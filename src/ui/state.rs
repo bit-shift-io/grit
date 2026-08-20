@@ -1,0 +1,732 @@
+//! Iced application state, message dispatch, and background-task wiring.
+
+use std::path::PathBuf;
+
+use iced::widget::{button, column, row, rule, text, text_input};
+use iced::{Element, Length, Subscription, Task};
+
+use crate::git::types::{GitAction, RepoState};
+use crate::ui::components;
+use crate::ui::persistence::{self, SavedRepo};
+
+/// UI events produced by widgets and background tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    // Tab management.
+    AddTabPressed,
+    OpenTab(usize),
+    CloseTab(usize),
+    NewRepoNameChanged(String),
+    NewRepoPathChanged(String),
+    BrowseFolder,
+    FolderPicked(Option<PathBuf>),
+    OpenNewRepo,
+    // Git actions applied to the active repository tab.
+    StageFile(String),
+    UnstageFile(String),
+    CommitPressed,
+    CommitMessageChanged(String),
+    PushPressed,
+    PullPressed,
+    CheckoutBranch(String),
+    Revert(String),
+    // Watcher / background updates, routed by tab id.
+    TabRefresh(usize),
+    TabStateUpdated(usize, RepoState),
+    TabError(usize, String),
+}
+
+/// A configured, live repository tab.
+#[derive(Debug, Clone)]
+pub struct RepoTab {
+    id: usize,
+    name: String,
+    repo_path: PathBuf,
+    repo_state: RepoState,
+    commit_message: String,
+    error: Option<String>,
+}
+
+/// One tab: either a live repository or the "add repository" form.
+#[derive(Debug, Clone)]
+pub enum Tab {
+    Repo(RepoTab),
+    AddRepo {
+        name: String,
+        path: String,
+        error: Option<String>,
+    },
+}
+
+/// Root application state for the native desktop UI.
+#[derive(Debug, Clone)]
+pub struct GritApp {
+    tabs: Vec<Tab>,
+    active: usize,
+    next_id: usize,
+    config_path: Option<PathBuf>,
+}
+
+impl GritApp {
+    /// Creates an app whose persistence target is overridden (used by tests).
+    #[cfg(test)]
+    fn with_config(repo_path: PathBuf, config_path: Option<PathBuf>) -> Self {
+        let tab = RepoTab {
+            id: 0,
+            name: Self::tab_name(&repo_path),
+            repo_path,
+            repo_state: RepoState::default(),
+            commit_message: String::new(),
+            error: None,
+        };
+        Self {
+            tabs: vec![Tab::Repo(tab)],
+            active: 0,
+            next_id: 1,
+            config_path,
+        }
+    }
+
+    /// Builds the app from previously saved repositories, falling back to a CLI path.
+    fn from_saved(saved: Vec<SavedRepo>, fallback: PathBuf) -> Self {
+        let mut tabs = Vec::new();
+        for (id, repo) in saved.into_iter().enumerate() {
+            tabs.push(Tab::Repo(RepoTab {
+                id,
+                name: repo.name,
+                repo_path: repo.path,
+                repo_state: RepoState::default(),
+                commit_message: String::new(),
+                error: None,
+            }));
+        }
+        let next_id = tabs.len();
+        if tabs.is_empty() {
+            tabs.push(Tab::Repo(RepoTab {
+                id: 0,
+                name: Self::tab_name(&fallback),
+                repo_path: fallback,
+                repo_state: RepoState::default(),
+                commit_message: String::new(),
+                error: None,
+            }));
+        }
+        Self {
+            tabs,
+            active: 0,
+            next_id: if next_id == 0 { 1 } else { next_id },
+            config_path: persistence::config_path(),
+        }
+    }
+
+    fn tab_name(path: &PathBuf) -> String {
+        path.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    fn active_repo(&self) -> Option<&RepoTab> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Repo(tab)) => Some(tab),
+            _ => None,
+        }
+    }
+
+    fn active_repo_mut(&mut self) -> Option<&mut RepoTab> {
+        match self.tabs.get_mut(self.active) {
+            Some(Tab::Repo(tab)) => Some(tab),
+            _ => None,
+        }
+    }
+
+    /// Persists the current repository tabs to the data folder.
+    fn persist_tabs(&self) {
+        if let Some(path) = &self.config_path {
+            let repos: Vec<SavedRepo> = self
+                .tabs
+                .iter()
+                .filter_map(|t| match t {
+                    Tab::Repo(r) => Some(SavedRepo {
+                        name: r.name.clone(),
+                        path: r.repo_path.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            persistence::save_repos(path, &repos);
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::AddTabPressed => {
+                self.tabs.push(Tab::AddRepo {
+                    name: String::new(),
+                    path: String::new(),
+                    error: None,
+                });
+                self.active = self.tabs.len() - 1;
+                Task::none()
+            }
+            Message::OpenTab(index) => {
+                if index < self.tabs.len() {
+                    self.active = index;
+                }
+                Task::none()
+            }
+            Message::CloseTab(index) => {
+                if index >= self.tabs.len() {
+                    return Task::none();
+                }
+                let removed_repo = match self.tabs.get(index) {
+                    Some(Tab::Repo(_)) => true,
+                    _ => false,
+                };
+                self.tabs.remove(index);
+                if self.tabs.is_empty() {
+                    self.tabs.push(Tab::AddRepo {
+                        name: String::new(),
+                        path: String::new(),
+                        error: None,
+                    });
+                }
+                if self.active >= self.tabs.len() {
+                    self.active = self.tabs.len() - 1;
+                } else if index < self.active {
+                    self.active -= 1;
+                }
+                if removed_repo {
+                    self.persist_tabs();
+                }
+                Task::none()
+            }
+            Message::NewRepoNameChanged(name) => {
+                if let Some(Tab::AddRepo { name: n, .. }) = self.tabs.get_mut(self.active) {
+                    *n = name;
+                }
+                Task::none()
+            }
+            Message::NewRepoPathChanged(path) => {
+                if let Some(Tab::AddRepo { path: p, .. }) = self.tabs.get_mut(self.active) {
+                    *p = path;
+                }
+                Task::none()
+            }
+            Message::BrowseFolder => Task::perform(
+                async move {
+                    rfd::FileDialog::new()
+                        .set_title("Select a Git repository folder")
+                        .pick_folder()
+                },
+                Message::FolderPicked,
+            ),
+            Message::FolderPicked(picked) => {
+                if let Some(path) = picked {
+                    if let Some(Tab::AddRepo { path: input, .. }) = self.tabs.get_mut(self.active)
+                    {
+                        *input = path.display().to_string();
+                    }
+                }
+                Task::none()
+            }
+            Message::OpenNewRepo => {
+                let (name, path) = match self.tabs.get(self.active) {
+                    Some(Tab::AddRepo { name, path, .. }) => (name.clone(), path.clone()),
+                    _ => return Task::none(),
+                };
+                let name = name.trim().to_string();
+                let path = path.trim().to_string();
+                let dir = PathBuf::from(&path);
+                let validation_error = if path.is_empty() {
+                    Some("Folder path is required".to_string())
+                } else if !dir.is_dir() {
+                    Some(format!("Not a directory: {path}"))
+                } else {
+                    None
+                };
+                if let Some(error) = validation_error {
+                    if let Some(Tab::AddRepo { error: slot, .. }) = self.tabs.get_mut(self.active)
+                    {
+                        *slot = Some(error);
+                    }
+                    return Task::none();
+                }
+
+                let tab_name = if name.is_empty() {
+                    Self::tab_name(&dir)
+                } else {
+                    name
+                };
+                let id = self.next_id;
+                self.next_id += 1;
+                if let Some(slot) = self.tabs.get_mut(self.active) {
+                    *slot = Tab::Repo(RepoTab {
+                        id,
+                        name: tab_name,
+                        repo_path: dir.clone(),
+                        repo_state: RepoState::default(),
+                        commit_message: String::new(),
+                        error: None,
+                    });
+                }
+                self.persist_tabs();
+                refresh(id, dir)
+            }
+            // Git actions on the active repository tab.
+            Message::StageFile(path) => self.run_action(GitAction::Stage(path)),
+            Message::UnstageFile(path) => self.run_action(GitAction::Unstage(path)),
+            Message::CommitPressed => {
+                let Some(tab) = self.active_repo_mut() else {
+                    return Task::none();
+                };
+                let message = tab.commit_message.trim().to_string();
+                if message.is_empty() {
+                    tab.error = Some("Commit message must not be empty".to_string());
+                    return Task::none();
+                }
+                tab.commit_message.clear();
+                let id = tab.id;
+                let repo_path = tab.repo_path.clone();
+                run_action_on(id, repo_path, GitAction::Commit(message))
+            }
+            Message::CommitMessageChanged(value) => {
+                if let Some(tab) = self.active_repo_mut() {
+                    tab.commit_message = value;
+                }
+                Task::none()
+            }
+            Message::PushPressed => self.run_action(GitAction::Push),
+            Message::PullPressed => self.run_action(GitAction::Pull),
+            Message::CheckoutBranch(branch) => self.run_action(GitAction::CheckoutBranch(branch)),
+            Message::Revert(hash) => self.run_action(GitAction::Revert(hash)),
+            // Watcher and background updates, routed by tab id.
+            Message::TabRefresh(id) => {
+                let path = self.tabs.iter().find_map(|t| match t {
+                    Tab::Repo(r) if r.id == id => Some(r.repo_path.clone()),
+                    _ => None,
+                });
+                match path {
+                    Some(path) => refresh(id, path),
+                    None => Task::none(),
+                }
+            }
+            Message::TabStateUpdated(id, state) => {
+                if let Some(Tab::Repo(tab)) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|t| matches!(t, Tab::Repo(r) if r.id == id))
+                {
+                    tab.repo_state = state;
+                    tab.error = None;
+                }
+                Task::none()
+            }
+            Message::TabError(id, error) => {
+                if let Some(Tab::Repo(tab)) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|t| matches!(t, Tab::Repo(r) if r.id == id))
+                {
+                    tab.error = Some(error);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Runs a git action against the active tab on an executor worker thread.
+    fn run_action(&self, action: GitAction) -> Task<Message> {
+        let Some(tab) = self.active_repo() else {
+            return Task::none();
+        };
+        run_action_on(tab.id, tab.repo_path.clone(), action)
+    }
+
+    /// Watches every open repository and emits per-tab refresh events.
+    pub fn subscription(&self) -> Subscription<Message> {
+        let subs: Vec<Subscription<Message>> = self
+            .tabs
+            .iter()
+            .filter_map(|t| match t {
+                Tab::Repo(tab) => Some(watcher_subscription(tab.id, tab.repo_path.clone())),
+                _ => None,
+            })
+            .collect();
+        Subscription::batch(subs)
+    }
+
+    pub fn view(&self) -> Element<'_, Message> {
+        column![self.tab_bar(), rule::horizontal(1), self.tab_content()]
+            .padding(12)
+            .spacing(10)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn tab_bar(&self) -> Element<'_, Message> {
+        let mut children: Vec<Element<'_, Message>> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let label = match tab {
+                    Tab::Repo(t) => t.name.clone(),
+                    Tab::AddRepo { .. } => "New Repo".to_string(),
+                };
+                let is_active = index == self.active;
+                let tab_button = button(text(label))
+                    .on_press(Message::OpenTab(index))
+                    .style(tab_button_style(is_active));
+                row![tab_button, button(text("×")).on_press(Message::CloseTab(index))]
+                    .spacing(2)
+                    .into()
+            })
+            .collect();
+        children.push(button(text("+").size(16)).on_press(Message::AddTabPressed).into());
+        row(children).spacing(4).into()
+    }
+
+    fn tab_content(&self) -> Element<'_, Message> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Repo(tab)) => self.repo_view(tab),
+            Some(Tab::AddRepo { name, path, error }) => {
+                add_repo_view(name, path, error.as_ref(), self.active)
+            }
+            None => text("No tabs").into(),
+        }
+    }
+
+    fn repo_view<'a>(&self, tab: &'a RepoTab) -> Element<'a, Message> {
+        let error_bar = if let Some(error) = &tab.error {
+            text(format!("Error: {error}"))
+                .color(iced::Color::from_rgb(0.9, 0.25, 0.25))
+        } else {
+            text("")
+        };
+
+        column![
+            components::header::header(&tab.repo_state),
+            error_bar,
+            components::staging::staging(&tab.repo_state.changes),
+            components::commit::commit(&tab.commit_message),
+            rule::horizontal(1),
+            components::history::history(&tab.repo_state.history),
+        ]
+        .spacing(10)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+}
+
+/// Style for a tab-bar button: highlighted when it is the active tab.
+fn tab_button_style(
+    is_active: bool,
+) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
+    move |theme, status| {
+        let palette = theme.palette();
+        let mut style = iced::widget::button::Style::default();
+        let hovered = matches!(status, iced::widget::button::Status::Hovered);
+        style.background = Some(iced::Background::Color(if is_active {
+            palette.primary
+        } else if hovered {
+            palette.background
+        } else {
+            palette.background
+        }));
+        style.text_color = if is_active {
+            palette.background
+        } else {
+            palette.text
+        };
+        style
+    }
+}
+
+/// Form for creating a new repository tab.
+fn add_repo_view<'a>(
+    name: &'a str,
+    path: &'a str,
+    error: Option<&'a String>,
+    active: usize,
+) -> Element<'a, Message> {
+    let error_bar = if let Some(error) = error {
+        text(format!("Error: {error}"))
+            .color(iced::Color::from_rgb(0.9, 0.25, 0.25))
+    } else {
+        text("")
+    };
+
+    column![
+        text("Add Repository").size(20),
+        text("Tab name"),
+        text_input("e.g. my-project", name).on_input(Message::NewRepoNameChanged),
+        text("Folder path"),
+        row![
+            text_input("Path to the repository folder", path)
+                .on_input(Message::NewRepoPathChanged)
+                .width(Length::Fill),
+            button("Browse…").on_press(Message::BrowseFolder),
+        ]
+        .spacing(6),
+        error_bar,
+        row![
+            button("Open Repository").on_press(Message::OpenNewRepo),
+            button("Cancel").on_press(Message::CloseTab(active)),
+        ]
+        .spacing(8),
+    ]
+    .spacing(8)
+    .width(Length::Fill)
+    .into()
+}
+
+/// Watches one repository and emits refresh events for its tab.
+fn watcher_subscription(id: usize, repo_path: PathBuf) -> Subscription<Message> {
+    Subscription::run_with((id, repo_path), |data| {
+        let id = data.0;
+        let path = data.1.clone();
+        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
+        std::thread::spawn(move || {
+            let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let watcher = match crate::git::watcher::spawn_watcher(path, watcher_tx) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = tx.try_send(Message::TabError(id, format!("watcher failed: {e}")));
+                    return;
+                }
+            };
+            let _keep_alive = watcher;
+            while watcher_rx.blocking_recv().is_some() {
+                if tx.try_send(Message::TabRefresh(id)).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    })
+}
+
+/// Recomputes repository status on an executor worker thread.
+fn refresh(id: usize, repo_path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move {
+            match crate::git::get_repository_status(&repo_path) {
+                Ok(state) => Message::TabStateUpdated(id, state),
+                Err(e) => Message::TabError(id, e.to_string()),
+            }
+        },
+        |m| m,
+    )
+}
+
+/// Executes a git action on an executor worker thread, then refreshes.
+fn run_action_on(id: usize, repo_path: PathBuf, action: GitAction) -> Task<Message> {
+    Task::perform(
+        async move {
+            match crate::git::execute_action(&repo_path, action) {
+                Ok(()) => Message::TabRefresh(id),
+                Err(e) => Message::TabError(id, e.to_string()),
+            }
+        },
+        |m| m,
+    )
+}
+
+/// Launches the native GUI, restoring saved repositories from the data folder.
+pub fn run(repo_path: PathBuf) -> iced::Result {
+    let app = GritApp::from_saved(persistence::load_repos(), repo_path);
+    app.persist_tabs();
+    iced::application(
+        move || {
+            let app = app.clone();
+            let tasks: Vec<Task<Message>> = app
+                .tabs
+                .iter()
+                .filter_map(|t| match t {
+                    Tab::Repo(tab) => Some(refresh(tab.id, tab.repo_path.clone())),
+                    _ => None,
+                })
+                .collect();
+            (app, Task::batch(tasks))
+        },
+        GritApp::update,
+        GritApp::view,
+    )
+    .title("Grit")
+    .theme(iced::Theme::Dark)
+    .window_size(iced::Size::new(960.0, 680.0))
+    .subscription(GritApp::subscription)
+    .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app_in(dir: &std::path::Path) -> GritApp {
+        GritApp::with_config(PathBuf::from("."), Some(dir.join("repos.json")))
+    }
+
+    #[test]
+    fn commit_message_changed_updates_active_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::CommitMessageChanged("fix bug".to_string()));
+        assert_eq!(app.active_repo().unwrap().commit_message, "fix bug");
+    }
+
+    #[test]
+    fn empty_commit_message_sets_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::CommitPressed);
+        let tab = app.active_repo().unwrap();
+        assert!(tab.error.is_some());
+        assert!(tab.commit_message.is_empty());
+    }
+
+    #[test]
+    fn non_empty_commit_message_clears_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::CommitMessageChanged("fix bug".to_string()));
+        let _ = app.update(Message::CommitPressed);
+        assert!(app.active_repo().unwrap().commit_message.is_empty());
+    }
+
+    #[test]
+    fn state_updated_replaces_repo_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let state = RepoState {
+            current_branch: "main".to_string(),
+            branches: vec!["main".to_string()],
+            changes: vec![],
+            history: vec![],
+        };
+        let _ = app.update(Message::TabStateUpdated(0, state.clone()));
+        let tab = app.active_repo().unwrap();
+        assert_eq!(tab.repo_state, state);
+        assert!(tab.error.is_none());
+    }
+
+    #[test]
+    fn error_message_is_stored_for_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::TabError(0, "boom".to_string()));
+        assert_eq!(app.active_repo().unwrap().error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn add_tab_pressed_appends_add_repo_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        assert_eq!(app.tabs.len(), 2);
+        assert!(matches!(&app.tabs[app.active], Tab::AddRepo { .. }));
+    }
+
+    #[test]
+    fn open_tab_switches_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        assert_eq!(app.active, 1);
+        let _ = app.update(Message::OpenTab(0));
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn open_new_repo_converts_form_to_repo_tab_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::NewRepoNameChanged("My Repo".to_string()));
+        let _ = app.update(Message::NewRepoPathChanged(
+            repo_dir.path().display().to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        let tab = app.active_repo().unwrap();
+        assert_eq!(tab.name, "My Repo");
+        assert_eq!(tab.repo_path, repo_dir.path());
+
+        let saved = persistence::load_repos_from(&dir.path().join("repos.json"));
+        assert_eq!(saved.len(), 2);
+        assert!(saved.iter().any(|r| r.name == "My Repo"));
+    }
+
+    #[test]
+    fn open_new_repo_uses_dir_name_when_tab_unnamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::NewRepoPathChanged(
+            repo_dir.path().display().to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        let tab = app.active_repo().unwrap();
+        assert_eq!(
+            tab.name,
+            GritApp::tab_name(&repo_dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn open_new_repo_rejects_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        let _ = app.update(Message::NewRepoPathChanged(
+            "/nonexistent/does-not-exist".to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        assert!(matches!(&app.tabs[app.active], Tab::AddRepo { .. }));
+        let Tab::AddRepo { error, .. } = &app.tabs[app.active] else {
+            panic!("expected add repo form");
+        };
+        assert!(error.is_some());
+    }
+
+    #[test]
+    fn close_repo_tab_removes_it_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::CloseTab(0));
+        assert_eq!(app.tabs.len(), 1);
+        assert!(matches!(&app.tabs[0], Tab::AddRepo { .. }));
+        assert!(persistence::load_repos_from(&dir.path().join("repos.json")).is_empty());
+    }
+
+    #[test]
+    fn from_saved_restores_multiple_tabs() {
+        let _dir = tempfile::tempdir().unwrap();
+        let saved = vec![
+            SavedRepo {
+                name: "alpha".to_string(),
+                path: PathBuf::from("/repo/alpha"),
+            },
+            SavedRepo {
+                name: "beta".to_string(),
+                path: PathBuf::from("/repo/beta"),
+            },
+        ];
+        let app = GritApp::from_saved(saved, PathBuf::from("/repo/fallback"));
+        assert_eq!(app.tabs.len(), 2);
+        assert!(matches!(app.tabs[0], Tab::Repo(_)));
+        assert!(matches!(app.tabs[1], Tab::Repo(_)));
+        assert_eq!(app.active, 0);
+    }
+
+    #[test]
+    fn from_saved_empty_uses_fallback() {
+        let app = GritApp::from_saved(Vec::new(), PathBuf::from("/repo/fallback"));
+        assert_eq!(app.tabs.len(), 1);
+        let tab = app.active_repo().unwrap();
+        assert_eq!(tab.repo_path, PathBuf::from("/repo/fallback"));
+    }
+}
