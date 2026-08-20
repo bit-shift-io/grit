@@ -111,11 +111,75 @@ body { margin: 0; padding: 1rem; max-width: 900px; }
   :root { --muted: #888; --tab-border: #444; --btn-bg: #2a2a2a; --btn-border: #444; --btn-hover: #333; --section-bg: #2a2a2a; --section-hover: #333; --row-hover: #333; }
 }
 
-.history-item { padding: 0.25rem 0; font-family: ui-monospace, monospace; font-size: 0.85rem; }
-
 #history {
   max-height: 15rem;
   overflow-y: auto;
+}
+.commit-row { padding: 0; }
+.commit-head {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.commit-head:hover { background: var(--row-hover, #ececec); }
+.commit-meta {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+  white-space: nowrap;
+}
+.commit-msg {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.commit-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.3rem 0.5rem 0.5rem;
+}
+.commit-actions button {
+  background: var(--btn-bg, #f0f0f0);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+  margin: 0.15rem;
+}
+.commit-actions button:hover { background: var(--btn-hover, #ddd); }
+.commit-summary {
+  flex-basis: 100%;
+  padding: 0.4rem 0.75rem;
+  margin-bottom: 0.25rem;
+  background: var(--section-bg, #f0f0f0);
+  border-radius: 4px;
+}
+.commit-summary-msg {
+  font-family: ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+.commit-summary-meta {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+}
+.commit-summary-stat {
+  margin-top: 0.25rem;
+  font-size: 0.8rem;
+  color: var(--muted, #888);
+}
+.commit-summary-file {
+  margin-top: 0.2rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
 }
 
 #actions button.danger {

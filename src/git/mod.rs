@@ -1,7 +1,9 @@
 pub mod types;
 pub mod watcher;
 
-pub use types::{CommitInfo, FileChange, FilePair, GitAction, GitStatus, RepoState};
+pub use types::{
+    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, RepoState,
+};
 
 use std::fmt;
 use std::path::Path;
@@ -253,6 +255,107 @@ pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError>
         .unwrap_or_default();
     let current = std::fs::read_to_string(repo_path.join(path)).unwrap_or_default();
     Ok(FilePair { original, current })
+}
+
+pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary, GitError> {
+    let meta = run(
+        git_command(repo_path).args(["show", "-s", "--format=%an%x09%ct%x09%B", hash]),
+    )?;
+    let mut lines = meta.lines();
+    let header = lines.next().unwrap_or_default();
+    let mut parts = header.splitn(3, '\t');
+    let author = parts.next().unwrap_or_default().to_string();
+    let timestamp: i64 = parts.next().unwrap_or_default().trim().parse().unwrap_or(0);
+    let subject = parts.next().unwrap_or_default().to_string();
+
+    let mut body: Vec<&str> = lines.collect();
+    while body.last().map(|l| l.is_empty()).unwrap_or(false) {
+        body.pop();
+    }
+    let mut message = subject;
+    if !body.is_empty() {
+        message.push('\n');
+        message.push_str(&body.join("\n"));
+    }
+
+    let mut files_changed = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    if let Ok(stat) =
+        run(git_command(repo_path).args(["show", "--format=", "--shortstat", hash]))
+    {
+        if let Some(line) = stat.lines().find(|l| l.contains("changed")) {
+            for part in line.split(',') {
+                let part = part.trim();
+                let num: i64 = part
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if part.contains("insertion") {
+                    insertions = num;
+                } else if part.contains("deletion") {
+                    deletions = num;
+                } else {
+                    files_changed = num;
+                }
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    let name_status = run(git_command(repo_path).args(["show", "--format=", "--name-status", hash]))
+        .unwrap_or_default();
+    let numstat = run(git_command(repo_path).args(["show", "--format=", "--numstat", hash]))
+        .unwrap_or_default();
+    let name_lines: Vec<&str> = name_status.lines().filter(|l| !l.trim().is_empty()).collect();
+    let num_lines: Vec<&str> = numstat.lines().filter(|l| !l.trim().is_empty()).collect();
+    for (i, line) in name_lines.iter().enumerate() {
+        let mut fields = line.splitn(3, '\t');
+        let status_letter = fields
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .next()
+            .unwrap_or('M');
+        let path = fields.last().unwrap_or_default().trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let status = match status_letter {
+            'A' => "Added",
+            'D' => "Deleted",
+            'M' => "Modified",
+            'R' => "Renamed",
+            'C' => "Copied",
+            'T' => "Type Changed",
+            _ => "Changed",
+        };
+        let mut insertions = 0;
+        let mut deletions = 0;
+        if let Some(num) = num_lines.get(i) {
+            let mut nf = num.splitn(3, '\t');
+            insertions = nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            deletions = nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        }
+        files.push(FileStat {
+            status: status.to_string(),
+            path,
+            insertions,
+            deletions,
+        });
+    }
+
+    Ok(CommitSummary {
+        message,
+        author,
+        timestamp,
+        files_changed,
+        insertions,
+        deletions,
+        files,
+    })
 }
 
 pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitError> {
@@ -570,6 +673,57 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "feature");
+    }
+
+    #[test]
+    fn get_commit_summary_lists_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("keep.txt"), "a\n").unwrap();
+        fs::write(dir.path().join("gone.txt"), "b\n").unwrap();
+        commit_all(dir.path(), "first");
+        fs::write(dir.path().join("keep.txt"), "a\nb\nc\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "x\ny\n").unwrap();
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        commit_all(dir.path(), "second");
+        let hash = get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+
+        let summary = get_commit_summary(dir.path(), &hash).unwrap();
+        assert_eq!(summary.files.len(), 3);
+        let keep = summary.files.iter().find(|f| f.path == "keep.txt").unwrap();
+        assert_eq!(keep.status, "Modified");
+        assert_eq!(keep.insertions, 2);
+        assert_eq!(keep.deletions, 0);
+        let new = summary.files.iter().find(|f| f.path == "new.txt").unwrap();
+        assert_eq!(new.status, "Added");
+        assert_eq!(new.insertions, 2);
+        let gone = summary.files.iter().find(|f| f.path == "gone.txt").unwrap();
+        assert_eq!(gone.status, "Deleted");
+        assert_eq!(gone.deletions, 1);
+    }
+
+    #[test]
+    fn get_commit_summary_reports_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "line1\nline2\n").unwrap();
+        commit_all(dir.path(), "initial commit");
+        let hash = get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+
+        let summary = get_commit_summary(dir.path(), &hash).unwrap();
+        assert_eq!(summary.message, "initial commit");
+        assert_eq!(summary.author, "Test User");
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.insertions, 2);
+        assert_eq!(summary.deletions, 0);
     }
 
     #[test]

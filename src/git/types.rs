@@ -39,6 +39,25 @@ pub struct FilePair {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStat {
+    pub status: String,
+    pub path: String,
+    pub insertions: i64,
+    pub deletions: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitSummary {
+    pub message: String,
+    pub author: String,
+    pub timestamp: i64,
+    pub files_changed: i64,
+    pub insertions: i64,
+    pub deletions: i64,
+    pub files: Vec<FileStat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitAction {
     Stage(String),
     Unstage(String),

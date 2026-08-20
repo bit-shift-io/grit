@@ -44,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/ws", get(websocket::ws_handler))
         .route("/files", get(files_handler))
+        .route("/commit", get(commit_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
@@ -87,6 +88,63 @@ async fn files_handler(
             Json(crate::git::types::FilePair {
                 original: format!("files task panicked: {e}"),
                 current: String::new(),
+            }),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct CommitQuery {
+    tab: usize,
+    hash: String,
+}
+
+async fn commit_handler(
+    State(app): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<CommitQuery>,
+) -> (StatusCode, Json<crate::git::types::CommitSummary>) {
+    let repo_path = app.registry.repo_path_for(query.tab);
+    let Some(repo_path) = repo_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(crate::git::types::CommitSummary {
+                message: "no repository tabs open".to_string(),
+                author: String::new(),
+                timestamp: 0,
+                files_changed: 0,
+                insertions: 0,
+                deletions: 0,
+                files: Vec::new(),
+            }),
+        );
+    };
+    let hash = query.hash.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::git::get_commit_summary(&repo_path, &hash)).await;
+    match result {
+        Ok(Ok(summary)) => (StatusCode::OK, Json(summary)),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::git::types::CommitSummary {
+                message: e.to_string(),
+                author: String::new(),
+                timestamp: 0,
+                files_changed: 0,
+                insertions: 0,
+                deletions: 0,
+                files: Vec::new(),
+            }),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::git::types::CommitSummary {
+                message: format!("commit task panicked: {e}"),
+                author: String::new(),
+                timestamp: 0,
+                files_changed: 0,
+                insertions: 0,
+                deletions: 0,
+                files: Vec::new(),
             }),
         ),
     }
@@ -434,6 +492,51 @@ mod tests {
         let pair: crate::git::types::FilePair = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(pair.original, "one\n", "got: {pair:?}");
         assert_eq!(pair.current, "dir2\n", "got: {pair:?}");
+    }
+
+    #[tokio::test]
+    async fn commit_endpoint_returns_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "first commit"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let hash = crate::git::get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/commit?tab=0&hash={hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let summary: crate::git::types::CommitSummary = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(summary.message, "first commit");
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.insertions, 1);
+        assert_eq!(summary.deletions, 0);
     }
 
     #[tokio::test]
