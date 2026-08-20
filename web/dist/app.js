@@ -30,6 +30,9 @@ function activeTab(state) {
 function render(state) {
   renderTabBar(state);
 
+  if (state.tabs.length === 0) {
+    return;
+  }
   const tab = activeTab(state);
   document.getElementById("overview").textContent =
     `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;

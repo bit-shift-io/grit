@@ -22,7 +22,10 @@ pub async fn serve_static(request: Request) -> Response {
                     "application/octet-stream",
                 ));
             (
-                [(header::CONTENT_TYPE, content_type)],
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+                ],
                 file.data,
             )
                 .into_response()
@@ -90,6 +93,27 @@ mod tests {
             .unwrap();
         let js = String::from_utf8_lossy(&bytes);
         assert!(js.contains("WebSocket"));
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_not_cached() {
+        for uri in ["/", "/app.js", "/style.css", "/favicon.svg"] {
+            let response = router()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let cache = response.headers()["cache-control"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(cache.contains("no-cache"), "{uri} got {cache}");
+        }
     }
 
     #[tokio::test]
