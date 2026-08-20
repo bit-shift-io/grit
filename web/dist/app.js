@@ -15,7 +15,11 @@ ws.onmessage = (event) => {
   if (activeTabId === null) {
     activeTabId = state.active;
   }
+  const prev = lastState;
   lastState = state;
+  if (prev !== null && JSON.stringify(prev) === JSON.stringify(state)) {
+    return;
+  }
   render(state);
 };
 
@@ -51,6 +55,7 @@ function render(state) {
 
       const head = document.createElement("div");
       head.className = "change-head";
+      head.dataset.path = change.path;
 
       const status = document.createElement("span");
       status.className = "change-status";
@@ -62,13 +67,9 @@ function render(state) {
 
       const action = document.createElement("button");
       action.className = "action-btn";
-      if (change.is_staged) {
-        action.textContent = "Unstage";
-        action.onclick = () => sendAction({ Unstage: change.path });
-      } else {
-        action.textContent = "Stage";
-        action.onclick = () => sendAction({ Stage: change.path });
-      }
+      action.dataset.path = change.path;
+      action.dataset.staged = change.is_staged ? "true" : "false";
+      action.textContent = change.is_staged ? "Unstage" : "Stage";
 
       head.appendChild(status);
       head.appendChild(file);
@@ -89,11 +90,6 @@ function render(state) {
       row.appendChild(head);
       row.appendChild(detail);
       changesEl.appendChild(row);
-
-      head.onclick = (event) => {
-        if (event.target.closest(".action-btn")) return;
-        toggleDiff(detail, tab, change.path);
-      };
     }
   }
   if (!stillOpen) {
@@ -112,6 +108,7 @@ function render(state) {
 
     const head = document.createElement("div");
     head.className = "commit-head";
+    head.dataset.hash = commit.hash;
 
     const meta = document.createElement("span");
     meta.className = "commit-meta";
@@ -139,8 +136,6 @@ function render(state) {
     row.appendChild(head);
     row.appendChild(actions);
     historyEl.appendChild(row);
-
-    head.onclick = () => toggleCommitActions(actions, tab, commit.hash);
   }
   if (!commitStillOpen) {
     expandedCommitKey = null;
@@ -297,13 +292,7 @@ function renderTabBar(state) {
     if (tab.state.changes.length > 0) {
       btn.classList.add("dirty");
     }
-    btn.onclick = () => {
-      activeTabId = tab.id;
-      nukeArmed = false;
-      nukeStatus.textContent = "";
-      nukeBtn.textContent = "Nuke";
-      render(state);
-    };
+    btn.dataset.tabId = tab.id;
     tabsEl.appendChild(btn);
   }
 }
@@ -491,6 +480,43 @@ document.getElementById("discard-all-btn").onclick = () => {
     sendAction("DiscardAll");
   }
 };
+
+document.getElementById("tabs").addEventListener("click", (event) => {
+  const btn = event.target.closest(".tab");
+  if (!btn || !lastState) return;
+  activeTabId = Number(btn.dataset.tabId);
+  nukeArmed = false;
+  nukeStatus.textContent = "";
+  nukeBtn.textContent = "Nuke";
+  render(lastState);
+});
+
+document.getElementById("changes").addEventListener("click", (event) => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const actionBtn = event.target.closest(".action-btn");
+  if (actionBtn) {
+    if (actionBtn.dataset.staged === "true") {
+      sendAction({ Unstage: actionBtn.dataset.path });
+    } else {
+      sendAction({ Stage: actionBtn.dataset.path });
+    }
+    return;
+  }
+  const head = event.target.closest(".change-head");
+  if (!head) return;
+  toggleDiff(head.nextElementSibling, tab, head.dataset.path);
+});
+
+document.getElementById("history").addEventListener("click", (event) => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const head = event.target.closest(".commit-head");
+  if (!head) return;
+  toggleCommitActions(head.nextElementSibling, tab, head.dataset.hash);
+});
 
 document.querySelectorAll(".section-title").forEach((title) => {
   title.onclick = () => {
