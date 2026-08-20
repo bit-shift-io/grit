@@ -37,10 +37,15 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    use crate::server::registry::TabRegistry;
     use crate::server::{build_router, AppState};
 
     fn router() -> axum::Router {
-        build_router(AppState::new(std::path::PathBuf::from(".")))
+        build_router(AppState::new(TabRegistry::with_single_tab(
+            0,
+            "repo".to_string(),
+            std::path::PathBuf::from("."),
+        )))
     }
 
     #[tokio::test]

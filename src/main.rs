@@ -30,13 +30,22 @@ fn main() -> iced::Result {
     let repo_path = resolve_path(&cli.path);
 
     if cli.headless {
+        let registry = server::registry::TabRegistry::with_single_tab(
+            0,
+            repo_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| repo_path.display().to_string()),
+            repo_path,
+        );
         let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
-        runtime.block_on(server::run(repo_path, cli.port));
+        runtime.block_on(server::run(registry, cli.port));
         Ok(())
     } else {
+        let registry = server::registry::TabRegistry::new();
         let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
-        runtime.spawn(server::run(repo_path.clone(), cli.port));
-        ui::state::run(repo_path)
+        runtime.spawn(server::run(registry.clone(), cli.port));
+        ui::state::run(registry, repo_path)
     }
 }
 

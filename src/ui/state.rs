@@ -30,6 +30,9 @@ pub enum Message {
     PullPressed,
     CheckoutBranch(String),
     Revert(String),
+    ShowDiff(String),
+    DiffLoaded(String, String),
+    NukePressed,
     // Watcher / background updates, routed by tab id.
     TabRefresh(usize),
     TabStateUpdated(usize, RepoState),
@@ -44,6 +47,8 @@ pub struct RepoTab {
     repo_path: PathBuf,
     repo_state: RepoState,
     commit_message: String,
+    diff: Option<String>,
+    nuke_armed: bool,
     error: Option<String>,
 }
 
@@ -65,6 +70,7 @@ pub struct GritApp {
     active: usize,
     next_id: usize,
     config_path: Option<PathBuf>,
+    registry: Option<crate::server::registry::TabRegistry>,
 }
 
 impl GritApp {
@@ -77,6 +83,8 @@ impl GritApp {
             repo_path,
             repo_state: RepoState::default(),
             commit_message: String::new(),
+            diff: None,
+            nuke_armed: false,
             error: None,
         };
         Self {
@@ -84,6 +92,7 @@ impl GritApp {
             active: 0,
             next_id: 1,
             config_path,
+            registry: None,
         }
     }
 
@@ -97,6 +106,8 @@ impl GritApp {
                 repo_path: repo.path,
                 repo_state: RepoState::default(),
                 commit_message: String::new(),
+                diff: None,
+                nuke_armed: false,
                 error: None,
             }));
         }
@@ -108,6 +119,8 @@ impl GritApp {
                 repo_path: fallback,
                 repo_state: RepoState::default(),
                 commit_message: String::new(),
+                diff: None,
+                nuke_armed: false,
                 error: None,
             }));
         }
@@ -116,6 +129,7 @@ impl GritApp {
             active: 0,
             next_id: if next_id == 0 { 1 } else { next_id },
             config_path: persistence::config_path(),
+            registry: None,
         }
     }
 
@@ -157,6 +171,30 @@ impl GritApp {
         }
     }
 
+    /// Publishes the current repo tabs + active index to the web registry.
+    fn sync_registry(&self) {
+        if let Some(registry) = &self.registry {
+            use crate::server::registry::{WebState, WebTab};
+            let tabs = self
+                .tabs
+                .iter()
+                .filter_map(|t| match t {
+                    Tab::Repo(r) => Some(WebTab {
+                        id: r.id,
+                        name: r.name.clone(),
+                        repo_path: r.repo_path.display().to_string(),
+                        state: r.repo_state.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            registry.set(WebState {
+                active: self.active,
+                tabs,
+            });
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AddTabPressed => {
@@ -171,6 +209,7 @@ impl GritApp {
             Message::OpenTab(index) => {
                 if index < self.tabs.len() {
                     self.active = index;
+                    self.sync_registry();
                 }
                 Task::none()
             }
@@ -197,6 +236,7 @@ impl GritApp {
                 }
                 if removed_repo {
                     self.persist_tabs();
+                    self.sync_registry();
                 }
                 Task::none()
             }
@@ -266,10 +306,13 @@ impl GritApp {
                         repo_path: dir.clone(),
                         repo_state: RepoState::default(),
                         commit_message: String::new(),
+                        diff: None,
+                        nuke_armed: false,
                         error: None,
                     });
                 }
                 self.persist_tabs();
+                self.sync_registry();
                 refresh(id, dir)
             }
             // Git actions on the active repository tab.
@@ -299,6 +342,44 @@ impl GritApp {
             Message::PullPressed => self.run_action(GitAction::Pull),
             Message::CheckoutBranch(branch) => self.run_action(GitAction::CheckoutBranch(branch)),
             Message::Revert(hash) => self.run_action(GitAction::Revert(hash)),
+            Message::ShowDiff(path) => {
+                let Some(tab) = self.active_repo() else {
+                    return Task::none();
+                };
+                let repo_path = tab.repo_path.clone();
+                let id = tab.id;
+                Task::perform(
+                    async move {
+                        match crate::git::get_file_diff(&repo_path, &path) {
+                            Ok(diff) => Message::DiffLoaded(path, diff),
+                            Err(e) => Message::TabError(id, e.to_string()),
+                        }
+                    },
+                    |m| m,
+                )
+            }
+            Message::DiffLoaded(path, diff) => {
+                if let Some(tab) = self.active_repo_mut() {
+                    if tab.repo_state.changes.iter().any(|c| c.path == path) {
+                        tab.diff = Some(diff);
+                    }
+                }
+                Task::none()
+            }
+            Message::NukePressed => {
+                let Some(tab) = self.active_repo_mut() else {
+                    return Task::none();
+                };
+                if tab.nuke_armed {
+                    tab.nuke_armed = false;
+                    let id = tab.id;
+                    let repo_path = tab.repo_path.clone();
+                    run_action_on(id, repo_path, GitAction::Nuke)
+                } else {
+                    tab.nuke_armed = true;
+                    Task::none()
+                }
+            }
             // Watcher and background updates, routed by tab id.
             Message::TabRefresh(id) => {
                 let path = self.tabs.iter().find_map(|t| match t {
@@ -317,8 +398,10 @@ impl GritApp {
                     .find(|t| matches!(t, Tab::Repo(r) if r.id == id))
                 {
                     tab.repo_state = state;
+                    tab.nuke_armed = false;
                     tab.error = None;
                 }
+                self.sync_registry();
                 Task::none()
             }
             Message::TabError(id, error) => {
@@ -406,9 +489,10 @@ impl GritApp {
         };
 
         column![
-            components::header::header(&tab.repo_state),
+            components::header::header(&tab.repo_state, tab.nuke_armed),
             error_bar,
             components::staging::staging(&tab.repo_state.changes),
+            components::diff::diff(&tab.diff),
             components::commit::commit(&tab.commit_message),
             rule::horizontal(1),
             components::history::history(&tab.repo_state.history),
@@ -535,8 +619,10 @@ fn run_action_on(id: usize, repo_path: PathBuf, action: GitAction) -> Task<Messa
 }
 
 /// Launches the native GUI, restoring saved repositories from the data folder.
-pub fn run(repo_path: PathBuf) -> iced::Result {
-    let app = GritApp::from_saved(persistence::load_repos(), repo_path);
+pub fn run(registry: crate::server::registry::TabRegistry, repo_path: PathBuf) -> iced::Result {
+    let mut app = GritApp::from_saved(persistence::load_repos(), repo_path);
+    app.registry = Some(registry);
+    app.sync_registry();
     app.persist_tabs();
     iced::application(
         move || {
@@ -564,6 +650,7 @@ pub fn run(repo_path: PathBuf) -> iced::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::types::{FileChange, GitStatus};
 
     fn app_in(dir: &std::path::Path) -> GritApp {
         GritApp::with_config(PathBuf::from("."), Some(dir.join("repos.json")))
@@ -728,5 +815,123 @@ mod tests {
         assert_eq!(app.tabs.len(), 1);
         let tab = app.active_repo().unwrap();
         assert_eq!(tab.repo_path, PathBuf::from("/repo/fallback"));
+    }
+
+    #[test]
+    fn diff_loaded_stores_diff_on_active_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let state = RepoState {
+            current_branch: "main".to_string(),
+            branches: vec!["main".to_string()],
+            changes: vec![FileChange {
+                path: "a.txt".to_string(),
+                status: GitStatus::Modified,
+                is_staged: false,
+            }],
+            history: vec![],
+        };
+        let _ = app.update(Message::TabStateUpdated(0, state));
+        let _ = app.update(Message::DiffLoaded(
+            "a.txt".to_string(),
+            "-old\n+new\n".to_string(),
+        ));
+        assert_eq!(app.active_repo().unwrap().diff.as_deref(), Some("-old\n+new\n"));
+    }
+
+    #[test]
+    fn diff_loaded_ignores_stale_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::DiffLoaded(
+            "missing.txt".to_string(),
+            "diff".to_string(),
+        ));
+        assert!(app.active_repo().unwrap().diff.is_none());
+    }
+
+    #[test]
+    fn nuke_requires_two_presses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::NukePressed);
+        assert!(app.active_repo().unwrap().nuke_armed);
+        let _ = app.update(Message::NukePressed);
+        assert!(!app.active_repo().unwrap().nuke_armed);
+    }
+
+    #[test]
+    fn state_update_disarms_nuke() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::NukePressed);
+        assert!(app.active_repo().unwrap().nuke_armed);
+        let _ = app.update(Message::TabStateUpdated(0, RepoState::default()));
+        assert!(!app.active_repo().unwrap().nuke_armed);
+    }
+
+    fn app_with_registry(dir: &std::path::Path) -> (GritApp, crate::server::registry::TabRegistry)
+    {
+        let registry = crate::server::registry::TabRegistry::new();
+        let mut app = GritApp::with_config(PathBuf::from("."), Some(dir.join("repos.json")));
+        app.registry = Some(registry.clone());
+        (app, registry)
+    }
+
+    #[test]
+    fn registry_receives_initial_tab_on_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, registry) = app_with_registry(dir.path());
+        app.sync_registry();
+        let state = registry.snapshot();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].repo_path, ".");
+    }
+
+    #[test]
+    fn registry_reflects_state_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, registry) = app_with_registry(dir.path());
+        let state = RepoState {
+            current_branch: "dev".to_string(),
+            branches: vec!["dev".to_string()],
+            changes: vec![],
+            history: vec![],
+        };
+        let _ = app.update(Message::TabStateUpdated(0, state.clone()));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.tabs[0].state, state);
+    }
+
+    #[test]
+    fn registry_updates_on_open_new_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, registry) = app_with_registry(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::NewRepoNameChanged("new repo".to_string()));
+        let _ = app.update(Message::NewRepoPathChanged(
+            repo_dir.path().display().to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.tabs.len(), 2);
+        assert_eq!(snapshot.active, 1);
+        assert!(snapshot.tabs.iter().any(|t| t.name == "new repo"));
+    }
+
+    #[test]
+    fn registry_updates_on_tab_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, registry) = app_with_registry(dir.path());
+        let _ = app.update(Message::AddTabPressed);
+        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::NewRepoPathChanged(
+            repo_dir.path().display().to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        let _ = app.update(Message::OpenTab(0));
+        assert_eq!(registry.snapshot().active, 0);
     }
 }

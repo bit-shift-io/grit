@@ -1,7 +1,7 @@
 pub mod types;
 pub mod watcher;
 
-pub use types::{CommitInfo, FileChange, GitAction, GitStatus, RepoState};
+pub use types::{CommitInfo, FileChange, FilePair, GitAction, GitStatus, RepoState};
 
 use std::fmt;
 use std::path::Path;
@@ -192,6 +192,69 @@ fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
     Ok(history)
 }
 
+pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
+    let diff = run(git_command(repo_path).args(["diff", "HEAD", "--", path]));
+
+    match diff {
+        Ok(output) => {
+            if !output.trim().is_empty() {
+                return Ok(output);
+            }
+        }
+        Err(_) => {}
+    }
+
+    let staged = run(git_command(repo_path).args(["diff", "--cached", "--", path]));
+    if let Ok(output) = staged {
+        if !output.trim().is_empty() {
+            return Ok(output);
+        }
+    }
+
+    let unstaged = run(git_command(repo_path).args(["diff", "--", path]));
+    if let Ok(output) = unstaged {
+        if !output.trim().is_empty() {
+            return Ok(output);
+        }
+    }
+
+    let untracked = run(
+        git_command(repo_path).args(["ls-files", "--others", "--exclude-standard", "--", path]),
+    );
+    if let Ok(output) = untracked {
+        if output.trim() == path {
+            let full_path = repo_path.join(path);
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    let mut diff = format!(
+                        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+                    );
+                    for line in content.lines() {
+                        diff.push_str(&format!("+{line}\n"));
+                    }
+                    return Ok(diff);
+                }
+                Err(e) => {
+                    return Err(GitError {
+                        message: format!("failed to read untracked file {path}: {e}"),
+                        stderr: String::new(),
+                        stdout: String::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
+pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError> {
+    let original = run(git_command(repo_path).args(["show", &format!("HEAD:{path}")]))
+        .unwrap_or_default();
+    let current = std::fs::read_to_string(repo_path.join(path)).unwrap_or_default();
+    Ok(FilePair { original, current })
+}
+
 pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitError> {
     match action {
         GitAction::Stage(path) => {
@@ -209,13 +272,65 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Pull => {
             run(git_command(repo_path).args(["pull"]))?;
         }
+        GitAction::Fetch => {
+            run(git_command(repo_path).args(["fetch"]))?;
+        }
         GitAction::CheckoutBranch(branch) => {
             run(git_command(repo_path).args(["checkout", branch.as_str()]))?;
         }
         GitAction::Revert(hash) => {
             run(git_command(repo_path).args(["revert", "--no-edit", hash.as_str()]))?;
         }
+        GitAction::CreateBranch(name, from) => {
+            run(git_command(repo_path).args([
+                "checkout",
+                "-b",
+                name.as_str(),
+                from.as_str(),
+            ]))?;
+        }
+        GitAction::CreateTag(name, target) => {
+            run(git_command(repo_path).args(["tag", name.as_str(), target.as_str()]))?;
+        }
+        GitAction::DeleteTag(name) => {
+            run(git_command(repo_path).args(["tag", "-d", name.as_str()]))?;
+        }
+        GitAction::DeleteBranch(name) => {
+            run(git_command(repo_path).args(["branch", "-d", name.as_str()]))?;
+        }
+        GitAction::Nuke => {
+            nuke_repo(repo_path)?;
+        }
     }
+    Ok(())
+}
+
+fn nuke_repo(repo_path: &Path) -> Result<(), GitError> {
+    let branch = get_current_branch(repo_path)?;
+
+    let fetched = run(git_command(repo_path).args(["fetch", "origin"]));
+    match fetched {
+        Ok(_) => {
+            run(git_command(repo_path).args([
+                "reset",
+                "--hard",
+                &format!("origin/{branch}"),
+            ]))?;
+        }
+        Err(e) => {
+            let missing_remote = e.stderr.contains("does not appear to be a git repository")
+                || e.stderr.contains("Could not read from remote")
+                || e.stderr.contains("No such remote")
+                || e.stderr.contains("Could not resolve host");
+            if missing_remote {
+                run(git_command(repo_path).args(["reset", "--hard", "HEAD"]))?;
+            } else {
+                return Err(e);
+            }
+        }
+    }
+
+    run(git_command(repo_path).args(["clean", "-fdx"]))?;
     Ok(())
 }
 
@@ -367,5 +482,199 @@ mod tests {
         .unwrap();
         let state = get_repository_status(dir.path()).unwrap();
         assert_eq!(state.current_branch, "feature");
+    }
+
+    #[test]
+    fn get_file_diff_reports_unstaged_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("file.txt"), "world\n").unwrap();
+
+        let diff = get_file_diff(dir.path(), "file.txt").unwrap();
+        assert!(diff.contains("-hello"), "got: {diff}");
+        assert!(diff.contains("+world"), "got: {diff}");
+    }
+
+    #[test]
+    fn get_file_diff_reports_staged_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("file.txt"), "staged\n").unwrap();
+        execute_action(dir.path(), GitAction::Stage("file.txt".to_string())).unwrap();
+
+        let diff = get_file_diff(dir.path(), "file.txt").unwrap();
+        assert!(diff.contains("-hello"), "got: {diff}");
+        assert!(diff.contains("+staged"), "got: {diff}");
+    }
+
+    #[test]
+    fn get_file_diff_reports_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("new.txt"), "brand new\n").unwrap();
+
+        let diff = get_file_diff(dir.path(), "new.txt").unwrap();
+        assert!(diff.contains("new.txt"), "got: {diff}");
+        assert!(diff.contains("+brand new"), "got: {diff}");
+    }
+
+    #[test]
+    fn get_file_pair_returns_original_and_current() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("file.txt"), "world\n").unwrap();
+
+        let pair = get_file_pair(dir.path(), "file.txt").unwrap();
+        assert_eq!(pair.original, "hello\n");
+        assert_eq!(pair.current, "world\n");
+    }
+
+    #[test]
+    fn get_file_pair_returns_empty_original_for_untracked() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("new.txt"), "brand new\n").unwrap();
+
+        let pair = get_file_pair(dir.path(), "new.txt").unwrap();
+        assert_eq!(pair.original, "");
+        assert_eq!(pair.current, "brand new\n");
+    }
+
+    #[test]
+    fn create_branch_from_commit_and_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        let hash = get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+
+        execute_action(
+            dir.path(),
+            GitAction::CreateBranch("feature".to_string(), hash),
+        )
+        .unwrap();
+
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "feature");
+    }
+
+    #[test]
+    fn create_and_delete_tag_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        let hash = get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+
+        execute_action(dir.path(), GitAction::CreateTag("v1.0".to_string(), hash)).unwrap();
+        let tags = Command::new("git")
+            .args(["tag", "--list"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(tags.stdout).unwrap().trim(), "v1.0");
+
+        execute_action(dir.path(), GitAction::DeleteTag("v1.0".to_string())).unwrap();
+        let tags = Command::new("git")
+            .args(["tag", "--list"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8(tags.stdout).unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn delete_branch_removes_other_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        let hash = get_repository_status(dir.path())
+            .unwrap()
+            .history[0]
+            .hash
+            .clone();
+        execute_action(
+            dir.path(),
+            GitAction::CreateBranch("feature".to_string(), hash),
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        execute_action(dir.path(), GitAction::DeleteBranch("feature".to_string())).unwrap();
+        let branches = get_repository_status(dir.path()).unwrap().branches;
+        assert!(!branches.contains(&"feature".to_string()), "got: {branches:?}");
+    }
+
+    #[test]
+    fn nuke_discards_all_local_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        fs::write(dir.path().join("other.txt"), "other\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("file.txt"), "local edit\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "junk\n").unwrap();
+        execute_action(dir.path(), GitAction::Stage("file.txt".to_string())).unwrap();
+
+        execute_action(dir.path(), GitAction::Nuke).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
+        assert_eq!(fs::read_to_string(dir.path().join("file.txt")).unwrap(), "hello\n");
+        assert!(!dir.path().join("untracked.txt").exists());
+    }
+
+    #[test]
+    fn nuke_resets_to_remote_origin() {
+        let origin = tempfile::tempdir().unwrap();
+        init_repo(origin.path());
+        fs::write(origin.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(origin.path(), "initial");
+        fs::write(origin.path().join("a.txt"), "v2\n").unwrap();
+        commit_all(origin.path(), "second");
+
+        let dir = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "local hack\n").unwrap();
+        fs::write(dir.path().join("local.txt"), "junk\n").unwrap();
+        execute_action(dir.path(), GitAction::Stage("a.txt".to_string())).unwrap();
+
+        execute_action(dir.path(), GitAction::Nuke).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "v2\n",
+            "working tree should match remote HEAD"
+        );
+        assert!(!dir.path().join("local.txt").exists());
     }
 }

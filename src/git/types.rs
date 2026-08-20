@@ -33,14 +33,26 @@ pub struct RepoState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePair {
+    pub original: String,
+    pub current: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitAction {
     Stage(String),
     Unstage(String),
     Commit(String),
     Push,
     Pull,
+    Fetch,
     CheckoutBranch(String),
     Revert(String),
+    CreateBranch(String, String),
+    CreateTag(String, String),
+    DeleteTag(String),
+    DeleteBranch(String),
+    Nuke,
 }
 
 #[cfg(test)]
@@ -78,8 +90,14 @@ mod tests {
             GitAction::Commit("fix bug".to_string()),
             GitAction::Push,
             GitAction::Pull,
+            GitAction::Fetch,
             GitAction::CheckoutBranch("feature".to_string()),
             GitAction::Revert("deadbeef".to_string()),
+            GitAction::CreateBranch("feature".to_string(), "deadbeef".to_string()),
+            GitAction::CreateTag("v1.0".to_string(), "deadbeef".to_string()),
+            GitAction::DeleteTag("v1.0".to_string()),
+            GitAction::DeleteBranch("feature".to_string()),
+            GitAction::Nuke,
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();

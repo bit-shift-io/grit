@@ -88,3 +88,67 @@ This document serves as an actionable, phase-by-phase task list for an AI coding
 - [x] **Task 5.2: Release Build Verification**
   - Run `cargo build --release`.
   - Confirm output binary is fully self-contained and operates correctly when moved to a clean directory without external frontend assets.
+
+---
+
+## Phase 6: UX Essentials (README, Diffs, Nuke)
+- [x] **Task 6.1: Write a Simple README** (`README.md`)
+  - Replace the placeholder with a short, friendly README describing Grit, build/run commands, and key features.
+- [x] **Task 6.2: Add Nuke Action Variant** (`src/git/types.rs`)
+  - Add `Nuke` to the `GitAction` enum and include it in the JSON round-trip test.
+- [x] **Task 6.3: Add File Diff Retrieval + Nuke Execution** (`src/git/mod.rs`)
+  - Implement `get_file_diff(repo_path, path)` returning the unified diff string (staged + unstaged + untracked).
+  - Handle `GitAction::Nuke` in `execute_action`: `git fetch --all`, `git reset --hard origin/<current-branch>`, `git clean -fdx`, falling back to re-cloning if the working tree is missing `.git`.
+  - Add unit tests covering diff output and a nuke that discards local changes.
+- [x] **Task 6.4: Expose Diff via HTTP** (`src/server/mod.rs`)
+  - Add a `/diff` route that accepts a `path` query param and returns the file diff as plain text.
+- [x] **Task 6.5: Wire Diff & Nuke Messages into UI State** (`src/ui/state.rs`)
+  - Add `Message::ShowDiff(String)`, `Message::DiffLoaded(String, String)`, and `Message::NukePressed`.
+  - Store selected diff text on the active `RepoTab` and refresh after nuke.
+  - Add state-machine tests for diff load and nuke dispatch.
+- [x] **Task 6.6: Make Staging Rows Clickable for Diffs** (`src/ui/components/staging.rs`)
+  - Emit `Message::ShowDiff(path)` when a change row is clicked.
+- [x] **Task 6.7: Add Diff Panel Component** (`src/ui/components/diff.rs`, `src/ui/components/mod.rs`)
+  - Render the selected file's diff in a monospace scrollable panel; show a hint when no diff is selected.
+- [x] **Task 6.8: Add Nuke Button to Header** (`src/ui/components/header.rs`)
+  - Add a red "Nuke" button emitting `Message::NukePressed`.
+- [x] **Task 6.9: Enrich Web UI** (`web/dist/index.html`, `web/dist/app.js`)
+  - Render git status (branch, changes list with stage/unstage buttons), fetch/display file diffs, and add a Nuke button with confirm.
+
+---
+
+## Phase 7: Sync Desktop Tabs to the Web Interface
+- [x] **Task 7.1: Shared Tab Registry Types** (`src/server/registry.rs`, `src/server/mod.rs`)
+  - Create `WebTab { id, name, repo_path, state: RepoState }`, `WebState { active, tabs }`, and `TabRegistry` wrapping a `tokio::sync::watch` channel so the desktop GUI and web server share one tab list.
+  - Add `TabRegistry::new/set/snapshot/subscribe/update_state` plus a `with_single_tab(path)` helper for headless boot.
+  - Add unit tests for snapshot, update_state, and watch notifications.
+
+- [x] **Task 7.2: Multi-Tab Server State** (`src/server/mod.rs`)
+  - Refactor `AppState` to hold `registry: TabRegistry` and `broadcast: broadcast::Sender<WebState>` (replacing the single `repo_path`/`state`).
+  - Add `refresh_tab(app, tab_id)` and `refresh_all(app)` that recompute status via `get_repository_status` and push results into the registry.
+  - Rework `boot`/`run`/`sync_loop` to relay registry changes to the broadcast channel and spawn watchers for seeded tabs.
+  - Update existing server tests to build `AppState` from a registry and assert on `WebState`.
+
+- [x] **Task 7.3: Tab-Aware WebSocket Protocol** (`src/server/websocket.rs`)
+  - Send the current `WebState` snapshot on connect instead of a bare `RepoState`.
+  - Accept client messages shaped `{ "tab": <id>, "action": <GitAction> }`, resolve the repo path from the registry, dispatch the action, then `refresh_tab` for that id.
+  - Update WebSocket tests to send tab-scoped actions and assert on `WebState`.
+
+- [x] **Task 7.4: Tab-Scoped Diff Endpoint** (`src/server/mod.rs`)
+  - Change `/diff` to accept a `tab` query param (`/diff?tab=<id>&path=<file>`) and resolve the repo path from the registry.
+  - Update the existing diff endpoint test.
+
+- [x] **Task 7.5: Desktop Pushes Tabs to Registry** (`src/ui/state.rs`)
+  - Add `registry: Option<TabRegistry>` to `GritApp` and a `sync_registry()` helper that publishes the repo tabs + active index.
+  - Call `sync_registry()` after `OpenTab`, `CloseTab`, `OpenNewRepo`, and `TabStateUpdated`.
+  - Change `run()` to accept a `TabRegistry`, attach it, and publish tabs on startup.
+  - Add tests that the registry reflects tab add/remove/active/state changes (registry `None` in existing tests keeps them passing).
+
+- [x] **Task 7.6: Share Registry Across Modes** (`src/main.rs`)
+  - Create one `TabRegistry` in `main()`, seed a single tab from `--path` in headless mode, and pass clones to both `server::run` and `ui::state::run`.
+  - Keep CLI-parsing tests intact.
+
+- [x] **Task 7.7: Web Tab Bar UI** (`web/dist/index.html`, `web/dist/app.js`, `web/dist/style.css`)
+  - Render a tab bar listing every repo tab from `WebState`; track the active tab client-side (defaulting to `WebState.active`).
+  - Scope stage/unstage, diff loading, and nuke actions to the active tab id.
+  - Add tab bar styles and keep dark-mode support.

@@ -58,7 +58,7 @@ fn change_row(change: &FileChange, staged: bool) -> Element<'_, Message> {
 
     row![
         text(format!("{:?}", change.status)).width(Length::Fixed(90.0)),
-        text(&change.path),
+        button(text(&change.path)).on_press(Message::ShowDiff(change.path.clone())),
         action,
     ]
     .spacing(8)

@@ -7,13 +7,33 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header>
-    <h1>Grit</h1>
-    <div id="branch"></div>
-  </header>
+  <nav id="tabs"></nav>
+  <section id="actions" class="section">
+    <h2 class="section-title">Actions <span class="arrow">&#9662;</span></h2>
+    <div class="section-body">
+      <div id="overview" class="muted"></div>
+      <div class="action-row">
+        <button id="pull-btn">Pull</button>
+        <button id="push-btn">Push</button>
+        <button id="fetch-btn">Fetch</button>
+        <button id="nuke-btn" class="danger">Nuke</button>
+        <span id="nuke-status" class="nuke-status"></span>
+      </div>
+    </div>
+  </section>
   <main>
-    <section id="changes"></section>
-    <section id="history"></section>
+    <section class="section">
+      <h2 class="section-title">Changes <span class="arrow">&#9662;</span></h2>
+      <div class="section-body">
+        <div id="changes"></div>
+      </div>
+    </section>
+    <section class="section">
+      <h2 class="section-title">History <span class="arrow">&#9662;</span></h2>
+      <div class="section-body">
+        <div id="history"></div>
+      </div>
+    </section>
   </main>
   <script src="/app.js"></script>
 </body>
