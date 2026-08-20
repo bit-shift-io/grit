@@ -38,6 +38,7 @@ body { margin: 0; padding: 1rem; }
 }
 #tabs .tab:hover { opacity: 1; text-decoration: underline; }
 #tabs .tab.active { opacity: 1; font-weight: 700; }
+#tabs .tab.dirty { font-style: italic; }
 
 #actions .action-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; flex-wrap: wrap; }
 #actions button {

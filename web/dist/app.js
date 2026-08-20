@@ -291,6 +291,9 @@ function renderTabBar(state) {
       btn.classList.add("active");
     }
     btn.textContent = tab.name;
+    if (tab.state.changes.length > 0) {
+      btn.classList.add("dirty");
+    }
     btn.onclick = () => {
       activeTabId = tab.id;
       nukeArmed = false;
