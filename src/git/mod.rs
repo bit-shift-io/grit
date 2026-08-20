@@ -366,6 +366,15 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Unstage(path) => {
             run(git_command(repo_path).args(["reset", "HEAD", "--", path.as_str()]))?;
         }
+        GitAction::Discard(path) => {
+            run(git_command(repo_path).args([
+                "restore",
+                "--staged",
+                "--worktree",
+                "--",
+                path.as_str(),
+            ]))?;
+        }
         GitAction::Commit(message) => {
             run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
         }
@@ -548,6 +557,29 @@ mod tests {
         let state = get_repository_status(dir.path()).unwrap();
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.history[0].message, "second");
+    }
+
+    #[test]
+    fn discard_file_restores_tracked_content() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+        execute_action(dir.path(), GitAction::Stage("a.txt".to_string())).unwrap();
+
+        execute_action(dir.path(), GitAction::Discard("a.txt".to_string())).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "v1\n"
+        );
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(
+            !state.changes.iter().any(|c| c.path == "a.txt"),
+            "got: {:?}",
+            state.changes
+        );
     }
 
     #[test]

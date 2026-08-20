@@ -1,6 +1,5 @@
 const ws = new WebSocket(`ws://${location.host}/ws`);
 
-let nukeArmed = false;
 let activeTabId = null;
 let lastState = null;
 let expandedKey = null;
@@ -49,47 +48,7 @@ function render(state) {
   } else {
     changesEl.textContent = "";
     for (const change of tab.state.changes) {
-      const key = `${tab.id}:${change.path}`;
-      const row = document.createElement("div");
-      row.className = "change-row";
-
-      const head = document.createElement("div");
-      head.className = "change-head";
-      head.dataset.path = change.path;
-
-      const status = document.createElement("span");
-      status.className = "change-status";
-      status.textContent = change.status;
-
-      const file = document.createElement("span");
-      file.className = "change-file";
-      file.textContent = change.path;
-
-      const action = document.createElement("button");
-      action.className = "action-btn";
-      action.dataset.path = change.path;
-      action.dataset.staged = change.is_staged ? "true" : "false";
-      action.textContent = change.is_staged ? "Unstage" : "Stage";
-
-      head.appendChild(status);
-      head.appendChild(file);
-      head.appendChild(action);
-
-      const detail = document.createElement("div");
-      detail.className = "change-diff";
-      const expanded = expandedKey === key;
-      if (expanded) {
-        stillOpen = true;
-        expandedDetailEl = detail;
-      }
-      detail.style.display = expanded ? "block" : "none";
-      if (expanded) {
-        showDiff(detail, tab, change.path);
-      }
-
-      row.appendChild(head);
-      row.appendChild(detail);
-      changesEl.appendChild(row);
+      if (appendChangeRow(changesEl, change, tab)) stillOpen = true;
     }
   }
   if (!stillOpen) {
@@ -143,6 +102,68 @@ function render(state) {
   }
 }
 
+function appendChangeRow(container, change, tab) {
+  const key = `${tab.id}:${change.path}`;
+  const row = document.createElement("div");
+  row.className = "change-row";
+
+  const head = document.createElement("div");
+  head.className = "change-head";
+  head.dataset.path = change.path;
+
+  const status = document.createElement("span");
+  status.className = "change-status";
+  status.textContent = change.status;
+  if (change.is_staged) {
+    status.classList.add("staged");
+  }
+
+  const file = document.createElement("span");
+  file.className = "change-file";
+  file.textContent = change.path;
+
+  const actions = document.createElement("div");
+  actions.className = "change-actions";
+
+  const action = document.createElement("button");
+  action.className = "action-btn";
+  action.dataset.path = change.path;
+  action.dataset.action = "stage";
+  action.dataset.staged = change.is_staged ? "true" : "false";
+  action.textContent = change.is_staged ? "−" : "+";
+  action.title = change.is_staged ? "Unstage file" : "Stage file";
+
+  const discard = document.createElement("button");
+  discard.className = "action-btn discard-btn";
+  discard.dataset.path = change.path;
+  discard.dataset.action = "discard";
+  discard.textContent = "×";
+  discard.title = "Discard changes to this file";
+
+  actions.appendChild(action);
+  actions.appendChild(discard);
+
+  head.appendChild(status);
+  head.appendChild(file);
+  head.appendChild(actions);
+
+  const detail = document.createElement("div");
+  detail.className = "change-diff";
+  const expanded = expandedKey === key;
+  if (expanded) {
+    expandedDetailEl = detail;
+  }
+  detail.style.display = expanded ? "block" : "none";
+  if (expanded) {
+    showDiff(detail, tab, change.path);
+  }
+
+  row.appendChild(head);
+  row.appendChild(detail);
+  container.appendChild(row);
+  return expanded;
+}
+
 function toggleCommitActions(actionsEl, tab, hash) {
   const key = `${tab.id}:${hash}`;
   if (expandedCommitKey === key) {
@@ -162,7 +183,6 @@ function toggleCommitActions(actionsEl, tab, hash) {
 
 function buildCommitActions(actionsEl, tab, hash) {
   actionsEl.textContent = "";
-  showCommitSummary(actionsEl, tab, hash);
   const defs = [
     {
       label: "Revert",
@@ -207,6 +227,7 @@ function buildCommitActions(actionsEl, tab, hash) {
     btn.onclick = def.run;
     actionsEl.appendChild(btn);
   }
+  showCommitSummary(actionsEl, tab, hash);
 }
 
 async function showCommitSummary(actionsEl, tab, hash) {
@@ -446,18 +467,10 @@ function renderSideBySide(original, current) {
 }
 
 const nukeBtn = document.getElementById("nuke-btn");
-const nukeStatus = document.getElementById("nuke-status");
 nukeBtn.onclick = () => {
-  if (!nukeArmed) {
-    nukeArmed = true;
-    nukeStatus.textContent = "Are you sure? Click Nuke again to wipe the repo.";
-    nukeBtn.textContent = "Confirm Nuke";
-    return;
+  if (confirm("Nuke this repo? All local changes will be discarded and the repo reset to origin.")) {
+    sendAction("Nuke");
   }
-  nukeArmed = false;
-  nukeStatus.textContent = "";
-  nukeBtn.textContent = "Nuke";
-  sendAction("Nuke");
 };
 
 document.getElementById("pull-btn").onclick = () => sendAction("Pull");
@@ -465,7 +478,19 @@ document.getElementById("push-btn").onclick = () => sendAction("Push");
 document.getElementById("fetch-btn").onclick = () => sendAction("Fetch");
 
 const commitMsg = document.getElementById("commit-msg");
-document.getElementById("commit-btn").onclick = () => {
+  document.getElementById("stage-commit-push-btn").onclick = () => {
+    if (!commitMsg.value.trim()) return;
+    sendAction({ CommitAllPush: commitMsg.value.trim() });
+    commitMsg.value = "";
+  };
+  document.getElementById("commit-push-btn").onclick = () => {
+    if (!commitMsg.value.trim()) return;
+    const msg = commitMsg.value.trim();
+    sendAction({ Commit: msg });
+    sendAction("Push");
+    commitMsg.value = "";
+  };
+  document.getElementById("commit-btn").onclick = () => {
   if (!commitMsg.value.trim()) return;
   sendAction({ CommitAll: commitMsg.value.trim() });
   commitMsg.value = "";
@@ -485,9 +510,6 @@ document.getElementById("tabs").addEventListener("click", (event) => {
   const btn = event.target.closest(".tab");
   if (!btn || !lastState) return;
   activeTabId = Number(btn.dataset.tabId);
-  nukeArmed = false;
-  nukeStatus.textContent = "";
-  nukeBtn.textContent = "Nuke";
   render(lastState);
 });
 
@@ -497,10 +519,15 @@ document.getElementById("changes").addEventListener("click", (event) => {
   if (!tab) return;
   const actionBtn = event.target.closest(".action-btn");
   if (actionBtn) {
-    if (actionBtn.dataset.staged === "true") {
-      sendAction({ Unstage: actionBtn.dataset.path });
+    const path = actionBtn.dataset.path;
+    if (actionBtn.dataset.action === "discard") {
+      if (confirm(`Discard changes to ${path}?`)) {
+        sendAction({ Discard: path });
+      }
+    } else if (actionBtn.dataset.staged === "true") {
+      sendAction({ Unstage: path });
     } else {
-      sendAction({ Stage: actionBtn.dataset.path });
+      sendAction({ Stage: path });
     }
     return;
   }

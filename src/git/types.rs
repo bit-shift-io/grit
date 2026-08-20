@@ -61,6 +61,7 @@ pub struct CommitSummary {
 pub enum GitAction {
     Stage(String),
     Unstage(String),
+    Discard(String),
     Commit(String),
     CommitAll(String),
     CommitAllPush(String),
@@ -109,6 +110,7 @@ mod tests {
         let actions = vec![
             GitAction::Stage("a.txt".to_string()),
             GitAction::Unstage("b.txt".to_string()),
+            GitAction::Discard("c.txt".to_string()),
             GitAction::Commit("fix bug".to_string()),
             GitAction::CommitAll("all the things".to_string()),
             GitAction::CommitAllPush("ship it".to_string()),

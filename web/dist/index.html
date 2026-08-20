@@ -14,11 +14,10 @@
     <div class="section-body">
       <div id="overview" class="muted"></div>
       <div class="action-row">
-        <button id="pull-btn">Pull</button>
-        <button id="push-btn">Push</button>
-        <button id="fetch-btn">Fetch</button>
-        <button id="nuke-btn" class="danger">Nuke</button>
-        <span id="nuke-status" class="nuke-status"></span>
+        <button id="pull-btn" title="Fetch remote changes and merge them into the current branch">Pull</button>
+        <button id="push-btn" title="Push local commits to the remote">Push</button>
+        <button id="fetch-btn" title="Download remote changes without merging them">Fetch</button>
+        <button id="nuke-btn" class="danger" title="Discard all local changes and reset the repo to origin">Nuke</button>
       </div>
     </div>
   </section>
@@ -28,9 +27,10 @@
       <div class="section-body">
         <div class="commit-bar">
           <input id="commit-msg" type="text" placeholder="Commit message">
-          <button id="commit-push-btn">Commit + Push</button>
-          <button id="commit-btn">Commit</button>
-          <button id="discard-all-btn" class="danger">Discard All</button>
+          <button id="stage-commit-push-btn" title="Stage all changes, commit, and push to remote">Stage All + Commit + Push</button>
+          <button id="commit-push-btn" title="Commit staged changes and push to remote">Commit Staged + Push</button>
+          <button id="commit-btn" title="Commit staged changes locally">Commit</button>
+          <button id="discard-all-btn" class="danger" title="Discard all uncommitted changes">Discard All</button>
         </div>
         <div id="changes"></div>
       </div>
