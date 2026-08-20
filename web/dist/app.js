@@ -469,6 +469,23 @@ document.getElementById("pull-btn").onclick = () => sendAction("Pull");
 document.getElementById("push-btn").onclick = () => sendAction("Push");
 document.getElementById("fetch-btn").onclick = () => sendAction("Fetch");
 
+const commitMsg = document.getElementById("commit-msg");
+document.getElementById("commit-btn").onclick = () => {
+  if (!commitMsg.value.trim()) return;
+  sendAction({ CommitAll: commitMsg.value.trim() });
+  commitMsg.value = "";
+};
+document.getElementById("commit-push-btn").onclick = () => {
+  if (!commitMsg.value.trim()) return;
+  sendAction({ CommitAllPush: commitMsg.value.trim() });
+  commitMsg.value = "";
+};
+document.getElementById("discard-all-btn").onclick = () => {
+  if (confirm("Discard all uncommitted changes?")) {
+    sendAction("DiscardAll");
+  }
+};
+
 document.querySelectorAll(".section-title").forEach((title) => {
   title.onclick = () => {
     const section = title.parentElement;

@@ -1,5 +1,5 @@
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-body { margin: 0; padding: 1rem; max-width: 900px; }
+body { margin: 0; padding: 1rem; }
 .muted { color: var(--muted, #888); }
 
 .section { margin-top: 1rem; }
@@ -52,6 +52,38 @@ body { margin: 0; padding: 1rem; max-width: 900px; }
 #actions button:hover { background: var(--btn-hover, #ddd); }
 
 .change-row { padding: 0; }
+.commit-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+.commit-bar input {
+  flex: 1;
+  min-width: 12rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  background: var(--btn-bg, #eee);
+  color: inherit;
+  font: inherit;
+}
+.commit-bar button {
+  background: var(--btn-bg, #eee);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.commit-bar button:hover { background: var(--btn-hover, #ddd); }
+.commit-bar button.danger {
+  background: #b3261e;
+  color: #fff;
+  border-color: #b3261e;
+}
 .change-head {
   display: grid;
   grid-template-columns: 90px 1fr auto;

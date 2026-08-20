@@ -15,7 +15,7 @@ struct Cli {
     headless: bool,
 
     /// Port for the embedded web daemon.
-    #[arg(long, default_value_t = 8080)]
+    #[arg(long, default_value_t = 5000)]
     port: u16,
 
     /// Repository path to open.
@@ -68,7 +68,7 @@ mod tests {
     fn parses_defaults() {
         let cli = Cli::parse_from(["grit"]);
         assert!(!cli.headless);
-        assert_eq!(cli.port, 8080);
+        assert_eq!(cli.port, 5000);
         assert_eq!(cli.path, PathBuf::from("."));
     }
 

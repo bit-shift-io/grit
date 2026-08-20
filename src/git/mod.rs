@@ -369,6 +369,18 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Commit(message) => {
             run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
         }
+        GitAction::CommitAll(message) => {
+            run(git_command(repo_path).args(["add", "-A"]))?;
+            run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
+        }
+        GitAction::CommitAllPush(message) => {
+            run(git_command(repo_path).args(["add", "-A"]))?;
+            run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
+            run(git_command(repo_path).args(["push"]))?;
+        }
+        GitAction::DiscardAll => {
+            run(git_command(repo_path).args(["reset", "--hard", "HEAD"]))?;
+        }
         GitAction::Push => {
             run(git_command(repo_path).args(["push"]))?;
         }
@@ -536,6 +548,92 @@ mod tests {
         let state = get_repository_status(dir.path()).unwrap();
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.history[0].message, "second");
+    }
+
+    #[test]
+    fn commit_all_stages_and_commits_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+
+        execute_action(dir.path(), GitAction::CommitAll("all the things".to_string())).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
+        assert_eq!(state.history[0].message, "all the things");
+    }
+
+    #[test]
+    fn discard_all_resets_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "new\n").unwrap();
+        execute_action(dir.path(), GitAction::Stage("a.txt".to_string())).unwrap();
+
+        execute_action(dir.path(), GitAction::DiscardAll).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "v1\n"
+        );
+        assert!(dir.path().join("b.txt").exists(), "untracked kept");
+        assert!(state
+            .changes
+            .iter()
+            .all(|c| c.path == "b.txt"), "got: {:?}", state.changes);
+    }
+
+    #[test]
+    fn commit_all_push_commits_and_pushes_to_origin() {
+        let origin = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        OsCommand::new("git")
+            .args(["push", "-u", "origin", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+
+        execute_action(dir.path(), GitAction::CommitAllPush("ship it".to_string())).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
+        let remote_log = OsCommand::new("git")
+            .args(["-C", origin.path().to_str().unwrap(), "log", "--oneline", "-1"])
+            .output()
+            .unwrap();
+        let remote_log = String::from_utf8(remote_log.stdout).unwrap();
+        assert!(remote_log.contains("ship it"), "got: {remote_log}");
     }
 
     #[test]
