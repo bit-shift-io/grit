@@ -160,15 +160,19 @@ ids come from one monotonic allocator and are never reused within a session.
   sorted and capped at 32. Runs inside `get_repository_status`, so discovered
   scripts ride `RepoState.scripts` through the existing watcher → refresh →
   broadcast plumbing — new/deleted executables appear automatically.
-* **Launch** (`launch`): fire-and-forget `std::process::Command::spawn`,
-  detached from Grit's process group (`process_group(0)` on unix /
-  `DETACHED_PROCESS` on windows). stdout/stderr are **inherited** so script
-  output appears wherever Grit runs (terminal or journal); stdin is nulled.
-  A detached thread reaps the child, so nothing lingers as a zombie — beyond
-  that Grit never waits on or tracks launched processes. Shebang-less shell
-  scripts fall back to `/bin/sh` on ENOEXEC. Guards: reject absolute/`..`
-  paths, canonicalize containment (target must resolve inside the repo
-  root — symlink escapes fail), require an executable file.
+* **Launch** (`launch`): runs scripts inside a **terminal window** so
+  interactive menu/TUI scripts get a real TTY. Selection order (unix):
+  `$TERMINAL`, then well-known emulators (`x-terminal-emulator`, `gnome-terminal`,
+  `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `tilix`, `xterm`, each with
+  its exec-flag convention); macOS drives Terminal.app via osascript; Windows
+  opens a console with `cmd /K`. The shell payload reports the exit status and
+  keeps the window open until Enter. If no terminal can be spawned — or
+  `GRIT_NO_TERMINAL=1` (test hook) — it falls back to a direct detached spawn
+  with inherited stdio and a `/bin/sh` fallback for shebang-less scripts.
+  Fire-and-forget: detached process group, stdin nulled, a detached thread
+  reaps the spawner child; Grit never tracks the launched script. Guards:
+  reject absolute/`..` paths, canonicalize containment (symlink escapes fail),
+  require an executable file.
 * **Wire format**: `GitAction::RunScript(rel_path)` executes via the normal
   action dispatch in both Embedded and Remote modes; picking a script in the
   dropdown launches it immediately (no confirmation step). The section is

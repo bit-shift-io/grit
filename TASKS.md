@@ -44,5 +44,7 @@
 - [x] `src/actions.rs` launch(): inherit stdout/stderr so script output is visible where Grit runs; `/bin/sh` fallback for shebang-less scripts on ENOEXEC; detached reaper thread replaces handle forgetting; test for the shebang-less path (1 file)
 - [x] Desktop one-click run: remove two-press confirm (`pending_script`, `RunScriptConfirmed`, `CancelScript`) — dropdown selection dispatches `RunScript` immediately with a stale-entry guard; tests updated (2 files: `src/ui/state.rs`, `src/ui/components/actions.rs`)
 - [x] Web one-click run: drop `confirm()` gate on the Run Script button (1 file: `web/dist/app.js`)
+- [x] Case-insensitive scan dirs: `discover()` matches any root-level `scripts`/`tools` directory regardless of casing (`Scripts/`, `TOOLS/`, ...), keeping real names in rel paths for case-sensitive filesystems; test added (1 file: `src/actions.rs`)
+- [x] Terminal-window launching: `launch()` runs scripts in the system terminal — probe order: `$TERMINAL` → `TERM_PROGRAM` → `/proc` ancestor detection → `xdg-terminal-exec`/`xdg-terminal` → installed `.desktop` TerminalEmulator entries (via `freedesktop-desktop-entry`) → DE preferences → known-emulator table → unknown desktop entries (positional) → direct-spawn fallback + `GRIT_NO_TERMINAL` test hook; keep-open payload showing exit status; tests for payload/PATH lookup/desktop parsing (1 file: `src/actions.rs`)
 
 

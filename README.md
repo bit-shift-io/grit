@@ -21,9 +21,10 @@ all contained in one self-contained executable.
 - Commit, push, pull, and checkout branches
 - Browse commit history
 - Project Actions: scripts/executables in the repo root, `scripts/`, or
-  `tools/` are auto-discovered (live, via the file watcher) into an Actions
-  dropdown; picking one launches it immediately (output goes to the Grit
-  terminal/journal), fire-and-forget, disableable via `actions::ENABLED`
+  `tools/` (any casing) are auto-discovered (live, via the file watcher) into
+  an Actions dropdown; picking one launches it in a new terminal window
+  (interactive menu scripts work; window stays open showing exit status),
+  fire-and-forget, disableable via `actions::ENABLED`
 - Nuke button: wipe all local changes and re-clone the repository from scratch
 - Open tabs persist across restarts via a shared config file
   (`$XDG_CONFIG_HOME/bitshift/grit/config.json`)
@@ -47,6 +48,53 @@ cargo build --release
 # Headless web daemon only
 ./target/release/grit --headless --port 5000
 ```
+
+## Run as a systemd service (boot start)
+
+A **user unit** is the recommended way to run Grit at boot: it inherits your
+graphical session environment, so Project Actions can open terminal windows on
+your desktop, and it survives logout/login.
+
+Create `~/.config/systemd/user/grit.service`:
+
+```ini
+[Unit]
+Description=Grit Git client daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/Projects/grit/target/release/grit --headless --port 5000
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+Then enable and start it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now grit
+journalctl --user -u grit -f   # follow logs
+```
+
+Notes:
+
+- `After=`/`PartOf=`/`WantedBy=graphical-session.target` tie the service to
+  your login session; GNOME publishes the Wayland/X environment to the user
+  manager, so scripts launched from Grit open in Ptyxis or your configured
+  terminal. Pin one explicitly with `Environment=TERMINAL=ptyxis` in the
+  `[Service]` section if you prefer.
+- A **system-level** unit (`/etc/systemd/system/grit.service`, runs before
+  login) works too, but it cannot reach your graphical session: script
+  launches fall back to detached execution with output in
+  `journalctl -u grit`. You can bridge the session manually with
+  `Environment=XDG_RUNTIME_DIR=/run/user/<uid>` and
+  `Environment=WAYLAND_DISPLAY=wayland-0`, but the user unit is simpler.
+- The desktop GUI automatically attaches to a running daemon on its port
+  instead of starting a second server, so `grit --path .` after boot connects
+  to the systemd instance.
 
 ## Development
 

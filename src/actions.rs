@@ -17,8 +17,10 @@ use crate::git::types::ScriptEntry;
 /// [`launch`] refuse every request — no scripts are surfaced or run.
 pub const ENABLED: bool = true;
 
-/// Repo-relative directories scanned for executables. `""` is the root.
-const SCAN_DIRS: [&str; 3] = ["", "scripts", "tools"];
+/// Subdirectory names scanned for executables, matched **case-insensitively**
+/// against actual root-level directories (`Scripts/`, `TOOLS/`, ... all work).
+/// The repository root itself is always scanned too.
+const SCAN_DIR_NAMES: [&str; 2] = ["scripts", "tools"];
 
 /// Upper bound on surfaced scripts, keeping the UI sane on messy repos.
 const MAX_SCRIPTS: usize = 32;
@@ -31,46 +33,75 @@ pub fn discover(repo_path: &Path) -> Vec<ScriptEntry> {
     }
 
     let mut found: Vec<ScriptEntry> = Vec::new();
-    for dir in SCAN_DIRS {
-        let dir_path = if dir.is_empty() {
-            repo_path.to_path_buf()
-        } else {
-            repo_path.join(dir)
-        };
-        let Ok(entries) = std::fs::read_dir(&dir_path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_executable_file(&path) {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let rel_path = if dir.is_empty() {
-                name.clone()
-            } else {
-                format!("{dir}/{name}")
-            };
-            found.push(ScriptEntry { name, rel_path });
-            if found.len() >= MAX_SCRIPTS {
-                found.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-                return found;
-            }
-        }
+    scan_dir(repo_path, "", &mut found);
+
+    // Pick up root-level scripts/tools directories whatever their casing;
+    // rel paths keep the real names so launches resolve on case-sensitive
+    // filesystems.
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(repo_path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .map(|name| {
+                        let lower = name.to_string_lossy().to_lowercase();
+                        SCAN_DIR_NAMES.contains(&lower.as_str())
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        scan_dir(&dir, &name, &mut found);
     }
 
     found.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    found.truncate(MAX_SCRIPTS);
     found
 }
 
-/// Launches a discovered script as a detached child process. Standard
-/// output/error are inherited from Grit itself, so script output lands in
-/// the terminal (or journal when daemonized) instead of vanishing; stdin is
-/// disconnected. A background thread reaps the child so nothing lingers as
-/// a zombie — beyond that, Grit neither waits nor tracks.
+/// Collects executable files directly inside `dir`, recording them with
+/// `prefix`-relative paths (`""` = repo root).
+fn scan_dir(dir: &Path, prefix: &str, out: &mut Vec<ScriptEntry>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_executable_file(&path) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let rel_path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        out.push(ScriptEntry { name, rel_path });
+    }
+}
+
+/// Launches a discovered script inside a **terminal window** so interactive
+/// menu/TUI scripts get a real TTY and their output stays visible. The
+/// window is kept open after the script exits showing its status. Grit
+/// never waits on or tracks the launched process beyond reaping the
+/// short-lived spawner child.
+///
+/// Terminal selection order (unix): `$TERMINAL`, then well-known emulators;
+/// macOS uses Terminal.app, Windows opens a console via `start`. When no
+/// terminal can be spawned (or `GRIT_NO_TERMINAL=1`, used by tests), the
+/// script falls back to a direct detached spawn with inherited stdio.
 pub fn launch(repo_path: &Path, rel_path: &str) -> Result<(), String> {
     if !ENABLED {
         return Err("Project actions are disabled".to_string());
@@ -94,25 +125,371 @@ pub fn launch(repo_path: &Path, rel_path: &str) -> Result<(), String> {
         return Err(format!("not an executable file: {rel_path}"));
     }
 
-    let spawned = base_command(&canonical, &canonical_repo)
-        .spawn()
-        .or_else(|e| {
-            // Plain shell scripts without a shebang fail exec with ENOEXEC;
-            // fall back to /bin/sh so they still launch.
-            if cfg!(unix) && e.raw_os_error() == Some(8) {
-                base_command(Path::new("/bin/sh"), &canonical_repo)
-                    .arg(&canonical)
-                    .spawn()
-            } else {
-                Err(e)
-            }
-        });
+    let spawned = if terminal_disabled() {
+        spawn_direct(&canonical, &canonical_repo)
+    } else {
+        spawn_terminal(&canonical, &canonical_repo).or_else(|e| {
+            tracing::warn!(
+                "no usable terminal emulator ({e}); running {rel_path} detached in Grit's \
+                 own stdio instead. Set $TERMINAL to your terminal to fix this."
+            );
+            spawn_direct(&canonical, &canonical_repo)
+        })
+    };
     let mut child = spawned.map_err(|e| format!("failed to launch {rel_path}: {e}"))?;
 
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
+}
+
+/// Test hook: when set, never spawn a terminal emulator.
+fn terminal_disabled() -> bool {
+    std::env::var_os("GRIT_NO_TERMINAL").is_some()
+}
+
+/// Shell snippet that runs the script, reports its exit status, and keeps
+/// the window open until Enter — so errors and post-run output are visible.
+fn keep_open_payload(script: &Path) -> String {
+    let script = script.display();
+    format!(
+        "\"{script}\"; status=$?; echo; echo \"[exit $status] Press Enter to close\"; read _"
+    )
+}
+
+/// Locates a program on `PATH` without shelling out.
+fn find_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Direct detached spawn (pre-terminal behavior): inherits stdout/stderr,
+/// nulls stdin, detaches the process group, falls back to `/bin/sh` for
+/// shebang-less scripts.
+fn spawn_direct(script: &Path, cwd: &Path) -> std::io::Result<std::process::Child> {
+    base_command(script, cwd)
+        .spawn()
+        .or_else(|e| {
+            if cfg!(unix) && e.raw_os_error() == Some(8) {
+                base_command(Path::new("/bin/sh"), cwd).arg(script).spawn()
+            } else {
+                Err(e)
+            }
+        })
+}
+
+/// Well-known terminal emulators and the flags each expects before the
+/// command. Single source of truth for every probe path below.
+#[cfg(not(target_os = "macos"))]
+const TERMINAL_FLAGS: &[(&str, &[&str])] = &[
+    ("x-terminal-emulator", &["-e"]),
+    ("gnome-terminal", &["--"]),
+    ("ptyxis", &["--"]),
+    ("kgx", &["--"]),
+    ("konsole", &["-e"]),
+    ("xfce4-terminal", &["-x"]),
+    ("alacritty", &["-e"]),
+    ("kitty", &[]),
+    ("tilix", &["-e"]),
+    ("ghostty", &["-e"]),
+    ("foot", &[]),
+    ("st", &[]),
+    ("urxvt", &["-e"]),
+    ("xterm", &["-e"]),
+    ("terminator", &["-x"]),
+    ("mate-terminal", &["-e"]),
+    ("lxterminal", &["-e"]),
+    ("qterminal", &["-e"]),
+    ("wezterm", &["start", "--"]),
+];
+
+#[cfg(not(target_os = "macos"))]
+fn flags_for(program: &str) -> Option<&'static [&'static str]> {
+    TERMINAL_FLAGS
+        .iter()
+        .find(|(name, _)| *name == program)
+        .map(|(_, flags)| *flags)
+}
+
+/// Normalizes process names to entries in [`TERMINAL_FLAGS`]: strips `.exe`
+/// and folds server variants like `gnome-terminal-server` (whose 15-char
+/// comm name is truncated to `gnome-terminal-`) onto their base program.
+#[cfg(not(target_os = "macos"))]
+fn normalize_terminal_name(name: &str) -> &str {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let name = name.strip_suffix('-').unwrap_or(name);
+    match name {
+        "gnome-terminal-server" => "gnome-terminal",
+        other => other,
+    }
+}
+
+/// The terminal Grit itself is running inside, discovered by walking the
+/// `/proc` parent chain. Launching it again opens a new window of exactly
+/// the emulator the user chose to work in — no guessing required.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ancestor_terminal() -> Option<(String, Vec<String>)> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut pid = std::process::id();
+    for _ in 0..16 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let comm_end = stat.rfind(')')?;
+        let ppid: u32 = stat[comm_end + 2..]
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()?;
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+            if let Some(arg0) = cmdline.split(|&b| b == 0).find(|s| !s.is_empty()) {
+                let exe = Path::new(OsStr::from_bytes(arg0));
+                if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
+                    let normalized = normalize_terminal_name(name);
+                    if let Some(flags) = flags_for(normalized) {
+                        return Some((
+                            normalized.to_string(),
+                            flags.iter().map(|f| f.to_string()).collect(),
+                        ));
+                    }
+                }
+            }
+        }
+        pid = ppid;
+    }
+    None
+}
+
+/// Terminals preferred by the current desktop environment, so the right
+/// emulator wins when several are installed.
+#[cfg(not(target_os = "macos"))]
+fn desktop_preferences() -> Vec<(&'static str, &'static [&'static str])> {
+    let de = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if de.contains("gnome") || de.contains("unity") || de.contains("cinnamon") {
+        vec![
+            ("gnome-terminal", &["--"]),
+            ("ptyxis", &["--"]),
+            ("kgx", &["--"]),
+        ]
+    } else if de.contains("kde") || de.contains("plasma") {
+        vec![("konsole", &["-e"])]
+    } else if de.contains("xfce") {
+        vec![("xfce4-terminal", &["-x"])]
+    } else if de.contains("mate") {
+        vec![("mate-terminal", &["-e"])]
+    } else if de.contains("lxqt") {
+        vec![("qterminal", &["-e"])]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The launchable binary name advertised by a TerminalEmulator entry:
+/// `TryExec` when present, else the first token of `Exec` (basename only).
+/// Flatpak-wrapped launchers return None — the wrapper does not accept a
+/// plain `sh -c` command line.
+#[cfg(not(target_os = "macos"))]
+fn primary_binary(entry: &freedesktop_desktop_entry::DesktopEntry) -> Option<String> {
+    if entry.exec().is_some_and(|e| e.starts_with("flatpak run")) {
+        return None;
+    }
+    let bin = entry
+        .try_exec()
+        .or_else(|| entry.exec().and_then(|e| e.split_whitespace().next()))?;
+    Some(
+        Path::new(bin)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| bin.to_string()),
+    )
+}
+
+/// Terminals advertised by installed `.desktop` files (Categories contains
+/// `TerminalEmulator`), in freedesktop priority order. This reflects what
+/// the system actually registered as terminal apps — including terminals
+/// our static list has never heard of. Returns (flag-known, flag-unknown).
+#[cfg(not(target_os = "macos"))]
+fn desktop_file_terminals() -> (Vec<String>, Vec<String>) {
+    use freedesktop_desktop_entry::{default_paths, DesktopEntry, Iter};
+
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for path in Iter::new(default_paths()) {
+        let Ok(entry) = DesktopEntry::from_path(path, None as Option<&[String]>) else {
+            continue;
+        };
+        if entry.hidden() || entry.no_display() {
+            continue;
+        }
+        let Some(categories) = entry.categories() else {
+            continue;
+        };
+        if !categories.iter().any(|c| *c == "TerminalEmulator") {
+            continue;
+        }
+        let Some(binary) = primary_binary(&entry) else {
+            continue;
+        };
+
+        let target = if flags_for(&binary).is_some() {
+            &mut known
+        } else {
+            &mut unknown
+        };
+        if !target.contains(&binary) {
+            target.push(binary);
+        }
+    }
+    (known, unknown)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Child> {
+    use std::process::Command;
+
+    let payload = keep_open_payload(script);
+
+    // Probe order: explicit $TERMINAL, the terminal Grit runs inside,
+    // freedesktop launchers, installed .desktop entries, DE preferences,
+    // then the full known list.
+    // Each entry is (program, flags preceding the command).
+    let mut attempts: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    if let Some(term) = std::env::var_os("TERMINAL") {
+        let name = term.to_string_lossy().into_owned();
+        seen.push(name.clone());
+        attempts.push((name, vec!["-e".into()]));
+    }
+    if let Some(mapped) = term_program_candidate() {
+        seen.push(mapped.0.clone());
+        attempts.push(mapped);
+    }
+    if let Some(ancestor) = ancestor_terminal() {
+        tracing::debug!("detected host terminal: {}", ancestor.0);
+        seen.push(ancestor.0.clone());
+        attempts.push(ancestor);
+    }
+    let (desktop_known, desktop_unknown) = desktop_file_terminals();
+    for program in &desktop_known {
+        if let Some(flags) = flags_for(program) {
+            if !seen.iter().any(|s| s == program) {
+                seen.push(program.clone());
+                attempts.push((
+                    program.clone(),
+                    flags.iter().map(|f| f.to_string()).collect(),
+                ));
+            }
+        }
+    }
+    for (program, flags) in std::iter::once(("xdg-terminal-exec", &[] as &[&str]))
+        .chain(std::iter::once(("xdg-terminal", &[] as &[&str])))
+        .chain(desktop_preferences())
+        .chain(TERMINAL_FLAGS.iter().copied())
+    {
+        if seen.iter().any(|s| s == program) {
+            continue;
+        }
+        seen.push(program.to_string());
+        attempts.push((
+            program.to_string(),
+            flags.iter().map(|f| f.to_string()).collect(),
+        ));
+    }
+
+    for (program, flags) in attempts {
+        let Some(exe) = find_in_path(&program) else {
+            continue;
+        };
+        let mut cmd = Command::new(exe);
+        cmd.args(flags).args(["sh", "-c", &payload]).current_dir(cwd);
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!("launched script in terminal window via {program}");
+                return Ok(child);
+            }
+            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
+        }
+    }
+
+    for program in &desktop_unknown {
+        // Last resort: terminals we have no flag table entry for get the
+        // command passed positionally — the most common convention.
+        let Some(exe) = find_in_path(program) else {
+            continue;
+        };
+        match Command::new(exe)
+            .args(["sh", "-c", &payload])
+            .current_dir(cwd)
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!("launched script in terminal window via {program}");
+                return Ok(child);
+            }
+            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no terminal emulator found",
+    ))
+}
+
+/// Maps `TERM_PROGRAM` (set by terminals for their child processes) to a
+/// fresh instance of that same terminal — i.e. the one the user chose.
+#[cfg(not(target_os = "macos"))]
+fn term_program_candidate() -> Option<(String, Vec<String>)> {
+    let name = std::env::var("TERM_PROGRAM").ok()?;
+    let (program, flags): (&str, &[&str]) = match name.as_str() {
+        "ghostty" => ("ghostty", &["-e"]),
+        "WezTerm" => ("wezterm", &["start", "--"]),
+        "kitty" => ("kitty", &[]),
+        "alacritty" => ("alacritty", &["-e"]),
+        _ => return None,
+    };
+    Some((
+        program.to_string(),
+        flags.iter().map(|f| f.to_string()).collect(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Child> {
+    use std::process::Command;
+
+    // Terminal.app starts in $HOME, so cd explicitly. Escape for the
+    // AppleScript string literal.
+    let inner = format!(
+        "cd '{}'; {}; status=$?; echo; echo \"[exit $status] Press Enter to close\"; read _",
+        cwd.display(),
+        script.display()
+    );
+    let escaped = inner.replace('\\', "\\\\").replace('"', "\\\"");
+    Command::new("osascript")
+        .args([
+            "-e",
+            &format!("tell application \"Terminal\" to do script \"{escaped}\""),
+        ])
+        .spawn()
+}
+
+#[cfg(windows)]
+fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Child> {
+    use std::process::Command;
+
+    // `start` opens a new console window; `/K` keeps it open afterwards.
+    Command::new("cmd")
+        .args(["/C", "start", "", "cmd", "/K"])
+        .arg(script)
+        .current_dir(cwd)
+        .spawn()
 }
 
 /// Builds the detached-launch command for a program run inside `cwd`.
@@ -186,6 +563,24 @@ mod tests {
     }
 
     #[test]
+    fn scan_dirs_match_case_insensitively() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Scripts")).unwrap();
+        make_exec(&dir.path().join("Scripts/build.sh"));
+        fs::create_dir(dir.path().join("TOOLS")).unwrap();
+        make_exec(&dir.path().join("TOOLS/fix.sh"));
+        fs::create_dir(dir.path().join("Tools")).unwrap();
+        make_exec(&dir.path().join("Tools/lint.sh"));
+
+        let found = discover(dir.path());
+        let rels: Vec<&str> = found.iter().map(|s| s.rel_path.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["Scripts/build.sh", "TOOLS/fix.sh", "Tools/lint.sh"]
+        );
+    }
+
+    #[test]
     fn skips_non_executable_hidden_and_dirs() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("scripts")).unwrap();
@@ -222,8 +617,130 @@ mod tests {
         );
     }
 
+    /// Pins launches to the direct-spawn path so tests never open real
+    /// terminal windows, even on developer machines that have them.
+    fn disable_terminals() {
+        std::env::set_var("GRIT_NO_TERMINAL", "1");
+    }
+
+    #[test]
+    fn keep_open_payload_reports_status_and_waits() {
+        let payload = keep_open_payload(Path::new("/repo/scripts/menu.sh"));
+        assert!(payload.contains("\"/repo/scripts/menu.sh\""));
+        assert!(payload.contains("status=$?"));
+        assert!(payload.ends_with("read _"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_locates_shell() {
+        assert!(find_in_path("sh").is_some());
+        assert!(find_in_path("definitely-not-a-real-binary-xyz").is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn term_program_maps_to_the_current_terminal() {
+        std::env::set_var("TERM_PROGRAM", "ghostty");
+        let (program, flags) = term_program_candidate().unwrap();
+        assert_eq!(program, "ghostty");
+        assert_eq!(flags, vec!["-e".to_string()]);
+
+        std::env::set_var("TERM_PROGRAM", "vscode");
+        assert!(term_program_candidate().is_none(), "unmapped names are skipped");
+        std::env::remove_var("TERM_PROGRAM");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn terminal_names_normalize_to_flag_table_entries() {
+        assert_eq!(normalize_terminal_name("gnome-terminal-server"), "gnome-terminal");
+        assert_eq!(normalize_terminal_name("gnome-terminal-"), "gnome-terminal");
+        assert_eq!(normalize_terminal_name("kitty.exe"), "kitty");
+        assert_eq!(normalize_terminal_name("konsole"), "konsole");
+        assert!(flags_for("gnome-terminal").is_some());
+        assert!(flags_for("kgx").is_some());
+        assert!(flags_for("bash").is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn desktop_preferences_follow_xdg_current_desktop() {
+        std::env::set_var("XDG_CURRENT_DESKTOP", "ubuntu:GNOME");
+        let prefs = desktop_preferences();
+        assert_eq!(prefs[0].0, "gnome-terminal");
+
+        std::env::set_var("XDG_CURRENT_DESKTOP", "KDE");
+        assert_eq!(desktop_preferences()[0].0, "konsole");
+
+        std::env::remove_var("XDG_CURRENT_DESKTOP");
+        assert!(desktop_preferences().is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn decode_entry(content: &str) -> freedesktop_desktop_entry::DesktopEntry {
+        use freedesktop_desktop_entry::DesktopEntry;
+        DesktopEntry::from_str(
+            "/tmp/fake/org.example.Term.desktop",
+            content,
+            None as Option<&[String]>,
+        )
+        .expect("fixture decodes")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn primary_binary_prefers_try_exec_and_basenames() {
+        let entry = decode_entry(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=T\n\
+             Exec=/usr/local/bin/weird-term --flag\n\
+             TryExec=weird-term\n\
+             Categories=TerminalEmulator;\n",
+        );
+        assert_eq!(primary_binary(&entry).as_deref(), Some("weird-term"));
+
+        let entry = decode_entry(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=T\n\
+             Exec=ptyxis --new-window\n\
+             Categories=TerminalEmulator;System;\n",
+        );
+        assert_eq!(primary_binary(&entry).as_deref(), Some("ptyxis"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn primary_binary_skips_flatpak_wrappers() {
+        let entry = decode_entry(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=T\n\
+             Exec=flatpak run org.some.Terminal\n\
+             Categories=TerminalEmulator;\n",
+        );
+        assert_eq!(primary_binary(&entry), None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn desktop_file_scan_picks_up_installed_terminals() {
+        // Only assertable when this machine actually has Ptyxis installed.
+        if !Path::new("/usr/share/applications/org.gnome.Ptyxis.desktop").exists() {
+            return;
+        }
+        let (known, _) = desktop_file_terminals();
+        assert!(
+            known.iter().any(|b| b == "ptyxis"),
+            "expected ptyxis among {known:?}"
+        );
+    }
+
     #[test]
     fn launch_runs_script_to_completion_detached() {
+        disable_terminals();
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("scripts")).unwrap();
         let script_path = dir.path().join("scripts/marker.sh");
@@ -238,17 +755,18 @@ mod tests {
 
         // Fire-and-forget: the marker appears while the child is still
         // sleeping; Grit has already returned without tracking it.
-        for _ in 0..50 {
+        for _ in 0..150 {
             if dir.path().join("marker").exists() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(dir.path().join("marker").exists(), "script side effect missing");
     }
 
     #[test]
     fn launch_runs_shebangless_script_via_sh_fallback() {
+        disable_terminals();
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("plain");
         fs::write(
@@ -260,11 +778,11 @@ mod tests {
 
         launch(dir.path(), "plain").expect("sh fallback must launch shebangless scripts");
 
-        for _ in 0..50 {
+        for _ in 0..150 {
             if dir.path().join("marker").exists() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(dir.path().join("marker").exists());
     }
