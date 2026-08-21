@@ -33,22 +33,54 @@ impl Default for WebState {
 }
 
 /// Shared registry that both the desktop GUI and web server read/write.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TabRegistry {
     tx: watch::Sender<WebState>,
     rx: watch::Receiver<WebState>,
+    /// Monotonic id allocator; ids are never reused within a session so
+    /// clients can treat every unseen id as a genuinely new tab.
+    next_id: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for TabRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            rx: self.rx.clone(),
+            next_id: std::sync::atomic::AtomicUsize::new(
+                self.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
 }
 
 impl TabRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         let (tx, rx) = watch::channel(WebState::default());
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            next_id: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocates a fresh tab id that will never be handed out again.
+    pub fn alloc_id(&self) -> usize {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ensures future allocations stay above every id in `used`.
+    pub fn raise_next_id_floor(&self, used: impl IntoIterator<Item = usize>) {
+        let max = used.into_iter().max().map_or(0, |m| m + 1);
+        self.next_id.fetch_max(max, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Creates a registry pre-seeded with a single repository tab.
     pub fn with_single_tab(id: usize, name: String, repo_path: PathBuf) -> Self {
         let registry = Self::new();
+        registry.raise_next_id_floor(std::iter::once(id));
         registry.set(WebState {
             active: 0,
             tabs: vec![WebTab {
@@ -191,6 +223,30 @@ mod tests {
             tabs: vec![sample_tab(0, "new")],
         });
         assert!(rx.changed().await.is_ok());
+        assert_eq!(registry.snapshot().tabs.len(), 1);
+    }
+
+    #[test]
+    fn alloc_ids_are_monotonic_and_never_reused() {
+        let registry = TabRegistry::with_single_tab(3, "a".to_string(), PathBuf::from("/repo/a"));
+        assert_eq!(registry.alloc_id(), 4);
+        assert_eq!(registry.alloc_id(), 5);
+
+        // Removing the highest tab must not recycle its id.
+        registry.raise_next_id_floor(std::iter::once(5));
+        assert_eq!(registry.alloc_id(), 6);
+    }
+
+    #[test]
+    fn clone_shares_watch_channel_but_copies_counter() {
+        let registry = TabRegistry::new();
+        let _ = registry.alloc_id();
+        let clone = registry.clone();
+        assert_eq!(clone.alloc_id(), 1);
+        clone.set(WebState {
+            active: 0,
+            tabs: vec![sample_tab(9, "x")],
+        });
         assert_eq!(registry.snapshot().tabs.len(), 1);
     }
 }

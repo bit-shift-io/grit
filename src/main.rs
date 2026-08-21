@@ -1,6 +1,7 @@
 mod git;
 mod server;
 mod ui;
+mod shared_config;
 
 use std::path::{Path, PathBuf};
 
@@ -19,15 +20,16 @@ struct Cli {
     port: u16,
 
     /// Repository path to open.
-    #[arg(long, default_value = ".")]
-    path: PathBuf,
+    #[arg(long)]
+    path: Option<PathBuf>,
 }
 
 fn main() -> iced::Result {
     let cli = Cli::parse();
     tracing_subscriber::fmt::init();
 
-    let repo_path = resolve_path(&cli.path);
+    let open_explicit = cli.path.is_some();
+    let repo_path = resolve_path(cli.path.as_deref().unwrap_or(Path::new(".")));
 
     if cli.headless {
         let registry = server::registry::TabRegistry::with_single_tab(
@@ -45,7 +47,7 @@ fn main() -> iced::Result {
         let registry = server::registry::TabRegistry::new();
         let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
         runtime.spawn(server::run(registry.clone(), cli.port));
-        ui::state::run(registry, repo_path)
+        ui::state::run(registry, repo_path, open_explicit)
     }
 }
 
@@ -69,7 +71,7 @@ mod tests {
         let cli = Cli::parse_from(["grit"]);
         assert!(!cli.headless);
         assert_eq!(cli.port, 5000);
-        assert_eq!(cli.path, PathBuf::from("."));
+        assert!(cli.path.is_none());
     }
 
     #[test]
@@ -77,7 +79,7 @@ mod tests {
         let cli = Cli::parse_from(["grit", "--headless", "--port", "9090", "--path", "/repo"]);
         assert!(cli.headless);
         assert_eq!(cli.port, 9090);
-        assert_eq!(cli.path, PathBuf::from("/repo"));
+        assert_eq!(cli.path, Some(PathBuf::from("/repo")));
     }
 
     #[test]

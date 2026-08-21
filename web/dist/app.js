@@ -7,6 +7,8 @@ let expandedDetailEl = null;
 let expandedCommitKey = null;
 let expandedCommitEl = null;
 let awaitingNewTab = false;
+// Local-only view state: the "+" form never exists as a server-side tab.
+let showAddForm = false;
 let browserDir = null;
 let browserParent = null;
 const knownTabIds = new Set();
@@ -109,21 +111,43 @@ function setupAddRepoForm(tab) {
       return;
     }
     errorEl.style.display = "none";
+    awaitingNewTab = true;
     sendAction({ NewTab: JSON.stringify({ name: nameInput.value.trim(), path }) });
   };
 
-  cancelBtn.onclick = () => sendAction("CloseTab");
+  cancelBtn.onclick = () => {
+    showAddForm = false;
+    if (lastState && lastState.tabs.length > 0) {
+      if (activeTabId === null || !lastState.tabs.some((t) => t.id === activeTabId)) {
+        activeTabId = getInitialTabId(lastState);
+      }
+      updateUrlTab(activeTabId);
+    } else {
+      updateUrlTab(null);
+    }
+    render(lastState);
+  };
 }
 
 ws.onmessage = (event) => {
   const state = JSON.parse(event.data);
-  if (activeTabId === null) {
-    activeTabId = state.active;
+  // Invariant: exactly one active view at all times — a real tab whenever
+  // any exist, otherwise the client-local "+" form (activeTabId === null).
+  if (state.tabs.length > 0) {
+    if (activeTabId === null || !state.tabs.some((t) => t.id === activeTabId)) {
+      activeTabId = getInitialTabId(state) ?? sortedTabs(state)[0].id;
+    }
+  } else {
+    activeTabId = null;
   }
   const newIds = state.tabs.map((t) => t.id).filter((id) => !knownTabIds.has(id));
-  if (awaitingNewTab && newIds.length > 0) {
-    activeTabId = newIds[0];
-    awaitingNewTab = false;
+  if (awaitingNewTab) {
+    const target = state.tabs.find((t) => newIds.includes(t.id));
+    if (target) {
+      activeTabId = target.id;
+      awaitingNewTab = false;
+      showAddForm = false;
+    }
   }
   for (const id of state.tabs.map((t) => t.id)) {
     knownTabIds.add(id);
@@ -133,6 +157,7 @@ ws.onmessage = (event) => {
   if (prev !== null && JSON.stringify(prev) === JSON.stringify(state)) {
     return;
   }
+  updateUrlTab(activeTabId);
   render(state);
 };
 
@@ -147,25 +172,23 @@ function activeTab(state) {
 function render(state) {
   renderTabBar(state);
 
-  if (state.tabs.length === 0) {
-    return;
-  }
-  const tab = activeTab(state);
-  
   const addRepoForm = document.getElementById("add-repo-form");
   const repoView = document.getElementById("repo-view");
   const historySection = document.getElementById("history-section");
   const actionsSection = document.getElementById("actions");
-  
-  if (tab && tab.repo_path === "") {
+
+  if (showAddForm || state.tabs.length === 0) {
+    updateUrlTab(null);
     addRepoForm.style.display = "block";
     repoView.style.display = "none";
     historySection.style.display = "none";
     actionsSection.style.display = "none";
-    setupAddRepoForm(tab);
+    setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
   }
+  const tab = activeTab(state);
+  
   addRepoForm.style.display = "none";
   repoView.style.display = "block";
   historySection.style.display = "block";
@@ -437,7 +460,7 @@ function renderCommitSummary(summary) {
 function renderTabBar(state) {
   const tabsEl = document.getElementById("tabs");
   tabsEl.textContent = "";
-  for (const tab of state.tabs) {
+  for (const tab of sortedTabs(state)) {
     const btn = document.createElement("button");
     btn.className = "tab";
     if (tab.id === activeTabId) {
@@ -455,6 +478,39 @@ function renderTabBar(state) {
   newTabBtn.textContent = "+";
   newTabBtn.title = "New tab";
   tabsEl.appendChild(newTabBtn);
+}
+
+function sortedTabs(state) {
+  return [...state.tabs].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+  );
+}
+
+function updateUrlTab(tabId) {
+  const url = new URL(window.location.href);
+  const tabs = lastState ? sortedTabs(lastState) : [];
+  const idx = tabId === null ? -1 : tabs.findIndex((t) => t.id === tabId);
+  if (idx >= 0) {
+    url.searchParams.set("t", String(idx));
+  } else {
+    url.searchParams.delete("t");
+  }
+  window.history.replaceState({}, "", url);
+}
+
+function getInitialTabId(state) {
+  const url = new URL(window.location.href);
+  const t = url.searchParams.get("t");
+  const sorted = sortedTabs(state);
+  if (t !== null) {
+    const idx = parseInt(t, 10);
+    if (!isNaN(idx) && idx >= 0 && idx < sorted.length) {
+      return sorted[idx].id;
+    }
+  }
+  // state.active is an index into the tab list, not an id.
+  const byIndex = sorted[state.active] ?? sorted[0];
+  return byIndex ? byIndex.id : null;
 }
 
 async function toggleDiff(detailEl, tab, path) {
@@ -480,8 +536,7 @@ async function showDiff(detailEl, tab, path) {
   const key = `${tab.id}:${path}`;
   const cached = pairCache.get(key);
   if (cached) {
-    detailEl.textContent = "";
-    detailEl.appendChild(renderSideBySide(cached.original, cached.current));
+    renderFilePair(detailEl, cached);
     return;
   }
   detailEl.textContent = "Loading...";
@@ -489,11 +544,25 @@ async function showDiff(detailEl, tab, path) {
     const response = await fetch(`/files?tab=${tab.id}&path=${encodeURIComponent(path)}`);
     const pair = await response.json();
     pairCache.set(key, pair);
-    detailEl.textContent = "";
-    detailEl.appendChild(renderSideBySide(pair.original, pair.current));
+    renderFilePair(detailEl, pair);
   } catch (err) {
     detailEl.textContent = `Failed to load diff: ${err}`;
   }
+}
+
+function renderFilePair(detailEl, pair) {
+  detailEl.textContent = "";
+  if (pair.original === pair.current) {
+    // Contents are identical: the change is mode/permission-only.
+    detailEl.textContent =
+      "No content changes — this file was changed by permissions or metadata only.";
+    return;
+  }
+  if (pair.original.includes("\u0000") || pair.current.includes("\u0000")) {
+    detailEl.textContent = "Binary file — no text diff available.";
+    return;
+  }
+  detailEl.appendChild(renderSideBySide(pair.original, pair.current));
 }
 
 function splitLines(text) {
@@ -616,6 +685,18 @@ document.getElementById("pull-btn").onclick = () => sendAction("Pull");
 document.getElementById("push-btn").onclick = () => sendAction("Push");
 document.getElementById("fetch-btn").onclick = () => sendAction("Fetch");
 
+document.getElementById("remove-tab-btn").onclick = () => {
+  const tab = lastState && activeTab(lastState);
+  if (!tab) return;
+  if (confirm(`Remove "${tab.name}"? The repository on disk is kept.`)) {
+    // Send the explicit id: removal must not depend on selection state.
+    ws.send(JSON.stringify({ tab: tab.id, action: "CloseTab" }));
+    activeTabId = null;
+    awaitingNewTab = false;
+    showAddForm = false;
+  }
+};
+
 const commitMsg = document.getElementById("commit-msg");
   document.getElementById("stage-commit-push-btn").onclick = () => {
     if (!commitMsg.value.trim()) return;
@@ -649,11 +730,15 @@ document.getElementById("tabs").addEventListener("click", (event) => {
   const btn = event.target.closest(".tab");
   if (!btn || !lastState) return;
   if (btn.classList.contains("new-tab")) {
-    awaitingNewTab = true;
-    sendAction({ NewTab: JSON.stringify({ name: "new", path: "" }) });
+    // The "+" toggles the local Add Repository view; no server round-trip.
+    showAddForm = true;
+    updateUrlTab(null);
+    if (lastState) render(lastState);
     return;
   }
   activeTabId = Number(btn.dataset.tabId);
+  showAddForm = false;
+  updateUrlTab(activeTabId);
   render(lastState);
 });
 

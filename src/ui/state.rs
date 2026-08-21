@@ -1,4 +1,10 @@
 //! Iced application state, message dispatch, and background-task wiring.
+//!
+//! The desktop GUI is a pure client of the shared [`TabRegistry`]: every tab
+//! mutation (opening/closing repositories) goes through the same server-side
+//! operations the web UI uses, and the local tab list is derived exclusively
+//! from `WebTabsSync` deliveries. The GUI never writes the registry's tab
+//! list and never persists configuration — the server owns both.
 
 use std::path::PathBuf;
 
@@ -7,20 +13,24 @@ use iced::{Element, Length, Subscription, Task};
 
 use crate::git::types::{GitAction, RepoState};
 use crate::ui::components;
-use crate::ui::persistence::{self, SavedRepo};
 
 /// UI events produced by widgets and background tasks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     // Tab management.
     AddTabPressed,
     OpenTab(usize),
     CloseTab(usize),
+    CancelAddForm,
     NewRepoNameChanged(String),
     NewRepoPathChanged(String),
     BrowseFolder,
     FolderPicked(Option<PathBuf>),
     OpenNewRepo,
+    /// Outcome of the shared `open_repo_tab` operation.
+    OpenRepoResult(Result<usize, String>),
+    /// Fire-and-forget result for operations whose effect arrives via sync.
+    Nop,
     // Git actions applied to the active repository tab.
     StageFile(String),
     UnstageFile(String),
@@ -37,6 +47,9 @@ pub enum Message {
     TabRefresh(usize),
     TabStateUpdated(usize, RepoState),
     TabError(usize, String),
+    /// Mirror of the shared registry's tab list; the sole source of truth
+    /// for which repository tabs exist.
+    WebTabsSync(Vec<crate::server::registry::WebTab>),
 }
 
 /// A configured, live repository tab.
@@ -52,217 +65,150 @@ pub struct RepoTab {
     error: Option<String>,
 }
 
-/// One tab: either a live repository or the "add repository" form.
-#[derive(Debug, Clone)]
-pub enum Tab {
-    Repo(RepoTab),
-    AddRepo {
-        name: String,
-        path: String,
-        error: Option<String>,
-    },
-}
-
 /// Root application state for the native desktop UI.
 #[derive(Debug, Clone)]
 pub struct GritApp {
-    tabs: Vec<Tab>,
+    /// Mirrors the shared registry; mutated only through `apply_sync`.
+    tabs: Vec<RepoTab>,
     active: usize,
-    next_id: usize,
-    config_path: Option<PathBuf>,
     registry: Option<crate::server::registry::TabRegistry>,
+    /// Local "+" form mode. The form is never a tab; with zero tabs it is
+    /// also the default view.
+    show_add_form: bool,
+    add_name: String,
+    add_path: String,
+    add_error: Option<String>,
 }
 
 impl GritApp {
-    /// Creates an app whose persistence target is overridden (used by tests).
-    #[cfg(test)]
-    fn with_config(repo_path: PathBuf, config_path: Option<PathBuf>) -> Self {
-        let tab = RepoTab {
-            id: 0,
-            name: Self::tab_name(&repo_path),
-            repo_path,
-            repo_state: RepoState::default(),
-            commit_message: String::new(),
-            diff: None,
-            nuke_armed: false,
-            error: None,
-        };
+    /// Creates an empty app; tab contents arrive via `WebTabsSync`.
+    pub fn new() -> Self {
         Self {
-            tabs: vec![Tab::Repo(tab)],
+            tabs: Vec::new(),
             active: 0,
-            next_id: 1,
-            config_path,
             registry: None,
+            show_add_form: false,
+            add_name: String::new(),
+            add_path: String::new(),
+            add_error: None,
         }
     }
 
-    /// Builds the app from previously saved repositories, falling back to a CLI path.
-    fn from_saved(saved: Vec<SavedRepo>, fallback: PathBuf) -> Self {
-        let mut tabs = Vec::new();
-        for (id, repo) in saved.into_iter().enumerate() {
-            tabs.push(Tab::Repo(RepoTab {
-                id,
-                name: repo.name,
-                repo_path: repo.path,
-                repo_state: RepoState::default(),
-                commit_message: String::new(),
-                diff: None,
-                nuke_armed: false,
-                error: None,
-            }));
-        }
-        let next_id = tabs.len();
-        if tabs.is_empty() {
-            tabs.push(Tab::Repo(RepoTab {
-                id: 0,
-                name: Self::tab_name(&fallback),
-                repo_path: fallback,
-                repo_state: RepoState::default(),
-                commit_message: String::new(),
-                diff: None,
-                nuke_armed: false,
-                error: None,
-            }));
-        }
-        Self {
-            tabs,
-            active: 0,
-            next_id: if next_id == 0 { 1 } else { next_id },
-            config_path: persistence::config_path(),
-            registry: None,
-        }
-    }
-
-    fn tab_name(path: &PathBuf) -> String {
-        path.file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+    /// Whether the Add Repository form should be displayed.
+    fn showing_add_form(&self) -> bool {
+        self.show_add_form || self.tabs.is_empty()
     }
 
     fn active_repo(&self) -> Option<&RepoTab> {
-        match self.tabs.get(self.active) {
-            Some(Tab::Repo(tab)) => Some(tab),
-            _ => None,
-        }
+        self.tabs.get(self.active)
     }
 
     fn active_repo_mut(&mut self) -> Option<&mut RepoTab> {
-        match self.tabs.get_mut(self.active) {
-            Some(Tab::Repo(tab)) => Some(tab),
-            _ => None,
-        }
+        self.tabs.get_mut(self.active)
     }
 
-    /// Persists the current repository tabs to the data folder.
-    fn persist_tabs(&self) {
-        if let Some(path) = &self.config_path {
-            let repos: Vec<SavedRepo> = self
-                .tabs
-                .iter()
-                .filter_map(|t| match t {
-                    Tab::Repo(r) => Some(SavedRepo {
-                        name: r.name.clone(),
-                        path: r.repo_path.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            persistence::save_repos(path, &repos);
-        }
+    fn index_of_id(&self, id: usize) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
     }
 
-    /// Publishes the current repo tabs + active index to the web registry,
-    /// preserving tabs that were created through the web UI. The published
-    /// `active` is only an advisory default for newly connected web clients;
-    /// each client owns its tab selection.
-    fn sync_registry(&self) {
-        if let Some(registry) = &self.registry {
-            use crate::server::registry::{WebState, WebTab};
-            let snapshot = registry.snapshot();
-            let mut tabs: Vec<WebTab> = self
-                .tabs
-                .iter()
-                .filter_map(|t| match t {
-                    Tab::Repo(r) => Some(WebTab {
-                        id: r.id,
-                        name: r.name.clone(),
-                        repo_path: r.repo_path.display().to_string(),
-                        state: r.repo_state.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            let gui_ids: Vec<usize> = tabs.iter().map(|t| t.id).collect();
-            tabs.extend(
-                snapshot
-                    .tabs
-                    .into_iter()
-                    .filter(|t| !gui_ids.contains(&t.id)),
-            );
-            let len = tabs.len();
-            let active = self
-                .active_repo()
-                .and_then(|repo| tabs.iter().position(|t| t.id == repo.id))
-                .unwrap_or_else(|| snapshot.active.min(len.saturating_sub(1)));
-            registry.set(WebState { active, tabs });
+    /// Applies a registry snapshot to the local tab list: adopts new tabs
+    /// (preserving per-tab UI fields for known ids), drops removed ones,
+    /// and heals the selection. This is the ONLY place `self.tabs` changes
+    /// outside of synchronous form handling.
+    fn apply_sync(&mut self, live_tabs: &[crate::server::registry::WebTab]) {
+        let live_ids: std::collections::HashSet<usize> =
+            live_tabs.iter().map(|t| t.id).collect();
+
+        let before = self.tabs.len();
+        self.tabs.retain(|r| live_ids.contains(&r.id));
+        let mut changed = self.tabs.len() != before;
+
+        let mut newly_adopted: Option<usize> = None;
+        for web in live_tabs.iter().filter(|t| !t.repo_path.is_empty()) {
+            if let Some(existing) = self.tabs.iter_mut().find(|r| r.id == web.id) {
+                // Server owns identity fields; local UI fields are kept.
+                existing.name = web.name.clone();
+                existing.repo_path = PathBuf::from(&web.repo_path);
+                existing.repo_state = web.state.clone();
+                continue;
+            }
+            self.tabs.push(RepoTab {
+                id: web.id,
+                name: web.name.clone(),
+                repo_path: PathBuf::from(&web.repo_path),
+                repo_state: web.state.clone(),
+                commit_message: String::new(),
+                diff: None,
+                nuke_armed: false,
+                error: None,
+            });
+            newly_adopted = Some(web.id);
+            changed = true;
+        }
+
+        if !changed {
+            return;
+        }
+
+        // Follow newly created tabs and hide the "+" form once a repo exists.
+        if let Some(id) = newly_adopted {
+            if let Some(pos) = self.index_of_id(id) {
+                self.active = pos;
+            }
+            self.show_add_form = false;
+        }
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
         }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AddTabPressed => {
-                self.tabs.push(Tab::AddRepo {
-                    name: String::new(),
-                    path: String::new(),
-                    error: None,
-                });
-                self.active = self.tabs.len() - 1;
+                self.show_add_form = true;
+                Task::none()
+            }
+            Message::CancelAddForm => {
+                self.show_add_form = false;
+                self.add_error = None;
                 Task::none()
             }
             Message::OpenTab(index) => {
                 if index < self.tabs.len() {
                     self.active = index;
-                    self.sync_registry();
+                    self.show_add_form = false;
                 }
                 Task::none()
             }
             Message::CloseTab(index) => {
-                if index >= self.tabs.len() {
+                let Some(tab) = self.tabs.get(index) else {
                     return Task::none();
-                }
-                let removed_repo = match self.tabs.get(index) {
-                    Some(Tab::Repo(_)) => true,
-                    _ => false,
                 };
-                self.tabs.remove(index);
-                if self.tabs.is_empty() {
-                    self.tabs.push(Tab::AddRepo {
-                        name: String::new(),
-                        path: String::new(),
-                        error: None,
-                    });
+                let id = tab.id;
+                match self.registry.clone() {
+                    Some(registry) => Task::perform(
+                        async move {
+                            crate::server::websocket::close_tab_by_id(&registry, id);
+                            Message::Nop
+                        },
+                        |m| m,
+                    ),
+                    None => {
+                        // No shared workspace (standalone): remove locally.
+                        self.tabs.remove(index);
+                        if self.active >= self.tabs.len() {
+                            self.active = self.tabs.len().saturating_sub(1);
+                        }
+                        Task::none()
+                    }
                 }
-                if self.active >= self.tabs.len() {
-                    self.active = self.tabs.len() - 1;
-                } else if index < self.active {
-                    self.active -= 1;
-                }
-                if removed_repo {
-                    self.persist_tabs();
-                    self.sync_registry();
-                }
-                Task::none()
             }
             Message::NewRepoNameChanged(name) => {
-                if let Some(Tab::AddRepo { name: n, .. }) = self.tabs.get_mut(self.active) {
-                    *n = name;
-                }
+                self.add_name = name;
                 Task::none()
             }
             Message::NewRepoPathChanged(path) => {
-                if let Some(Tab::AddRepo { path: p, .. }) = self.tabs.get_mut(self.active) {
-                    *p = path;
-                }
+                self.add_path = path;
                 Task::none()
             }
             Message::BrowseFolder => Task::perform(
@@ -275,58 +221,63 @@ impl GritApp {
             ),
             Message::FolderPicked(picked) => {
                 if let Some(path) = picked {
-                    if let Some(Tab::AddRepo { path: input, .. }) = self.tabs.get_mut(self.active)
-                    {
-                        *input = path.display().to_string();
-                    }
+                    self.add_path = path.display().to_string();
                 }
                 Task::none()
             }
             Message::OpenNewRepo => {
-                let (name, path) = match self.tabs.get(self.active) {
-                    Some(Tab::AddRepo { name, path, .. }) => (name.clone(), path.clone()),
-                    _ => return Task::none(),
-                };
-                let name = name.trim().to_string();
-                let path = path.trim().to_string();
-                let dir = PathBuf::from(&path);
+                let name = self.add_name.trim().to_string();
+                let path = self.add_path.trim().to_string();
+                // Instant client-side validation; the shared op re-validates.
                 let validation_error = if path.is_empty() {
                     Some("Folder path is required".to_string())
-                } else if !dir.is_dir() {
+                } else if !PathBuf::from(&path).is_dir() {
                     Some(format!("Not a directory: {path}"))
                 } else {
                     None
                 };
                 if let Some(error) = validation_error {
-                    if let Some(Tab::AddRepo { error: slot, .. }) = self.tabs.get_mut(self.active)
-                    {
-                        *slot = Some(error);
-                    }
+                    self.add_error = Some(error);
                     return Task::none();
                 }
-
-                let tab_name = if name.is_empty() {
-                    Self::tab_name(&dir)
-                } else {
-                    name
-                };
-                let id = self.next_id;
-                self.next_id += 1;
-                if let Some(slot) = self.tabs.get_mut(self.active) {
-                    *slot = Tab::Repo(RepoTab {
-                        id,
-                        name: tab_name,
-                        repo_path: dir.clone(),
-                        repo_state: RepoState::default(),
-                        commit_message: String::new(),
-                        diff: None,
-                        nuke_armed: false,
-                        error: None,
-                    });
+                match self.registry.clone() {
+                    Some(registry) => Task::perform(
+                        async move {
+                            Message::OpenRepoResult(
+                                crate::server::websocket::open_repo_tab(
+                                    &registry, name, path,
+                                )
+                                .await,
+                            )
+                        },
+                        |m| m,
+                    ),
+                    None => {
+                        self.add_error =
+                            Some("No workspace available".to_string());
+                        Task::none()
+                    }
                 }
-                self.persist_tabs();
-                self.sync_registry();
-                refresh(id, dir)
+            }
+            Message::OpenRepoResult(result) => {
+                match result {
+                    Ok(id) => {
+                        // The form resets for its next use; the tab itself
+                        // arrives through WebTabsSync adoption.
+                        self.show_add_form = false;
+                        self.add_name.clear();
+                        self.add_path.clear();
+                        self.add_error = None;
+                        if let Some(tab) = self.tabs.iter().find(|r| r.id == id) {
+                            let path = tab.repo_path.clone();
+                            return refresh(id, path);
+                        }
+                    }
+                    Err(error) => {
+                        self.add_error = Some(error);
+                    }
+                }
+                Task::none()
             }
             // Git actions on the active repository tab.
             Message::StageFile(path) => self.run_action(GitAction::Stage(path)),
@@ -395,9 +346,12 @@ impl GritApp {
             }
             // Watcher and background updates, routed by tab id.
             Message::TabRefresh(id) => {
-                let path = self.tabs.iter().find_map(|t| match t {
-                    Tab::Repo(r) if r.id == id => Some(r.repo_path.clone()),
-                    _ => None,
+                let path = self.tabs.iter().find_map(|t| {
+                    if t.id == id {
+                        Some(t.repo_path.clone())
+                    } else {
+                        None
+                    }
                 });
                 match path {
                     Some(path) => refresh(id, path),
@@ -405,28 +359,24 @@ impl GritApp {
                 }
             }
             Message::TabStateUpdated(id, state) => {
-                if let Some(Tab::Repo(tab)) = self
-                    .tabs
-                    .iter_mut()
-                    .find(|t| matches!(t, Tab::Repo(r) if r.id == id))
-                {
+                if let Some(tab) = self.tabs.iter_mut().find(|r| r.id == id) {
                     tab.repo_state = state;
                     tab.nuke_armed = false;
                     tab.error = None;
                 }
-                self.sync_registry();
                 Task::none()
             }
             Message::TabError(id, error) => {
-                if let Some(Tab::Repo(tab)) = self
-                    .tabs
-                    .iter_mut()
-                    .find(|t| matches!(t, Tab::Repo(r) if r.id == id))
-                {
+                if let Some(tab) = self.tabs.iter_mut().find(|r| r.id == id) {
                     tab.error = Some(error);
                 }
                 Task::none()
             }
+            Message::WebTabsSync(live_tabs) => {
+                self.apply_sync(&live_tabs);
+                Task::none()
+            }
+            Message::Nop => Task::none(),
         }
     }
 
@@ -440,14 +390,14 @@ impl GritApp {
 
     /// Watches every open repository and emits per-tab refresh events.
     pub fn subscription(&self) -> Subscription<Message> {
-        let subs: Vec<Subscription<Message>> = self
+        let mut subs: Vec<Subscription<Message>> = self
             .tabs
             .iter()
-            .filter_map(|t| match t {
-                Tab::Repo(tab) => Some(watcher_subscription(tab.id, tab.repo_path.clone())),
-                _ => None,
-            })
+            .map(|tab| watcher_subscription(tab.id, tab.repo_path.clone()))
             .collect();
+        if self.registry.is_some() {
+            subs.push(registry_subscription());
+        }
         Subscription::batch(subs)
     }
 
@@ -466,12 +416,8 @@ impl GritApp {
             .iter()
             .enumerate()
             .map(|(index, tab)| {
-                let label = match tab {
-                    Tab::Repo(t) => t.name.clone(),
-                    Tab::AddRepo { .. } => "New Repo".to_string(),
-                };
-                let is_active = index == self.active;
-                let tab_button = button(text(label))
+                let is_active = index == self.active && !self.showing_add_form();
+                let tab_button = button(text(tab.name.clone()))
                     .on_press(Message::OpenTab(index))
                     .style(tab_button_style(is_active));
                 row![tab_button, button(text("×")).on_press(Message::CloseTab(index))]
@@ -484,11 +430,11 @@ impl GritApp {
     }
 
     fn tab_content(&self) -> Element<'_, Message> {
+        if self.showing_add_form() {
+            return add_repo_view(&self.add_name, &self.add_path, self.add_error.as_ref());
+        }
         match self.tabs.get(self.active) {
-            Some(Tab::Repo(tab)) => self.repo_view(tab),
-            Some(Tab::AddRepo { name, path, error }) => {
-                add_repo_view(name, path, error.as_ref(), self.active)
-            }
+            Some(tab) => self.repo_view(tab),
             None => text("No tabs").into(),
         }
     }
@@ -517,6 +463,12 @@ impl GritApp {
     }
 }
 
+impl Default for GritApp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Style for a tab-bar button: highlighted when it is the active tab.
 fn tab_button_style(
     is_active: bool,
@@ -541,12 +493,11 @@ fn tab_button_style(
     }
 }
 
-/// Form for creating a new repository tab.
+/// Form for opening a new repository into the shared workspace.
 fn add_repo_view<'a>(
     name: &'a str,
     path: &'a str,
     error: Option<&'a String>,
-    active: usize,
 ) -> Element<'a, Message> {
     let error_bar = if let Some(error) = error {
         text(format!("Error: {error}"))
@@ -570,7 +521,7 @@ fn add_repo_view<'a>(
         error_bar,
         row![
             button("Open Repository").on_press(Message::OpenNewRepo),
-            button("Cancel").on_press(Message::CloseTab(active)),
+            button("Cancel").on_press(Message::CancelAddForm),
         ]
         .spacing(8),
     ]
@@ -605,6 +556,42 @@ fn watcher_subscription(id: usize, repo_path: PathBuf) -> Subscription<Message> 
     })
 }
 
+/// Shared-registry handle readable from the subscription's fn-pointer builder.
+static SHARED_REGISTRY: std::sync::OnceLock<crate::server::registry::TabRegistry> =
+    std::sync::OnceLock::new();
+
+/// Streams shared-registry snapshots into the GUI. This is how tabs opened
+/// or closed anywhere (web or desktop) reach every view.
+fn registry_subscription() -> Subscription<Message> {
+    Subscription::run(|| {
+        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
+        if let Some(registry) = SHARED_REGISTRY.get() {
+            let registry = registry.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                let Ok(rt) = rt else {
+                    return;
+                };
+                rt.block_on(async move {
+                    let mut watch_rx = registry.subscribe();
+                    loop {
+                        if watch_rx.changed().await.is_err() {
+                            break;
+                        }
+                        let tabs = watch_rx.borrow().tabs.clone();
+                        if tx.try_send(Message::WebTabsSync(tabs)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            });
+        }
+        rx
+    })
+}
+
 /// Recomputes repository status on an executor worker thread.
 fn refresh(id: usize, repo_path: PathBuf) -> Task<Message> {
     Task::perform(
@@ -631,24 +618,45 @@ fn run_action_on(id: usize, repo_path: PathBuf, action: GitAction) -> Task<Messa
     )
 }
 
-/// Launches the native GUI, restoring saved repositories from the data folder.
-pub fn run(registry: crate::server::registry::TabRegistry, repo_path: PathBuf) -> iced::Result {
-    let mut app = GritApp::from_saved(persistence::load_repos(), repo_path);
-    app.registry = Some(registry);
-    app.sync_registry();
-    app.persist_tabs();
+/// Launches the native GUI as a pure client of the shared registry.
+///
+/// With an explicit `--path`, the repository is opened through the shared
+/// operation so the resulting tab is visible to every connected client.
+pub fn run(
+    registry: crate::server::registry::TabRegistry,
+    repo_path: PathBuf,
+    open_explicit: bool,
+) -> iced::Result {
+    let _ = SHARED_REGISTRY.set(registry.clone());
+    let mut app = GritApp::new();
+    app.registry = Some(registry.clone());
+    // Seed from the current snapshot (boot may have restored saved repos
+    // already); later changes arrive through the registry subscription.
+    app.apply_sync(&registry.snapshot().tabs);
+
     iced::application(
         move || {
             let app = app.clone();
-            let tasks: Vec<Task<Message>> = app
-                .tabs
-                .iter()
-                .filter_map(|t| match t {
-                    Tab::Repo(tab) => Some(refresh(tab.id, tab.repo_path.clone())),
-                    _ => None,
-                })
-                .collect();
-            (app, Task::batch(tasks))
+            let startup = if open_explicit {
+                let registry = registry.clone();
+                let repo_path = repo_path.clone();
+                Task::perform(
+                    async move {
+                        Message::OpenRepoResult(
+                            crate::server::websocket::open_repo_tab(
+                                &registry,
+                                String::new(),
+                                repo_path.display().to_string(),
+                            )
+                            .await,
+                        )
+                    },
+                    |m| m,
+                )
+            } else {
+                Task::none()
+            };
+            (app, startup)
         },
         GritApp::update,
         GritApp::view,
@@ -664,15 +672,40 @@ pub fn run(registry: crate::server::registry::TabRegistry, repo_path: PathBuf) -
 mod tests {
     use super::*;
     use crate::git::types::{FileChange, GitStatus};
+    use crate::server::registry::{WebState, WebTab};
 
-    fn app_in(dir: &std::path::Path) -> GritApp {
-        GritApp::with_config(PathBuf::from("."), Some(dir.join("repos.json")))
+    fn webtab(id: usize, name: &str, path: &std::path::Path) -> WebTab {
+        WebTab {
+            id,
+            name: name.to_string(),
+            repo_path: path.display().to_string(),
+            state: RepoState::default(),
+        }
+    }
+
+    fn app_in(_dir: &std::path::Path) -> GritApp {
+        GritApp::new()
+    }
+
+    /// Seeds one repo tab (id 0) through the normal sync path.
+    fn seed_one(app: &mut GritApp, dir: &std::path::Path) {
+        let _ = app.update(Message::WebTabsSync(vec![webtab(0, "repo", dir)]));
+    }
+
+    fn repo_state(branch: &str) -> RepoState {
+        RepoState {
+            current_branch: branch.to_string(),
+            branches: vec![branch.to_string()],
+            changes: vec![],
+            history: vec![],
+        }
     }
 
     #[test]
     fn commit_message_changed_updates_active_tab() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::CommitMessageChanged("fix bug".to_string()));
         assert_eq!(app.active_repo().unwrap().commit_message, "fix bug");
     }
@@ -681,6 +714,7 @@ mod tests {
     fn empty_commit_message_sets_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::CommitPressed);
         let tab = app.active_repo().unwrap();
         assert!(tab.error.is_some());
@@ -691,6 +725,7 @@ mod tests {
     fn non_empty_commit_message_clears_input() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::CommitMessageChanged("fix bug".to_string()));
         let _ = app.update(Message::CommitPressed);
         assert!(app.active_repo().unwrap().commit_message.is_empty());
@@ -700,12 +735,8 @@ mod tests {
     fn state_updated_replaces_repo_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
-        let state = RepoState {
-            current_branch: "main".to_string(),
-            branches: vec!["main".to_string()],
-            changes: vec![],
-            history: vec![],
-        };
+        seed_one(&mut app, dir.path());
+        let state = repo_state("main");
         let _ = app.update(Message::TabStateUpdated(0, state.clone()));
         let tab = app.active_repo().unwrap();
         assert_eq!(tab.repo_state, state);
@@ -716,68 +747,38 @@ mod tests {
     fn error_message_is_stored_for_tab() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::TabError(0, "boom".to_string()));
         assert_eq!(app.active_repo().unwrap().error.as_deref(), Some("boom"));
     }
 
     #[test]
-    fn add_tab_pressed_appends_add_repo_form() {
+    fn add_tab_pressed_shows_local_form_without_creating_a_tab() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::AddTabPressed);
-        assert_eq!(app.tabs.len(), 2);
-        assert!(matches!(&app.tabs[app.active], Tab::AddRepo { .. }));
+        assert_eq!(app.tabs.len(), 1, "the form must never become a tab");
+        assert!(app.showing_add_form());
     }
 
     #[test]
-    fn open_tab_switches_active() {
+    fn open_tab_switches_active_and_hides_form() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::WebTabsSync(vec![
+            webtab(0, "one", dir.path()),
+            webtab(1, "two", other.path()),
+        ]));
         let _ = app.update(Message::AddTabPressed);
-        assert_eq!(app.active, 1);
         let _ = app.update(Message::OpenTab(0));
         assert_eq!(app.active, 0);
+        assert!(!app.showing_add_form());
     }
 
-    #[test]
-    fn open_new_repo_converts_form_to_repo_tab_and_persists() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_in(dir.path());
-        let _ = app.update(Message::AddTabPressed);
-        let repo_dir = tempfile::tempdir().unwrap();
-        let _ = app.update(Message::NewRepoNameChanged("My Repo".to_string()));
-        let _ = app.update(Message::NewRepoPathChanged(
-            repo_dir.path().display().to_string(),
-        ));
-        let _ = app.update(Message::OpenNewRepo);
-        let tab = app.active_repo().unwrap();
-        assert_eq!(tab.name, "My Repo");
-        assert_eq!(tab.repo_path, repo_dir.path());
-
-        let saved = persistence::load_repos_from(&dir.path().join("repos.json"));
-        assert_eq!(saved.len(), 2);
-        assert!(saved.iter().any(|r| r.name == "My Repo"));
-    }
-
-    #[test]
-    fn open_new_repo_uses_dir_name_when_tab_unnamed() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = app_in(dir.path());
-        let _ = app.update(Message::AddTabPressed);
-        let repo_dir = tempfile::tempdir().unwrap();
-        let _ = app.update(Message::NewRepoPathChanged(
-            repo_dir.path().display().to_string(),
-        ));
-        let _ = app.update(Message::OpenNewRepo);
-        let tab = app.active_repo().unwrap();
-        assert_eq!(
-            tab.name,
-            GritApp::tab_name(&repo_dir.path().to_path_buf())
-        );
-    }
-
-    #[test]
-    fn open_new_repo_rejects_missing_directory() {
+    #[tokio::test]
+    async fn open_new_repo_rejects_missing_directory() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         let _ = app.update(Message::AddTabPressed);
@@ -785,65 +786,83 @@ mod tests {
             "/nonexistent/does-not-exist".to_string(),
         ));
         let _ = app.update(Message::OpenNewRepo);
-        assert!(matches!(&app.tabs[app.active], Tab::AddRepo { .. }));
-        let Tab::AddRepo { error, .. } = &app.tabs[app.active] else {
-            panic!("expected add repo form");
-        };
-        assert!(error.is_some());
+        assert!(app.showing_add_form(), "form stays open on error");
+        assert!(
+            app.add_error.is_some(),
+            "validation error must be surfaced"
+        );
+        assert!(app.tabs.is_empty(), "no tab may be created locally");
     }
 
-    #[test]
-    fn close_repo_tab_removes_it_and_persists() {
+    #[tokio::test]
+    async fn open_repo_operation_appends_and_sync_adopts_and_selects() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
-        let _ = app.update(Message::CloseTab(0));
+        let registry = crate::server::registry::TabRegistry::new();
+        app.registry = Some(registry.clone());
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(repo_dir.path())
+            .output()
+            .unwrap();
+
+        let id = crate::server::websocket::open_repo_tab(
+            &registry,
+            "My Repo".to_string(),
+            repo_dir.path().display().to_string(),
+        )
+        .await
+        .unwrap();
+        let _ = app.update(Message::OpenRepoResult(Ok(id)));
+        let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
+
         assert_eq!(app.tabs.len(), 1);
-        assert!(matches!(&app.tabs[0], Tab::AddRepo { .. }));
-        assert!(persistence::load_repos_from(&dir.path().join("repos.json")).is_empty());
+        assert_eq!(app.active_repo().unwrap().name, "My Repo");
+        assert_eq!(app.active_repo().unwrap().id, id);
+        assert_eq!(app.active, 0, "adopted tab becomes active");
+        assert!(!app.showing_add_form(), "form hides once a repo opens");
+        assert!(app.add_name.is_empty() && app.add_path.is_empty(), "form resets");
     }
 
     #[test]
-    fn from_saved_restores_multiple_tabs() {
-        let _dir = tempfile::tempdir().unwrap();
-        let saved = vec![
-            SavedRepo {
-                name: "alpha".to_string(),
-                path: PathBuf::from("/repo/alpha"),
-            },
-            SavedRepo {
-                name: "beta".to_string(),
-                path: PathBuf::from("/repo/beta"),
-            },
-        ];
-        let app = GritApp::from_saved(saved, PathBuf::from("/repo/fallback"));
-        assert_eq!(app.tabs.len(), 2);
-        assert!(matches!(app.tabs[0], Tab::Repo(_)));
-        assert!(matches!(app.tabs[1], Tab::Repo(_)));
-        assert_eq!(app.active, 0);
-    }
-
-    #[test]
-    fn from_saved_empty_uses_fallback() {
-        let app = GritApp::from_saved(Vec::new(), PathBuf::from("/repo/fallback"));
+    fn close_tab_through_registry_arrives_via_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let mut app = app_in(dir.path());
+        let registry = crate::server::registry::TabRegistry::with_single_tab(
+            3,
+            "gone".to_string(),
+            dir.path().to_path_buf(),
+        );
+        app.registry = Some(registry.clone());
+        let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
         assert_eq!(app.tabs.len(), 1);
-        let tab = app.active_repo().unwrap();
-        assert_eq!(tab.repo_path, PathBuf::from("/repo/fallback"));
+
+        // The web closes tab 3; the snapshot no longer contains it.
+        crate::server::websocket::close_tab_by_id(&registry, 3);
+        let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
+
+        assert!(app.tabs.is_empty(), "closed tab must disappear locally");
+        assert!(dir.path().join(".git").exists(), "disk untouched");
     }
 
     #[test]
     fn diff_loaded_stores_diff_on_active_tab() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
-        let state = RepoState {
-            current_branch: "main".to_string(),
-            branches: vec!["main".to_string()],
-            changes: vec![FileChange {
-                path: "a.txt".to_string(),
-                status: GitStatus::Modified,
-                is_staged: false,
-            }],
-            history: vec![],
-        };
+        seed_one(&mut app, dir.path());
+        let mut state = repo_state("main");
+        state.changes = vec![FileChange {
+            path: "a.txt".to_string(),
+            status: GitStatus::Modified,
+            is_staged: false,
+        }];
         let _ = app.update(Message::TabStateUpdated(0, state));
         let _ = app.update(Message::DiffLoaded(
             "a.txt".to_string(),
@@ -856,6 +875,7 @@ mod tests {
     fn diff_loaded_ignores_stale_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::DiffLoaded(
             "missing.txt".to_string(),
             "diff".to_string(),
@@ -867,6 +887,7 @@ mod tests {
     fn nuke_requires_two_presses() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::NukePressed);
         assert!(app.active_repo().unwrap().nuke_armed);
         let _ = app.update(Message::NukePressed);
@@ -877,137 +898,127 @@ mod tests {
     fn state_update_disarms_nuke() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
         let _ = app.update(Message::NukePressed);
         assert!(app.active_repo().unwrap().nuke_armed);
         let _ = app.update(Message::TabStateUpdated(0, RepoState::default()));
         assert!(!app.active_repo().unwrap().nuke_armed);
     }
 
-    fn app_with_registry(dir: &std::path::Path) -> (GritApp, crate::server::registry::TabRegistry)
-    {
+    #[test]
+    fn web_removed_tab_is_dropped_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
         let registry = crate::server::registry::TabRegistry::new();
-        let mut app = GritApp::with_config(PathBuf::from("."), Some(dir.join("repos.json")));
-        app.registry = Some(registry.clone());
-        (app, registry)
-    }
-
-    #[test]
-    fn registry_receives_initial_tab_on_sync() {
-        let dir = tempfile::tempdir().unwrap();
-        let (app, registry) = app_with_registry(dir.path());
-        app.sync_registry();
-        let state = registry.snapshot();
-        assert_eq!(state.active, 0);
-        assert_eq!(state.tabs.len(), 1);
-        assert_eq!(state.tabs[0].repo_path, ".");
-    }
-
-    #[test]
-    fn registry_reflects_state_updates() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, registry) = app_with_registry(dir.path());
-        let state = RepoState {
-            current_branch: "dev".to_string(),
-            branches: vec!["dev".to_string()],
-            changes: vec![],
-            history: vec![],
-        };
-        let _ = app.update(Message::TabStateUpdated(0, state.clone()));
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.tabs[0].state, state);
-    }
-
-    #[test]
-    fn registry_updates_on_open_new_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, registry) = app_with_registry(dir.path());
-        let _ = app.update(Message::AddTabPressed);
-        let repo_dir = tempfile::tempdir().unwrap();
-        let _ = app.update(Message::NewRepoNameChanged("new repo".to_string()));
-        let _ = app.update(Message::NewRepoPathChanged(
-            repo_dir.path().display().to_string(),
-        ));
-        let _ = app.update(Message::OpenNewRepo);
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.tabs.len(), 2);
-        assert_eq!(snapshot.active, 1);
-        assert!(snapshot.tabs.iter().any(|t| t.name == "new repo"));
-    }
-
-    #[test]
-    fn registry_updates_on_tab_switch() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, registry) = app_with_registry(dir.path());
-        let _ = app.update(Message::AddTabPressed);
-        let repo_dir = tempfile::tempdir().unwrap();
-        let _ = app.update(Message::NewRepoPathChanged(
-            repo_dir.path().display().to_string(),
-        ));
-        let _ = app.update(Message::OpenNewRepo);
-        let _ = app.update(Message::OpenTab(0));
-        assert_eq!(registry.snapshot().active, 0);
-    }
-
-    #[test]
-    fn sync_registry_preserves_web_only_tabs() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, registry) = app_with_registry(dir.path());
-        use crate::server::registry::{WebState, WebTab};
-        registry.set(WebState {
-            active: 1,
-            tabs: vec![
-                WebTab {
-                    id: 0,
-                    name: "gui".to_string(),
-                    repo_path: ".".to_string(),
-                    state: RepoState::default(),
-                },
-                WebTab {
-                    id: 99,
-                    name: "new".to_string(),
-                    repo_path: String::new(),
-                    state: RepoState::default(),
-                },
-            ],
-        });
-        let _ = app.update(Message::TabStateUpdated(0, RepoState::default()));
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.tabs.len(), 2, "web-only tab must survive gui sync");
-        assert_eq!(snapshot.tabs[1].id, 99);
-        assert_eq!(snapshot.active, 0, "gui selection is advisory default");
-    }
-
-    #[test]
-    fn sync_registry_follows_gui_when_active_is_gui_tab() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, registry) = app_with_registry(dir.path());
-        use crate::server::registry::{WebState, WebTab};
         registry.set(WebState {
             active: 0,
-            tabs: vec![
-                WebTab {
-                    id: 0,
-                    name: "gui".to_string(),
-                    repo_path: ".".to_string(),
-                    state: RepoState::default(),
-                },
-                WebTab {
-                    id: 42,
-                    name: "web repo".to_string(),
-                    repo_path: "/elsewhere".to_string(),
-                    state: RepoState::default(),
-                },
-            ],
+            tabs: vec![webtab(0, "grit", dir.path())],
         });
-        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
+        assert_eq!(app.tabs.len(), 1);
+
+        registry.set(WebState {
+            active: 0,
+            tabs: Vec::new(),
+        });
+        let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
+
+        assert!(app.tabs.is_empty());
+        assert!(app.showing_add_form(), "zero tabs fall back to the form");
+    }
+
+    #[test]
+    fn web_created_tab_is_adopted_by_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::WebTabsSync(vec![webtab(7, "from web", dir.path())]));
+        assert!(
+            app.tabs.iter().any(|t| t.id == 7),
+            "desktop must adopt tabs created through the web UI"
+        );
+    }
+
+    #[test]
+    fn web_placeholder_tabs_are_not_adopted() {
+        let mut app = GritApp::new();
+        let _ = app.update(Message::WebTabsSync(vec![WebTab {
+            id: 9,
+            name: "new".to_string(),
+            repo_path: String::new(),
+            state: RepoState::default(),
+        }]));
+        assert!(
+            !app.tabs.iter().any(|t| t.id == 9),
+            "empty-path entries are not repositories"
+        );
+    }
+
+    #[test]
+    fn adopt_web_repo_selects_it_and_hides_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = GritApp::new();
         let _ = app.update(Message::AddTabPressed);
-        let _ = app.update(Message::NewRepoPathChanged(
-            repo_dir.path().display().to_string(),
-        ));
-        let _ = app.update(Message::OpenNewRepo);
-        let _ = app.update(Message::TabStateUpdated(1, RepoState::default()));
-        let snapshot = registry.snapshot();
-        assert_eq!(snapshot.tabs.len(), 3, "web-only tab must survive gui sync");
-        assert_eq!(snapshot.active, 1, "gui selection should win");
+        assert!(app.showing_add_form());
+
+        let _ = app.update(Message::WebTabsSync(vec![webtab(0, "fresh", dir.path())]));
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_repo().unwrap().name, "fresh");
+        assert_eq!(app.active, 0);
+        assert!(!app.showing_add_form(), "stale form must not linger");
+    }
+
+    #[test]
+    fn dead_id_is_healed_when_the_same_id_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        let _ = app.update(Message::WebTabsSync(vec![webtab(5, "first", dir.path())]));
+        let _ = app.update(Message::WebTabsSync(vec![]));
+        assert!(app.tabs.is_empty());
+
+        // A later snapshot re-uses the id for a different repo.
+        let _ = app.update(Message::WebTabsSync(vec![webtab(
+            5,
+            "returned",
+            dir.path(),
+        )]));
+        assert!(
+            app.tabs.iter().any(|t| t.name == "returned"),
+            "a re-used live id must be adoptable, not permanently dead"
+        );
+    }
+
+    #[test]
+    fn sync_merge_preserves_local_ui_fields_but_takes_server_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
+
+        let _ = app.update(Message::CommitMessageChanged("wip message".to_string()));
+        let _ = app.update(Message::TabError(0, "transient".to_string()));
+
+        // The server renames the tab and delivers fresh state.
+        let renamed = WebTab {
+            id: 0,
+            name: "renamed".to_string(),
+            repo_path: dir.path().display().to_string(),
+            state: repo_state("dev"),
+        };
+        let _ = app.update(Message::WebTabsSync(vec![renamed]));
+
+        let tab = app.active_repo().unwrap();
+        assert_eq!(tab.name, "renamed", "server owns identity fields");
+        assert_eq!(tab.repo_state.current_branch, "dev");
+        assert_eq!(
+            tab.commit_message, "wip message",
+            "local draft must survive broadcasts"
+        );
+        assert_eq!(tab.error.as_deref(), Some("transient"));
+    }
+
+    #[test]
+    fn zero_tabs_default_to_add_form() {
+        let app = GritApp::new();
+        assert!(app.showing_add_form());
     }
 }

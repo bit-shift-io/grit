@@ -3,6 +3,7 @@
 pub mod registry;
 pub mod static_files;
 pub mod websocket;
+pub mod persistence;
 
 use std::path::PathBuf;
 
@@ -286,8 +287,13 @@ pub async fn refresh_tab(app: &AppState, tab_id: usize) {
     if repo_path.as_os_str().is_empty() {
         return;
     }
+    let path = PathBuf::from(&repo_path);
+    if !path.exists() || !path.join(".git").exists() {
+        tracing::warn!("skipping refresh for tab {} with invalid repo path: {}", tab_id, repo_path.display());
+        return;
+    }
     let result =
-        tokio::task::spawn_blocking(move || crate::git::get_repository_status(&repo_path)).await;
+        tokio::task::spawn_blocking(move || crate::git::get_repository_status(&path)).await;
     match result {
         Ok(Ok(state)) => app.registry.update_state(tab_id, state),
         Ok(Err(e)) => tracing::error!("repository status refresh failed for tab {tab_id}: {e}"),
@@ -342,8 +348,27 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
     let app = AppState::new(registry);
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
 
+    // Restore tabs from persistent storage only if registry is empty.
+    if app.registry.snapshot().tabs.is_empty() {
+        let restored = crate::server::persistence::restore_web_state();
+        // Rewrite the config so tabs pruned for dead paths vanish from disk too.
+        crate::server::persistence::persist_web_state(&restored);
+        if !restored.tabs.is_empty() {
+            app.registry
+                .raise_next_id_floor(restored.tabs.iter().map(|t| t.id));
+            app.registry.set(restored);
+        }
+    }
+
     for tab in app.registry.snapshot().tabs {
+        if tab.repo_path.is_empty() {
+            continue;
+        }
         let repo_path = PathBuf::from(&tab.repo_path);
+        if !repo_path.exists() || !repo_path.join(".git").exists() {
+            tracing::warn!("skipping tab {} with invalid repo path: {}", tab.id, tab.repo_path);
+            continue;
+        }
         let watcher = match crate::git::watcher::spawn_watcher(repo_path, refresh_tx.clone()) {
             Ok(w) => Some(w),
             Err(e) => {
@@ -360,6 +385,14 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
             });
         }
     }
+
+    // Persist tabs on registry changes.
+    let mut persist_rx = app.registry.subscribe();
+    tokio::spawn(async move {
+        while persist_rx.changed().await.is_ok() {
+            crate::server::persistence::persist_web_state(&persist_rx.borrow());
+        }
+    });
 
     refresh_all(&app).await;
     (app, refresh_rx)
@@ -537,7 +570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browse_endpoint_falls_back_to_home_for_missing_path() {
+    async fn browse_endpoint_falls_back_to_projects_then_home() {
         let app = AppState::new(TabRegistry::new());
         let router = build_router(app);
 
@@ -557,8 +590,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let current = json["current"].as_str().unwrap();
+        // Falls back to ~/projects/Projects if exists, then $HOME, then /
         assert!(
-            current == "~"
+            current == "~/projects"
+                || current == "~/Projects"
                 || current == std::env::var("HOME").unwrap_or_default()
                 || current == "/",
             "got: {current}"
@@ -758,6 +793,11 @@ mod tests {
 
     #[tokio::test]
     async fn full_daemon_streams_watcher_updates_and_dispatching_actions() {
+        // Isolate config persistence so the test never touches the real
+        // user configuration file.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
+
         let dir = tempfile::tempdir().unwrap();
         init_repo(&dir.path().to_path_buf());
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
@@ -811,5 +851,52 @@ mod tests {
         .await;
         assert_eq!(updated.tabs[0].state.changes.len(), 1);
         assert_eq!(updated.tabs[0].state.changes[0].path, "b.txt");
+    }
+
+    #[tokio::test]
+    async fn close_last_tab_broadcasts_empty_and_stays_empty() {
+        // Isolate config persistence so the test never touches the real
+        // user configuration file.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = TabRegistry::with_single_tab(
+            0,
+            "repo".to_string(),
+            dir.path().to_path_buf(),
+        );
+        let (app, refresh_rx) = boot(registry).await;
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _initial = recv_state(&mut ws).await;
+
+        ws.send(Message::Text(r#"{"tab":0,"action":"CloseTab"}"#.into()))
+            .await
+            .unwrap();
+
+        // Every broadcast within the hold window must have no tabs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(700);
+        let mut seen_empty = false;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(120), ws.next()).await {
+                Ok(Some(Ok(Message::Text(txt)))) => {
+                    let s: WebState = serde_json::from_str(&txt).unwrap();
+                    assert!(
+                        s.tabs.is_empty(),
+                        "broadcast after closing the last tab must be empty, got {txt}"
+                    );
+                    seen_empty = true;
+                }
+                Ok(None) => break,
+                _ => {}
+            }
+        }
+        assert!(seen_empty, "expected at least one post-close broadcast");
     }
 }
