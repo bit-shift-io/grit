@@ -207,6 +207,8 @@ function render(state) {
   document.getElementById("overview").textContent =
     `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;
 
+  renderScriptRunner(tab);
+
   const changesEl = document.getElementById("changes");
   let stillOpen = false;
   expandedDetailEl = null;
@@ -268,6 +270,41 @@ function render(state) {
     expandedCommitEl = null;
   }
 }
+
+//#endregion
+
+//#region Script runner (Project Actions)
+
+function renderScriptRunner(tab) {
+  const scripts = tab.state.scripts || [];
+  const runner = document.getElementById("script-runner");
+  const select = document.getElementById("script-select");
+  if (scripts.length === 0) {
+    runner.style.display = "none";
+    select.textContent = "";
+    return;
+  }
+
+  const previous = select.value;
+  select.textContent = "";
+  for (const script of scripts) {
+    const option = document.createElement("option");
+    option.value = script.rel_path;
+    option.textContent = script.rel_path;
+    select.appendChild(option);
+  }
+  // Keep the user's selection across broadcasts when it still exists.
+  if (scripts.some((s) => s.rel_path === previous)) {
+    select.value = previous;
+  }
+  runner.style.display = "flex";
+}
+
+document.getElementById("run-script-btn").onclick = () => {
+  const relPath = document.getElementById("script-select").value;
+  if (!relPath) return;
+  sendAction({ RunScript: relPath });
+};
 
 //#endregion
 

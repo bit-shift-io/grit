@@ -2,6 +2,7 @@ mod git;
 mod server;
 mod ui;
 mod shared_config;
+pub mod actions;
 
 use std::path::{Path, PathBuf};
 

@@ -43,6 +43,9 @@ pub enum Message {
     ShowDiff(String),
     DiffLoaded(String, String),
     NukePressed,
+    // Project actions: picking a script launches it immediately.
+    /// Dropdown selection fires the launch (fire-and-forget).
+    RunScriptSelected(crate::git::types::ScriptEntry),
     // Watcher / background updates, routed by tab id.
     TabRefresh(usize),
     TabStateUpdated(usize, RepoState),
@@ -367,6 +370,20 @@ impl GritApp {
                     Task::none()
                 }
             }
+            // Project actions: picking a script launches it immediately.
+            Message::RunScriptSelected(entry) => {
+                let Some(tab) = self.active_repo() else {
+                    return Task::none();
+                };
+                // Guard against stale dropdown entries for deleted scripts;
+                // launch() re-validates on disk regardless.
+                if !tab.repo_state.scripts.contains(&entry) {
+                    return Task::none();
+                }
+                let id = tab.id;
+                let repo_path = tab.repo_path.clone();
+                run_action_on(id, repo_path, GitAction::RunScript(entry.rel_path))
+            }
             // Watcher and background updates, routed by tab id.
             Message::TabRefresh(id) => {
                 let path = self.tabs.iter().find_map(|t| {
@@ -434,13 +451,11 @@ impl GritApp {
         Task::perform(crate::ui::remote::send_op(port, json), |_| Message::Nop)
     }
 
-    /// Watches every open repository and emits per-tab refresh events.
+    /// Streams updates into the GUI. Repository watching is owned by the
+    /// server (one watcher per repo, feeding broadcasts); the desktop
+    /// subscribes only to sync sources, never to the filesystem itself.
     pub fn subscription(&self) -> Subscription<Message> {
-        let mut subs: Vec<Subscription<Message>> = self
-            .tabs
-            .iter()
-            .map(|tab| watcher_subscription(tab.id, tab.repo_path.clone()))
-            .collect();
+        let mut subs: Vec<Subscription<Message>> = Vec::new();
         if let Some(port) = self.remote_port {
             subs.push(remote_subscription(port));
         } else if self.registry.is_some() {
@@ -495,19 +510,22 @@ impl GritApp {
             text("")
         };
 
-        column![
+        let mut view = column![
             components::header::header(&tab.repo_state, tab.nuke_armed),
             error_bar,
             components::staging::staging(&tab.repo_state.changes),
             components::diff::diff(&tab.diff),
             components::commit::commit(&tab.commit_message),
-            rule::horizontal(1),
-            components::history::history(&tab.repo_state.history),
-        ]
-        .spacing(10)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        ];
+        if !tab.repo_state.scripts.is_empty() {
+            view = view.push(components::actions::actions(&tab.repo_state.scripts));
+        }
+        view.push(rule::horizontal(1))
+            .push(components::history::history(&tab.repo_state.history))
+            .spacing(10)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 
@@ -576,32 +594,6 @@ fn add_repo_view<'a>(
     .spacing(8)
     .width(Length::Fill)
     .into()
-}
-
-/// Watches one repository and emits refresh events for its tab.
-fn watcher_subscription(id: usize, repo_path: PathBuf) -> Subscription<Message> {
-    Subscription::run_with((id, repo_path), |data| {
-        let id = data.0;
-        let path = data.1.clone();
-        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
-        std::thread::spawn(move || {
-            let (watcher_tx, mut watcher_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-            let watcher = match crate::git::watcher::spawn_watcher(path, watcher_tx) {
-                Ok(w) => w,
-                Err(e) => {
-                    let _ = tx.try_send(Message::TabError(id, format!("watcher failed: {e}")));
-                    return;
-                }
-            };
-            let _keep_alive = watcher;
-            while watcher_rx.blocking_recv().is_some() {
-                if tx.try_send(Message::TabRefresh(id)).is_err() {
-                    break;
-                }
-            }
-        });
-        rx
-    })
 }
 
 /// Shared-registry handle readable from the subscription's fn-pointer builder.
@@ -800,6 +792,7 @@ mod tests {
             branches: vec![branch.to_string()],
             changes: vec![],
             history: vec![],
+            scripts: vec![],
         }
     }
 
@@ -994,6 +987,39 @@ mod tests {
         assert!(app.active_repo().unwrap().nuke_armed);
         let _ = app.update(Message::NukePressed);
         assert!(!app.active_repo().unwrap().nuke_armed);
+    }
+
+    fn script(name: &str) -> crate::git::types::ScriptEntry {
+        crate::git::types::ScriptEntry {
+            name: name.to_string(),
+            rel_path: format!("scripts/{name}"),
+        }
+    }
+
+    #[test]
+    fn script_selection_dispatches_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
+        let entry = script("build.sh");
+        let mut state = repo_state("main");
+        state.scripts = vec![entry.clone()];
+        let _ = app.update(Message::TabStateUpdated(0, state));
+
+        // Selection launches immediately; the returned Task is not driven
+        // here, so no process actually starts in this test.
+        let _ = app.update(Message::RunScriptSelected(entry));
+    }
+
+    #[test]
+    fn unknown_script_selection_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_in(dir.path());
+        seed_one(&mut app, dir.path());
+
+        // Stale dropdown entries (script deleted since last refresh) must
+        // be dropped without panicking or launching.
+        let _ = app.update(Message::RunScriptSelected(script("ghost.sh")));
     }
 
     #[test]

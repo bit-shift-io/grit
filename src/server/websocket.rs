@@ -574,6 +574,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_script_action_launches_script_and_surfaces_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        let script = dir.path().join("scripts/marker.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}/marker\nsleep 30\n", dir.path().display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let initial = recv_state(&mut ws).await;
+        assert!(
+            initial.tabs[0]
+                .state
+                .scripts
+                .iter()
+                .any(|s| s.rel_path == "scripts/marker.sh"),
+            "discovered scripts must ride RepoState: {:?}",
+            initial.tabs[0].state.scripts
+        );
+
+        ws.send(Message::Text(
+            r#"{"tab":0,"action":{"RunScript":"scripts/marker.sh"}}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        for _ in 0..100 {
+            if dir.path().join("marker").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            dir.path().join("marker").exists(),
+            "RunScript over the daemon wire must launch the script"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_script_rejects_escape_paths_without_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let outside = tempfile::tempdir().unwrap();
+        let outside_script = outside.path().join("evil.sh");
+        std::fs::write(
+            &outside_script,
+            format!("#!/bin/sh\ntouch {}/pwned\n", dir.path().display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&outside_script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _ = recv_state(&mut ws).await;
+
+        ws.send(Message::Text(r#"{"tab":0,"action":{"RunScript":"../evil.sh"}}"#.into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !dir.path().join("pwned").exists(),
+            "escape paths must never execute"
+        );
+    }
+
+    #[tokio::test]
     async fn webstate_contains_tab_id_and_repo_path() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());

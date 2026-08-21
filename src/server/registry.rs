@@ -147,6 +147,7 @@ mod tests {
                 branches: vec!["main".to_string()],
                 changes: vec![],
                 history: vec![],
+                scripts: vec![],
             },
         }
     }
@@ -193,6 +194,7 @@ mod tests {
             branches: vec!["dev".to_string()],
             changes: vec![],
             history: vec![],
+            scripts: vec![],
         };
         registry.update_state(1, fresh.clone());
         let state = registry.snapshot();

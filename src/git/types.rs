@@ -24,12 +24,28 @@ pub struct CommitInfo {
     pub timestamp: i64,
 }
 
+/// An executable script discovered in a repository (root, `scripts/`,
+/// or `tools/`). `rel_path` is repo-relative and is what gets launched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptEntry {
+    pub name: String,
+    pub rel_path: String,
+}
+
+impl std::fmt::Display for ScriptEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoState {
     pub current_branch: String,
     pub branches: Vec<String>,
     pub changes: Vec<FileChange>,
     pub history: Vec<CommitInfo>,
+    #[serde(default)]
+    pub scripts: Vec<ScriptEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +94,8 @@ pub enum GitAction {
     Nuke,
     NewTab(String),
     CloseTab,
+    /// Launch a discovered executable by repo-relative path (fire-and-forget).
+    RunScript(String),
 }
 
 #[cfg(test)]
@@ -100,11 +118,23 @@ mod tests {
                 message: "initial".to_string(),
                 timestamp: 1_600_000_000,
             }],
+            scripts: vec![ScriptEntry {
+                name: "build.sh".to_string(),
+                rel_path: "scripts/build.sh".to_string(),
+            }],
         };
 
         let json = serde_json::to_string(&state).unwrap();
         let parsed: RepoState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, state);
+    }
+
+    #[test]
+    fn repostate_defaults_scripts_for_older_payloads() {
+        let parsed: RepoState =
+            serde_json::from_str(r#"{"current_branch":"","branches":[],"changes":[],"history":[]}"#)
+                .unwrap();
+        assert!(parsed.scripts.is_empty(), "missing field must default");
     }
 
     #[test]
@@ -129,6 +159,7 @@ mod tests {
             GitAction::Nuke,
             GitAction::NewTab(r#"{"name":"new","path":""}"#.to_string()),
             GitAction::CloseTab,
+            GitAction::RunScript("scripts/deploy.sh".to_string()),
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();

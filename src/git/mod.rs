@@ -70,6 +70,7 @@ pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
         branches,
         changes,
         history,
+        scripts: crate::actions::discover(repo_path),
     })
 }
 
@@ -425,6 +426,13 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Nuke => {
             nuke_repo(repo_path)?;
         }
+        GitAction::RunScript(rel_path) => {
+            crate::actions::launch(repo_path, &rel_path).map_err(|message| GitError {
+                message,
+                stderr: String::new(),
+                stdout: String::new(),
+            })?;
+        }
         GitAction::NewTab(_) | GitAction::CloseTab => {}
     }
     Ok(())
@@ -494,6 +502,25 @@ mod tests {
             .current_dir(dir)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn status_reports_discovered_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::create_dir(dir.path().join("scripts")).unwrap();
+        fs::write(dir.path().join("scripts/build.sh"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            dir.path().join("scripts/build.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert_eq!(state.scripts.len(), 1);
+        assert_eq!(state.scripts[0].rel_path, "scripts/build.sh");
+        assert_eq!(state.scripts[0].name, "build.sh");
     }
 
     #[test]

@@ -7,6 +7,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 const DEBOUNCE_MS: u64 = 200;
 
+/// Directory names whose churn can never affect repository status
+/// (build artifacts, dependency installs, caches). Events originating
+/// exclusively inside these are dropped before debouncing so tools like
+/// `cargo build` or `npm install` do not trigger endless refresh cycles.
+const IGNORED_DIRS: [&str; 5] = ["target", "node_modules", "__pycache__", ".venv", "venv"];
+
 pub fn spawn_watcher(
     repo_path: PathBuf,
     tx: UnboundedSender<()>,
@@ -19,10 +25,8 @@ pub fn spawn_watcher(
         notify::Config::default(),
     )?;
 
-    let git_dir = repo_path.join(".git");
-    if git_dir.exists() {
-        watcher.watch(&git_dir, RecursiveMode::Recursive)?;
-    }
+    // A single recursive watch of the repo root already covers `.git`;
+    // adding a second watch for `.git` duplicates every event.
     watcher.watch(&repo_path, RecursiveMode::Recursive)?;
 
     std::thread::spawn(move || {
@@ -30,6 +34,23 @@ pub fn spawn_watcher(
     });
 
     Ok(watcher)
+}
+
+/// True when the event can never affect repository status and must not
+/// trigger a refresh: pure reads (`Access`), or every path living inside
+/// an ignored build/cache directory.
+fn is_ignored(event: &notify::Event) -> bool {
+    if matches!(event.kind, notify::EventKind::Access(_)) {
+        return true;
+    }
+    !event.paths.is_empty()
+        && event.paths.iter().all(|path| {
+            path.components().any(|component| {
+                IGNORED_DIRS
+                    .iter()
+                    .any(|dir| component.as_os_str() == *dir)
+            })
+        })
 }
 
 fn debounce_loop(
@@ -40,8 +61,10 @@ fn debounce_loop(
 
     loop {
         match raw_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(Ok(_event)) => {
-                pending = Some(Instant::now());
+            Ok(Ok(event)) => {
+                if !is_ignored(&event) {
+                    pending = Some(Instant::now());
+                }
             }
             Ok(Err(e)) => {
                 tracing::debug!("watcher error: {e}");
@@ -64,6 +87,56 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn events_inside_ignored_dirs_are_dropped() {
+        let make = |paths: &[&str]| notify::Event {
+            paths: paths.iter().map(PathBuf::from).collect(),
+            ..notify::Event::default()
+        };
+        assert!(is_ignored(&make(&["/repo/target/debug/foo.rs"])));
+        assert!(is_ignored(&make(&["/repo/node_modules/pkg/index.js"])));
+        assert!(is_ignored(&make(&["/repo/target/a", "/repo/node_modules/b"])));
+
+        assert!(!is_ignored(&make(&["/repo/src/main.rs"])));
+        // Mixed event touching one real path must not be dropped.
+        assert!(!is_ignored(&make(&["/repo/target/x", "/repo/src/lib.rs"])));
+        assert!(!is_ignored(&make(&[])), "empty event stays conservative");
+        // A file merely *named* like a dir elsewhere must not match.
+        assert!(!is_ignored(&make(&["/repo/target.rs"])));
+
+        // Reads never change repository state — including the Access burst
+        // the inotify backend emits while registering recursive watches.
+        let read = notify::Event {
+            kind: notify::EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any,
+            )),
+            paths: vec![PathBuf::from("/repo/src/main.rs")],
+            ..notify::Event::default()
+        };
+        assert!(is_ignored(&read));
+    }
+
+    #[tokio::test]
+    async fn build_dir_churn_does_not_trigger_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _watcher = spawn_watcher(dir.path().to_path_buf(), tx).unwrap();
+
+        fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("target/debug/artifact{i}")), "x").unwrap();
+        }
+
+        let quiet = tokio::time::timeout(Duration::from_millis(800), rx.recv()).await;
+        assert!(quiet.is_err(), "build churn must not emit refresh events");
+    }
 
     #[tokio::test]
     async fn watcher_emits_debounced_events() {

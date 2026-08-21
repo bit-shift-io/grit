@@ -20,6 +20,10 @@ all contained in one self-contained executable.
 - View file diffs (side-by-side in the web UI)
 - Commit, push, pull, and checkout branches
 - Browse commit history
+- Project Actions: scripts/executables in the repo root, `scripts/`, or
+  `tools/` are auto-discovered (live, via the file watcher) into an Actions
+  dropdown; picking one launches it immediately (output goes to the Grit
+  terminal/journal), fire-and-forget, disableable via `actions::ENABLED`
 - Nuke button: wipe all local changes and re-clone the repository from scratch
 - Open tabs persist across restarts via a shared config file
   (`$XDG_CONFIG_HOME/bitshift/grit/config.json`)

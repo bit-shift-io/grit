@@ -94,8 +94,14 @@ ids come from one monotonic allocator and are never reused within a session.
 * **`mod.rs`**: invokes the local `git` CLI via `std::process::Command`
   (`get_repository_status`, `get_file_diff`, `get_file_pair`, `get_commit_summary`,
   `execute_action`), wrapping stderr into structured `GitError`s.
-* **`watcher.rs`**: monitors `.git/index`, `.git/HEAD`, and working-directory
-  changes with a 200 ms debouncer.
+* **`watcher.rs`**: one recursive watch per repository covering the working tree
+  and `.git` (the root watch subsumes `.git`; a separate `.git` watch would
+  duplicate every event) with a 200 ms debouncer. Events are filtered before
+  debouncing: pure reads (`Access`) never arm a refresh, nor do events living
+  exclusively inside churn directories (`target`, `node_modules`,
+  `__pycache__`, `.venv`, `venv`) — so builds and package installs cannot spin
+  the refresh loop. Watching itself is server-owned only (`boot`); the desktop
+  GUI subscribes to sync broadcasts instead of the filesystem.
 
 ### 3.3 Tab Registry & Shared Persistence (`src/server/registry.rs`, `src/shared_config.rs`)
 * **`TabRegistry`** holds `WebState { active, tabs: Vec<WebTab> }` behind a
@@ -141,7 +147,35 @@ ids come from one monotonic allocator and are never reused within a session.
 * Zero tabs ⇒ the Add Repository form is the active view ("+" button toggles it
   locally). No config is written by the GUI itself.
 * **`components/`**: `header.rs` (branch switcher, push/pull/fetch, nuke),
-  `staging.rs`, `diff.rs`, `commit.rs`, `history.rs`.
+  `staging.rs`, `diff.rs`, `commit.rs`, `history.rs`, `actions.rs`.
+
+### 3.6 Project Actions (`src/actions.rs`)
+* **Self-contained subsystem** for discovering and launching repository
+  executables; removable by deleting the file plus its few `actions::` call
+  sites. A compile-time constant `actions::ENABLED` is the runtime kill-switch:
+  `false` yields empty discovery and refuses every launch.
+* **Discovery** (`discover`): non-recursive scan of only the repo root,
+  `scripts/`, and `tools/`; unix exec-bit detection (`#[cfg(windows)]`
+  extension fallback: `.bat/.cmd/.ps1/.exe`); hidden files skipped; results
+  sorted and capped at 32. Runs inside `get_repository_status`, so discovered
+  scripts ride `RepoState.scripts` through the existing watcher → refresh →
+  broadcast plumbing — new/deleted executables appear automatically.
+* **Launch** (`launch`): fire-and-forget `std::process::Command::spawn`,
+  detached from Grit's process group (`process_group(0)` on unix /
+  `DETACHED_PROCESS` on windows). stdout/stderr are **inherited** so script
+  output appears wherever Grit runs (terminal or journal); stdin is nulled.
+  A detached thread reaps the child, so nothing lingers as a zombie — beyond
+  that Grit never waits on or tracks launched processes. Shebang-less shell
+  scripts fall back to `/bin/sh` on ENOEXEC. Guards: reject absolute/`..`
+  paths, canonicalize containment (target must resolve inside the repo
+  root — symlink escapes fail), require an executable file.
+* **Wire format**: `GitAction::RunScript(rel_path)` executes via the normal
+  action dispatch in both Embedded and Remote modes; picking a script in the
+  dropdown launches it immediately (no confirmation step). The section is
+  hidden when no scripts exist. The web UI exposes the same launcher inside
+  its Actions section (`#script-runner`: `<select>` + Run button), fed by
+  the identical `RepoState.scripts` payload.
+
 
 ---
 

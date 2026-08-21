@@ -20,6 +20,11 @@
         <button id="nuke-btn" class="danger" title="Discard all local changes and reset the repo to origin">Nuke</button>
         <button id="remove-tab-btn" class="danger" title="Remove this tab from Grit (the repository on disk is kept)">Remove</button>
       </div>
+      <div id="script-runner" class="action-row" style="display: none;">
+        <label for="script-select" class="muted">Scripts:</label>
+        <select id="script-select" title="Executables discovered in the repo root, scripts/, and tools/"></select>
+        <button id="run-script-btn" title="Launch the selected script detached; Grit does not track it afterwards">Run Script</button>
+      </div>
     </div>
   </section>
   <main>
