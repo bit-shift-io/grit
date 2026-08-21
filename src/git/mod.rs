@@ -425,6 +425,7 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Nuke => {
             nuke_repo(repo_path)?;
         }
+        GitAction::NewTab(_) | GitAction::CloseTab => {}
     }
     Ok(())
 }

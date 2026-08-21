@@ -6,13 +6,127 @@ let expandedKey = null;
 let expandedDetailEl = null;
 let expandedCommitKey = null;
 let expandedCommitEl = null;
+let awaitingNewTab = false;
+let browserDir = null;
+let browserParent = null;
+const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
+
+function getTabNameFromPath(path) {
+  const parts = path.trim().split(/[/\\]/).filter(p => p.length > 0);
+  const name = parts[parts.length - 1] || "repo";
+  return name.replace(/-/g, " ");
+}
+
+function setupAddRepoForm(tab) {
+  const nameInput = document.getElementById("new-repo-name");
+  const pathInput = document.getElementById("new-repo-path");
+  const errorEl = document.getElementById("new-repo-error");
+
+  if (nameInput.dataset.tabId !== String(tab.id)) {
+    nameInput.dataset.tabId = String(tab.id);
+    nameInput.value = "";
+    pathInput.value = "";
+    delete nameInput.dataset.userSet;
+    errorEl.style.display = "none";
+    browserDir = null;
+    document.getElementById("folder-browser").style.display = "none";
+  }
+
+  const browseBtn = document.getElementById("browse-folder-btn");
+  const browserEl = document.getElementById("folder-browser");
+  const browserCurrent = document.getElementById("browser-current");
+  const browserEntries = document.getElementById("browser-entries");
+  const upBtn = document.getElementById("browser-up-btn");
+  const homeBtn = document.getElementById("browser-home-btn");
+  const selectBtn = document.getElementById("browser-select-btn");
+  const openBtn = document.getElementById("open-repo-btn");
+  const cancelBtn = document.getElementById("cancel-repo-btn");
+
+  nameInput.oninput = () => { nameInput.dataset.userSet = "true"; };
+
+  async function loadBrowser(path) {
+    try {
+      const url = path ? `/browse?path=${encodeURIComponent(path)}` : "/browse";
+      const response = await fetch(url);
+      const data = await response.json();
+      browserDir = data.current;
+      browserParent = data.parent;
+      browserCurrent.textContent = data.current;
+      upBtn.disabled = !data.parent;
+      browserEntries.textContent = "";
+      if (data.entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "browser-empty muted";
+        empty.textContent = "No subdirectories";
+        browserEntries.appendChild(empty);
+        return;
+      }
+      for (const entry of data.entries) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "browser-entry";
+        btn.textContent = `${entry.name}/`;
+        btn.title = entry.path;
+        btn.onclick = () => loadBrowser(entry.path);
+        browserEntries.appendChild(btn);
+      }
+    } catch (err) {
+      browserEntries.textContent = `Failed to list folders: ${err}`;
+    }
+  }
+
+  browseBtn.onclick = () => {
+    const show = browserEl.style.display === "none";
+    browserEl.style.display = show ? "block" : "none";
+    if (show && !browserDir) {
+      loadBrowser(pathInput.value.trim());
+    }
+  };
+  upBtn.onclick = () => { if (browserParent) loadBrowser(browserParent); };
+  homeBtn.onclick = () => loadBrowser("");
+  selectBtn.onclick = () => {
+    if (!browserDir) return;
+    pathInput.value = browserDir;
+    if (!nameInput.dataset.userSet) {
+      nameInput.value = getTabNameFromPath(browserDir);
+    }
+    browserEl.style.display = "none";
+  };
+
+  pathInput.oninput = () => {
+    if (!nameInput.dataset.userSet && pathInput.value) {
+      nameInput.value = getTabNameFromPath(pathInput.value);
+    }
+  };
+
+  openBtn.onclick = () => {
+    const path = pathInput.value.trim();
+    if (!path) {
+      errorEl.textContent = "Please select a directory";
+      errorEl.style.display = "block";
+      return;
+    }
+    errorEl.style.display = "none";
+    sendAction({ NewTab: JSON.stringify({ name: nameInput.value.trim(), path }) });
+  };
+
+  cancelBtn.onclick = () => sendAction("CloseTab");
+}
 
 ws.onmessage = (event) => {
   const state = JSON.parse(event.data);
   if (activeTabId === null) {
     activeTabId = state.active;
+  }
+  const newIds = state.tabs.map((t) => t.id).filter((id) => !knownTabIds.has(id));
+  if (awaitingNewTab && newIds.length > 0) {
+    activeTabId = newIds[0];
+    awaitingNewTab = false;
+  }
+  for (const id of state.tabs.map((t) => t.id)) {
+    knownTabIds.add(id);
   }
   const prev = lastState;
   lastState = state;
@@ -37,6 +151,26 @@ function render(state) {
     return;
   }
   const tab = activeTab(state);
+  
+  const addRepoForm = document.getElementById("add-repo-form");
+  const repoView = document.getElementById("repo-view");
+  const historySection = document.getElementById("history-section");
+  const actionsSection = document.getElementById("actions");
+  
+  if (tab && tab.repo_path === "") {
+    addRepoForm.style.display = "block";
+    repoView.style.display = "none";
+    historySection.style.display = "none";
+    actionsSection.style.display = "none";
+    setupAddRepoForm(tab);
+    document.title = "Grit | New Repository";
+    return;
+  }
+  addRepoForm.style.display = "none";
+  repoView.style.display = "block";
+  historySection.style.display = "block";
+  actionsSection.style.display = "block";
+  document.title = `Grit | ${tab.name}`;
   document.getElementById("overview").textContent =
     `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;
 
@@ -316,6 +450,11 @@ function renderTabBar(state) {
     btn.dataset.tabId = tab.id;
     tabsEl.appendChild(btn);
   }
+  const newTabBtn = document.createElement("button");
+  newTabBtn.className = "tab new-tab";
+  newTabBtn.textContent = "+";
+  newTabBtn.title = "New tab";
+  tabsEl.appendChild(newTabBtn);
 }
 
 async function toggleDiff(detailEl, tab, path) {
@@ -509,6 +648,11 @@ document.getElementById("discard-all-btn").onclick = () => {
 document.getElementById("tabs").addEventListener("click", (event) => {
   const btn = event.target.closest(".tab");
   if (!btn || !lastState) return;
+  if (btn.classList.contains("new-tab")) {
+    awaitingNewTab = true;
+    sendAction({ NewTab: JSON.stringify({ name: "new", path: "" }) });
+    return;
+  }
   activeTabId = Number(btn.dataset.tabId);
   render(lastState);
 });

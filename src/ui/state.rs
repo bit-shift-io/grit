@@ -171,11 +171,15 @@ impl GritApp {
         }
     }
 
-    /// Publishes the current repo tabs + active index to the web registry.
+    /// Publishes the current repo tabs + active index to the web registry,
+    /// preserving tabs that were created through the web UI. The published
+    /// `active` is only an advisory default for newly connected web clients;
+    /// each client owns its tab selection.
     fn sync_registry(&self) {
         if let Some(registry) = &self.registry {
             use crate::server::registry::{WebState, WebTab};
-            let tabs = self
+            let snapshot = registry.snapshot();
+            let mut tabs: Vec<WebTab> = self
                 .tabs
                 .iter()
                 .filter_map(|t| match t {
@@ -188,10 +192,19 @@ impl GritApp {
                     _ => None,
                 })
                 .collect();
-            registry.set(WebState {
-                active: self.active,
-                tabs,
-            });
+            let gui_ids: Vec<usize> = tabs.iter().map(|t| t.id).collect();
+            tabs.extend(
+                snapshot
+                    .tabs
+                    .into_iter()
+                    .filter(|t| !gui_ids.contains(&t.id)),
+            );
+            let len = tabs.len();
+            let active = self
+                .active_repo()
+                .and_then(|repo| tabs.iter().position(|t| t.id == repo.id))
+                .unwrap_or_else(|| snapshot.active.min(len.saturating_sub(1)));
+            registry.set(WebState { active, tabs });
         }
     }
 
@@ -933,5 +946,68 @@ mod tests {
         let _ = app.update(Message::OpenNewRepo);
         let _ = app.update(Message::OpenTab(0));
         assert_eq!(registry.snapshot().active, 0);
+    }
+
+    #[test]
+    fn sync_registry_preserves_web_only_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, registry) = app_with_registry(dir.path());
+        use crate::server::registry::{WebState, WebTab};
+        registry.set(WebState {
+            active: 1,
+            tabs: vec![
+                WebTab {
+                    id: 0,
+                    name: "gui".to_string(),
+                    repo_path: ".".to_string(),
+                    state: RepoState::default(),
+                },
+                WebTab {
+                    id: 99,
+                    name: "new".to_string(),
+                    repo_path: String::new(),
+                    state: RepoState::default(),
+                },
+            ],
+        });
+        let _ = app.update(Message::TabStateUpdated(0, RepoState::default()));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.tabs.len(), 2, "web-only tab must survive gui sync");
+        assert_eq!(snapshot.tabs[1].id, 99);
+        assert_eq!(snapshot.active, 0, "gui selection is advisory default");
+    }
+
+    #[test]
+    fn sync_registry_follows_gui_when_active_is_gui_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, registry) = app_with_registry(dir.path());
+        use crate::server::registry::{WebState, WebTab};
+        registry.set(WebState {
+            active: 0,
+            tabs: vec![
+                WebTab {
+                    id: 0,
+                    name: "gui".to_string(),
+                    repo_path: ".".to_string(),
+                    state: RepoState::default(),
+                },
+                WebTab {
+                    id: 42,
+                    name: "web repo".to_string(),
+                    repo_path: "/elsewhere".to_string(),
+                    state: RepoState::default(),
+                },
+            ],
+        });
+        let repo_dir = tempfile::tempdir().unwrap();
+        let _ = app.update(Message::AddTabPressed);
+        let _ = app.update(Message::NewRepoPathChanged(
+            repo_dir.path().display().to_string(),
+        ));
+        let _ = app.update(Message::OpenNewRepo);
+        let _ = app.update(Message::TabStateUpdated(1, RepoState::default()));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.tabs.len(), 3, "web-only tab must survive gui sync");
+        assert_eq!(snapshot.active, 1, "gui selection should win");
     }
 }

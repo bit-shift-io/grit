@@ -76,6 +76,8 @@ pub enum GitAction {
     DeleteTag(String),
     DeleteBranch(String),
     Nuke,
+    NewTab(String),
+    CloseTab,
 }
 
 #[cfg(test)]
@@ -125,6 +127,8 @@ mod tests {
             GitAction::DeleteTag("v1.0".to_string()),
             GitAction::DeleteBranch("feature".to_string()),
             GitAction::Nuke,
+            GitAction::NewTab(r#"{"name":"new","path":""}"#.to_string()),
+            GitAction::CloseTab,
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();
