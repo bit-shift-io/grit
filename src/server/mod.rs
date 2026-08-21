@@ -397,6 +397,32 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
     (app, refresh_rx)
 }
 
+/// Returns true when a Grit daemon answers /health on this port.
+///
+/// Sends a minimal HTTP/1.1 request over a raw TCP connection so no HTTP
+/// client dependency is needed; verifies the 200 status line to avoid
+/// mistaking unrelated local services for a Grit daemon.
+pub async fn is_daemon_running(port: u16) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(std::time::Duration::from_millis(500), connect).await
+    else {
+        return false;
+    };
+    let request = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+        .await
+        .map(|r| r.unwrap_or(0))
+        .unwrap_or(0);
+    buf[..n].starts_with(b"HTTP/1.1 200") || buf[..n].starts_with(b"HTTP/1.0 200")
+}
+
 /// Boots the full headless daemon: watcher, state sync, and HTTP server.
 pub async fn run(registry: TabRegistry, port: u16) {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -624,6 +650,24 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["tab_count"], 1);
         assert_eq!(json["change_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn daemon_probe_detects_running_and_closed_ports() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        let (_refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app_for(&dir.path().to_path_buf()), refresh_rx);
+
+        assert!(is_daemon_running(port).await);
+
+        // A bound-then-dropped port must not answer.
+        let dead = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        assert!(!is_daemon_running(dead_port).await);
     }
 
     #[tokio::test]

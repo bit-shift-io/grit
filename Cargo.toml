@@ -25,11 +25,11 @@ rfd = "0.15"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-tungstenite = "0.30"
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-tokio-tungstenite = "0.30"
 
 [profile.release]
 opt-level = 3

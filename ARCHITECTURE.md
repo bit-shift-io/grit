@@ -53,6 +53,7 @@ ids come from one monotonic allocator and are never reused within a session.
     │   └── static_files.rs  # Embedded asset server using rust-embed
     └── ui/                  # Native Desktop GUI subsystem (Iced)
         ├── mod.rs           # Module declarations only; run() lives in state.rs
+        ├── remote.rs        # WS client for connect-mode: run_client + send_op
         ├── state.rs         # GritApp: pure-client state fed by WebTabsSync deliveries
         └── components/      # UI Layout components
             ├── header.rs    # Branch selector, Push, Pull, and Fetch controls
@@ -69,9 +70,18 @@ ids come from one monotonic allocator and are never reused within a session.
 ### 3.1 CLI Entrypoint & Bootstrapping (`src/main.rs`)
 * Parses `--headless`, `--port` (default **5000**), `--path` (optional).
 * **Headless Mode**: boots Tokio runtime and runs only the Axum daemon.
-* **GUI Mode (Default)**: spawns the Axum server on a background Tokio task, then
-  launches the native `Iced` desktop window on the main thread. Both share one
-  cloned `TabRegistry`.
+* **GUI Mode (Default)**: probes `GET /health` on `127.0.0.1:<port>` first.
+  * **No daemon found → Embedded**: spawns the Axum server on a background
+    Tokio task, then launches the native `Iced` window; both share one cloned
+    `TabRegistry`.
+  * **Daemon found → Remote (`GuiMode::Remote`)**: the GUI attaches as a plain
+    WebSocket client of the running daemon (`src/ui/remote.rs`). Tab state
+    arrives via `WebTabsSync` deliveries, and open/close/git operations are
+    sent as `{"tab":…,"action":…}` JSON built by `encode_client_message` —
+    the exact wire format browsers use. No second server, no parallel writer.
+  * In both modes the desktop remains a pure client of the single-writer
+    registry; `config.json` is owned exclusively by whichever process runs
+    the daemon. `--port` must match the daemon's port when connecting.
 * Without an explicit `--path` and with an empty config, startup lands on the
   Add Repository form instead of seeding a fallback `"."` tab — a cleared
   workspace stays cleared across restarts.
@@ -141,12 +151,17 @@ ids come from one monotonic allocator and are never reused within a session.
 ```
 main.rs
   ├── Parse CLI (clap: --headless, --port=5000 default, --path optional)
-  ├── Create TabRegistry (shared by clones)
-  ├── Spawn Tokio runtime → server::run(registry)
-  │     ├── boot(): restore-from-config-if-empty → watchers → persist task
-  │     └── Axum routes (/health /ws /files /commit /browse /*)
-  └── IF NOT --headless:
-        └── Iced GUI (main thread), seeded by apply_sync(snapshot)
+  └── IF --headless:
+        └── Spawn Tokio runtime → server::run(registry)
+              ├── boot(): restore-from-config-if-empty → watchers → persist task
+              └── Axum routes (/health /ws /files /commit /browse /*)
+      ELSE (GUI):
+        ├── Probe GET /health on 127.0.0.1:<port>
+        ├── Daemon found (Remote): Iced GUI as WS client of that daemon
+        │     ├── remote.rs run_client(port) → WebTabsSync deliveries
+        │     └── ops sent via send_op(encode_client_message(...))
+        └── No daemon (Embedded): spawn server::run(new registry), then
+              └── Iced GUI seeded by apply_sync(snapshot)
 ```
 
 ### Tab List Mutation (single writer)
@@ -234,6 +249,7 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
 | `src/server/static_files.rs` | rust-embed asset serving |
 | `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
+| `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history) |
 | `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links, rendering |
 | `TASKS.md` | Original build roadmap (historical) |

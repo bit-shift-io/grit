@@ -44,10 +44,28 @@ fn main() -> iced::Result {
         runtime.block_on(server::run(registry, cli.port));
         Ok(())
     } else {
-        let registry = server::registry::TabRegistry::new();
         let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
-        runtime.spawn(server::run(registry.clone(), cli.port));
-        ui::state::run(registry, repo_path, open_explicit)
+        let daemon_found =
+            runtime.block_on(server::is_daemon_running(cli.port));
+        let mode = match choose_gui(daemon_found, cli.port) {
+            ui::state::GuiMode::Embedded(registry) => {
+                runtime.spawn(server::run(registry.clone(), cli.port));
+                ui::state::GuiMode::Embedded(registry)
+            }
+            remote => remote,
+        };
+        ui::state::run(mode, repo_path, open_explicit)
+    }
+}
+
+/// Picks the GUI's data source: attach to an already-running daemon when one
+/// answers on `port`, otherwise own an embedded registry + server.
+fn choose_gui(daemon_found: bool, port: u16) -> ui::state::GuiMode {
+    if daemon_found {
+        tracing::info!("Grit daemon detected on port {port}; attaching as client");
+        ui::state::GuiMode::Remote { port }
+    } else {
+        ui::state::GuiMode::Embedded(server::registry::TabRegistry::new())
     }
 }
 
@@ -86,5 +104,17 @@ mod tests {
     fn resolve_path_expands_relative_to_cwd() {
         let absolute = resolve_path(Path::new("/some/abs/path"));
         assert_eq!(absolute, PathBuf::from("/some/abs/path"));
+    }
+
+    #[test]
+    fn gui_mode_prefers_running_daemon() {
+        match choose_gui(true, 5000) {
+            ui::state::GuiMode::Remote { port } => assert_eq!(port, 5000),
+            _ => panic!("a running daemon must select Remote mode"),
+        }
+        assert!(matches!(
+            choose_gui(false, 5000),
+            ui::state::GuiMode::Embedded(_)
+        ));
     }
 }

@@ -23,6 +23,9 @@ all contained in one self-contained executable.
 - Nuke button: wipe all local changes and re-clone the repository from scratch
 - Open tabs persist across restarts via a shared config file
   (`$XDG_CONFIG_HOME/bitshift/grit/config.json`)
+- Connect-mode: if a Grit daemon is already running on `--port` (e.g. a
+  systemd service), the desktop app attaches to it as a client instead of
+  starting its own server — one source of truth, no config races
 
 ## Build
 
@@ -33,11 +36,12 @@ cargo build --release
 ## Run
 
 ```bash
-# Native desktop GUI (also serves the web UI at http://localhost:5000)
+# Native desktop GUI (also serves the web UI at http://localhost:5000;
+# attaches to an already-running daemon on that port if one exists)
 ./target/release/grit --path .
 
 # Headless web daemon only
-./target/release/grit --headless --port 8080
+./target/release/grit --headless --port 5000
 ```
 
 ## Development

@@ -17,6 +17,12 @@ struct ClientMessage {
     action: GitAction,
 }
 
+/// Serializes a client operation into the exact wire format the browser
+/// uses, so the desktop GUI in remote mode speaks the same protocol.
+pub fn encode_client_message(tab: Option<usize>, action: &GitAction) -> String {
+    serde_json::json!({ "tab": tab, "action": action }).to_string()
+}
+
 /// Opens a validated repository tab in the shared registry. This is the
 /// single mutation point for adding tabs; both the WebSocket handler and
 /// the desktop GUI route through it so ids come from one allocator.
@@ -197,9 +203,29 @@ mod tests {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
 
-    use crate::git::types::{GitStatus};
+    use super::encode_client_message;
+    use crate::git::types::{GitAction, GitStatus};
     use crate::server::registry::TabRegistry;
     use crate::server::{run_server, AppState};
+
+    #[test]
+    fn encoded_client_messages_round_trip() {
+        let json = encode_client_message(Some(3), &GitAction::Stage("a.txt".to_string()));
+        let msg: super::ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.tab, Some(3));
+        assert_eq!(msg.action, GitAction::Stage("a.txt".to_string()));
+
+        let json = encode_client_message(None, &GitAction::CloseTab);
+        let msg: super::ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.tab, None);
+        assert_eq!(msg.action, GitAction::CloseTab);
+
+        let payload = r#"{"name":"My Repo","path":"/tmp/repo"}"#;
+        let json = encode_client_message(None, &GitAction::NewTab(payload.to_string()));
+        let msg: super::ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.tab, None);
+        assert!(matches!(msg.action, GitAction::NewTab(p) if p == payload));
+    }
 
     fn init_repo(dir: &std::path::Path) {
         std::process::Command::new("git")

@@ -78,6 +78,12 @@ pub struct GritApp {
     add_name: String,
     add_path: String,
     add_error: Option<String>,
+    /// Remote (connect) mode: port of the running daemon to attach to.
+    /// `None` means embedded mode with the local registry.
+    remote_port: Option<u16>,
+    /// Remote mode only: repo path from an explicit `--path` that must be
+    /// opened on the daemon once the first sync arrives.
+    pending_open: Option<String>,
 }
 
 impl GritApp {
@@ -91,6 +97,8 @@ impl GritApp {
             add_name: String::new(),
             add_path: String::new(),
             add_error: None,
+            remote_port: None,
+            pending_open: None,
         }
     }
 
@@ -185,6 +193,11 @@ impl GritApp {
                     return Task::none();
                 };
                 let id = tab.id;
+                if let Some(port) = self.remote_port {
+                    // Remote mode: ask the daemon to close; the echo sync
+                    // performs the local removal.
+                    return Self::remote_op(port, None, crate::git::types::GitAction::CloseTab);
+                }
                 match self.registry.clone() {
                     Some(registry) => Task::perform(
                         async move {
@@ -239,6 +252,16 @@ impl GritApp {
                 if let Some(error) = validation_error {
                     self.add_error = Some(error);
                     return Task::none();
+                }
+                if let Some(port) = self.remote_port {
+                    // Remote mode: the daemon opens the repo; adoption via
+                    // sync clears the form.
+                    let payload = serde_json::json!({ "name": name, "path": path }).to_string();
+                    return Self::remote_op(
+                        port,
+                        None,
+                        crate::git::types::GitAction::NewTab(payload),
+                    );
                 }
                 match self.registry.clone() {
                     Some(registry) => Task::perform(
@@ -374,6 +397,19 @@ impl GritApp {
             }
             Message::WebTabsSync(live_tabs) => {
                 self.apply_sync(&live_tabs);
+                // Remote startup: open an explicitly requested repo once the
+                // daemon's tab list is known.
+                if let (Some(port), Some(path)) = (self.remote_port, self.pending_open.take()) {
+                    if !live_tabs.iter().any(|t| t.repo_path == path) {
+                        let payload =
+                            serde_json::json!({ "name": "", "path": path }).to_string();
+                        return Self::remote_op(
+                            port,
+                            None,
+                            crate::git::types::GitAction::NewTab(payload),
+                        );
+                    }
+                }
                 Task::none()
             }
             Message::Nop => Task::none(),
@@ -385,7 +421,17 @@ impl GritApp {
         let Some(tab) = self.active_repo() else {
             return Task::none();
         };
+        if let Some(port) = self.remote_port {
+            // Remote mode: the daemon executes the action on its copy.
+            return Self::remote_op(port, Some(tab.id), action);
+        }
         run_action_on(tab.id, tab.repo_path.clone(), action)
+    }
+
+    /// Fire-and-forget dispatch of a client message to the daemon.
+    fn remote_op(port: u16, tab: Option<usize>, action: GitAction) -> Task<Message> {
+        let json = crate::server::websocket::encode_client_message(tab, &action);
+        Task::perform(crate::ui::remote::send_op(port, json), |_| Message::Nop)
     }
 
     /// Watches every open repository and emits per-tab refresh events.
@@ -395,7 +441,9 @@ impl GritApp {
             .iter()
             .map(|tab| watcher_subscription(tab.id, tab.repo_path.clone()))
             .collect();
-        if self.registry.is_some() {
+        if let Some(port) = self.remote_port {
+            subs.push(remote_subscription(port));
+        } else if self.registry.is_some() {
             subs.push(registry_subscription());
         }
         Subscription::batch(subs)
@@ -562,6 +610,34 @@ static SHARED_REGISTRY: std::sync::OnceLock<crate::server::registry::TabRegistry
 
 /// Streams shared-registry snapshots into the GUI. This is how tabs opened
 /// or closed anywhere (web or desktop) reach every view.
+/// Streams daemon tab state into the GUI in remote (connect) mode.
+fn remote_subscription(port: u16) -> Subscription<Message> {
+    Subscription::run_with(port, |p| {
+        let port = *p;
+        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(rt) = rt else {
+                return;
+            };
+            rt.block_on(async move {
+                let (sync_tx, mut sync_rx) = tokio::sync::mpsc::unbounded_channel::<
+                    Vec<crate::server::registry::WebTab>,
+                >();
+                let client = tokio::spawn(crate::ui::remote::run_client(port, sync_tx));
+                while let Some(tabs) = sync_rx.recv().await {
+                    if tx.try_send(Message::WebTabsSync(tabs)).is_err() {
+                        break;
+                    }
+                }
+                client.abort();
+            });
+        });
+        rx
+    })
+}
 fn registry_subscription() -> Subscription<Message> {
     Subscription::run(|| {
         let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
@@ -618,44 +694,70 @@ fn run_action_on(id: usize, repo_path: PathBuf, action: GitAction) -> Task<Messa
     )
 }
 
+/// How the desktop GUI obtains its tab list.
+#[derive(Debug, Clone)]
+pub enum GuiMode {
+    /// Owns an embedded server writing to this local registry.
+    Embedded(crate::server::registry::TabRegistry),
+    /// Attaches to an already-running daemon over WebSocket.
+    Remote { port: u16 },
+}
+
 /// Launches the native GUI as a pure client of the shared registry.
 ///
 /// With an explicit `--path`, the repository is opened through the shared
 /// operation so the resulting tab is visible to every connected client.
-pub fn run(
-    registry: crate::server::registry::TabRegistry,
-    repo_path: PathBuf,
-    open_explicit: bool,
-) -> iced::Result {
-    let _ = SHARED_REGISTRY.set(registry.clone());
+pub fn run(mode: GuiMode, repo_path: PathBuf, open_explicit: bool) -> iced::Result {
     let mut app = GritApp::new();
-    app.registry = Some(registry.clone());
-    // Seed from the current snapshot (boot may have restored saved repos
-    // already); later changes arrive through the registry subscription.
-    app.apply_sync(&registry.snapshot().tabs);
+    let mut registry_for_startup: Option<crate::server::registry::TabRegistry> = None;
+    match &mode {
+        GuiMode::Embedded(registry) => {
+            let _ = SHARED_REGISTRY.set(registry.clone());
+            app.registry = Some(registry.clone());
+            // Seed from the current snapshot (boot may have restored saved
+            // repos already); later changes arrive through the subscription.
+            app.apply_sync(&registry.snapshot().tabs);
+            registry_for_startup = Some(registry.clone());
+        }
+        GuiMode::Remote { port } => {
+            app.remote_port = Some(*port);
+            if open_explicit {
+                // Deferred until the first sync: the daemon may still be
+                // starting (systemd boot race).
+                app.pending_open = Some(repo_path.display().to_string());
+            }
+        }
+    }
+    let startup_registry = registry_for_startup;
 
     iced::application(
         move || {
             let app = app.clone();
-            let startup = if open_explicit {
-                let registry = registry.clone();
-                let repo_path = repo_path.clone();
-                Task::perform(
-                    async move {
-                        Message::OpenRepoResult(
-                            crate::server::websocket::open_repo_tab(
-                                &registry,
-                                String::new(),
-                                repo_path.display().to_string(),
+            let startup =
+                if open_explicit {
+                    match &startup_registry {
+                        Some(registry) => {
+                            let registry = registry.clone();
+                            let repo_path = repo_path.clone();
+                            Task::perform(
+                                async move {
+                                    Message::OpenRepoResult(
+                                        crate::server::websocket::open_repo_tab(
+                                            &registry,
+                                            String::new(),
+                                            repo_path.display().to_string(),
+                                        )
+                                        .await,
+                                    )
+                                },
+                                |m| m,
                             )
-                            .await,
-                        )
-                    },
-                    |m| m,
-                )
-            } else {
-                Task::none()
-            };
+                        }
+                        None => Task::none(),
+                    }
+                } else {
+                    Task::none()
+                };
             (app, startup)
         },
         GritApp::update,
@@ -1020,5 +1122,32 @@ mod tests {
     fn zero_tabs_default_to_add_form() {
         let app = GritApp::new();
         assert!(app.showing_add_form());
+    }
+
+    #[test]
+    fn remote_mode_close_tab_waits_for_server_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let mut app = GritApp::new();
+        app.remote_port = Some(5999);
+        let live = vec![WebTab {
+            id: 0,
+            name: "t".to_string(),
+            repo_path: dir.path().display().to_string(),
+            state: crate::git::types::RepoState::default(),
+        }];
+        app.apply_sync(&live);
+
+        let _ = app.update(Message::CloseTab(0));
+        assert_eq!(
+            app.tabs.len(),
+            1,
+            "remote close must not mutate local tabs; the echo does"
+        );
     }
 }
