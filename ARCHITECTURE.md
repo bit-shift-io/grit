@@ -10,13 +10,22 @@
 
 ### Key Technology Stack
 * **Language & Runtime:** Rust (latest stable), Tokio async runtime (`full` features)
-* **Desktop UI:** `Iced` (v0.14+) with native rendering (`wgpu` / `winit`)
+* **Desktop UI:** `Iced` (v0.14) with native rendering (`wgpu` / `winit`)
 * **Web Server Daemon:** `Axum` (with `ws`, `tokio`, `http1` features)
 * **Static Asset Embedding:** `rust-embed` (embeds static frontend assets into single compiled binary)
-* **FileSystem Watching:** `notify` (v6+) monitoring `.git/` directory changes
+* **FileSystem Watching:** `notify` (v8) monitoring `.git/` directory changes
 * **CLI Engine:** `clap` (v4+ with `derive` macro support)
 * **Serialization:** `serde` & `serde_json`
 * **Logging/Tracing:** `tracing` & `tracing-subscriber`
+
+### Core Design Principle: Single Writer
+
+The **`TabRegistry`** (`src/server/registry.rs`) is the *only* mutation point for the tab list.
+The desktop GUI and every web browser are **pure clients**: they render `WebState`
+snapshots pushed through the registry's watch channel and request mutations through
+the same shared operations (`open_repo_tab`, `close_tab_by_id`). Neither client ever
+writes a full tab list back. This makes duplicate/ghost tabs structurally impossible:
+ids come from one monotonic allocator and are never reused within a session.
 
 ---
 
@@ -32,20 +41,23 @@
 │   └── dist/                # Pre-built HTML/CSS/JS frontend assets
 └── src/
     ├── main.rs              # Entrypoint parsing CLI args and routing execution mode
+    ├── shared_config.rs     # Shared persistence: config.json load/save/restore/prune
     ├── git/                 # Git Engine subsystem
     │   ├── mod.rs           # Git CLI command execution logic and status queries
     │   ├── types.rs         # Core data models (RepoState, GitStatus, FileChange, GitAction)
     │   └── watcher.rs       # Debounced workspace file-system monitoring (.git/ directory)
     ├── server/              # Embedded Axum Web Server subsystem
-    │   ├── mod.rs           # Axum router setup, shared AppState initialization
-    │   ├── websocket.rs     # Real-time WebSocket connection handling and JSON protocol dispatch
+    │   ├── mod.rs           # Axum router setup, AppState, boot/sync loops, /browse /files /commit
+    │   ├── registry.rs      # TabRegistry: single-writer tab list + watch channel + id allocator
+    │   ├── websocket.rs     # WS protocol dispatch, shared open_repo_tab/close_tab_by_id ops
     │   └── static_files.rs  # Embedded asset server using rust-embed
     └── ui/                  # Native Desktop GUI subsystem (Iced)
-        ├── mod.rs           # Main Iced application entry and run loop
-        ├── state.rs         # Application state and message dispatch enum
+        ├── mod.rs           # Module declarations only; run() lives in state.rs
+        ├── state.rs         # GritApp: pure-client state fed by WebTabsSync deliveries
         └── components/      # UI Layout components
             ├── header.rs    # Branch selector, Push, Pull, and Fetch controls
             ├── staging.rs   # Split-view un-staged/staged file tree list
+            ├── diff.rs      # Diff text viewer panel
             ├── commit.rs    # Commit summary/description input form
             └── history.rs   # Scrollable commit log and revision list
 ```
@@ -55,126 +67,156 @@
 ## 3. Core Subsystems & Module Breakdown
 
 ### 3.1 CLI Entrypoint & Bootstrapping (`src/main.rs`)
-* **`main.rs`**: Parses command-line arguments via `clap` (`--headless`, `--port`, `--path`).
-* **Dual Execution Modes**:
-  * **Headless Mode (`--headless`)**: Boots Tokio runtime and starts only the Axum WebSocket server daemon. Ideal for remote Linux boxes or SSH tunnels.
-  * **GUI Mode (Default)**: Boots Tokio runtime, spawns the Axum server on a background task (`localhost:8080`), and launches the native `Iced` desktop window on the main thread.
+* Parses `--headless`, `--port` (default **5000**), `--path` (optional).
+* **Headless Mode**: boots Tokio runtime and runs only the Axum daemon.
+* **GUI Mode (Default)**: spawns the Axum server on a background Tokio task, then
+  launches the native `Iced` desktop window on the main thread. Both share one
+  cloned `TabRegistry`.
+* Without an explicit `--path` and with an empty config, startup lands on the
+  Add Repository form instead of seeding a fallback `"."` tab — a cleared
+  workspace stays cleared across restarts.
 
 ### 3.2 Core Git Engine & Data Types (`src/git/`)
-* **`src/git/types.rs`**: Strictly typed Rust representations of repository states.
-  * `GitStatus`: Enum (`Modified`, `Untracked`, `Renamed`, `Deleted`, `Staged`).
-  * `FileChange`: Struct tracking file path, `GitStatus`, and staging state.
-  * `CommitInfo`: Struct holding commit hash, author, message, and timestamp.
-  * `RepoState`: Aggregated state holding active branch, branches list, file changes, and commit history.
-  * `GitAction`: Unified action enum (`Stage`, `Unstage`, `Commit`, `Push`, `Pull`, `CheckoutBranch`, `Revert`).
-* **`src/git/mod.rs`**: Invokes local `git` CLI commands (`git status`, `git commit`, etc.) and captures standard error output (`stderr`) as custom structured `GitError`.
-* **`src/git/watcher.rs`**: Monitors `.git/index`, `.git/HEAD`, and working directory changes using the `notify` crate with a 200ms debouncer to avoid event thrashing.
+* **`types.rs`**: strictly typed models — `GitStatus`, `FileChange`, `FilePair`,
+  `CommitInfo`, `CommitSummary`, `RepoState`, and the `GitAction` enum
+  (`Stage`, `Unstage`, `Commit`, `Push`, `Pull`, `CheckoutBranch`, `Revert`,
+  `Nuke`, ...).
+* **`mod.rs`**: invokes the local `git` CLI via `std::process::Command`
+  (`get_repository_status`, `get_file_diff`, `get_file_pair`, `get_commit_summary`,
+  `execute_action`), wrapping stderr into structured `GitError`s.
+* **`watcher.rs`**: monitors `.git/index`, `.git/HEAD`, and working-directory
+  changes with a 200 ms debouncer.
 
-### 3.3 Axum Web Server & Embedded Assets (`src/server/`)
-* **`src/server/mod.rs`**: Configures Axum router containing HTTP routes (`/health`) and WebSocket upgrade routes (`/ws`).
-* **`src/server/websocket.rs`**: Handles bidirectional real-time communication. Converts inbound WebSocket JSON payloads into `GitAction` commands and broadcasts outbound updated `RepoState` payloads across all connected browser clients.
-* **`src/server/static_files.rs`**: Reads compiled web bundle files directly from memory using `#[derive(RustEmbed)]` to serve web UI clients without external disk dependencies.
+### 3.3 Tab Registry & Shared Persistence (`src/server/registry.rs`, `src/shared_config.rs`)
+* **`TabRegistry`** holds `WebState { active, tabs: Vec<WebTab> }` behind a
+  `tokio::sync::watch` channel plus an `AtomicUsize` id allocator
+  (`alloc_id()` never repeats; `raise_next_id_floor()` protects ids adopted from
+  disk). Cloning copies the counter but shares the channel.
+* **`WebTab`** = `{ id, name, repo_path, state: RepoState }` — the wire format for
+  both WS broadcasts and desktop sync messages.
+* **`shared_config.rs`** owns `$XDG_CONFIG_HOME/bitshift/grit/config.json`
+  (`SavedTab { id, name, path }`): `save_tabs`, `load_tabs(_from)`,
+  `persist_web_state`, `restore_web_state` (with `prune_dead_tabs` filtering
+  paths whose `.git` no longer exists). The server is the sole writer of this file.
 
-### 3.4 Native Desktop GUI (`src/ui/`)
-* **`src/ui/state.rs`**: Defines the top-level `GritApp` struct implementing `iced::Application` / `iced::Element`. Tracks local view state and handles message processing.
-* **`src/ui/components/`**: Modular Iced widget trees:
-  * **`header.rs`**: Branch switcher dropdown and repository sync controls (Push / Pull / Fetch).
-  * **`staging.rs`**: Dual list view for unstaged vs. staged changes with interactive action buttons.
-  * **`commit.rs`**: Multi-line commit text entry form with "Commit" action submission.
-  * **`history.rs`**: Visual scrollable commit log rendering commit metadata.
-* **Async Task Handlers**: Heavy Git operations (`push`, `pull`, `fetch`) are offloaded to Tokio tasks via `iced::Task` / `iced::Command` to guarantee zero main UI thread blocking.
+### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
+* **Routes**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
+  `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
+  the add-repo form), `/*` embedded static assets.
+* **`boot(registry)`**: restores tabs from config **only if the registry is empty**
+  (then re-persists the healed state), spawns per-tab `.git` watchers, starts the
+  persist task (writes config on every registry change), and runs the sync loop
+  broadcasting snapshots to all WS clients on registry/watcher events.
+  `refresh_tab` re-validates that the path still contains `.git` before shelling out.
+* **`websocket.rs`**: parses `ClientMessage { tab: Option<usize>, action }`.
+  Git actions execute against the target tab's repo then trigger a refresh;
+  tab mutations go through the extracted shared ops:
+  * `open_repo_tab(&registry, name, path) -> Result<usize, String>` — validates
+    tilde expansion, directory existence, and `.git` presence; allocates a fresh id;
+    appends; sets `active` to it.
+  * `close_tab_by_id(&registry, id) -> bool` — removes any tab (repo files on disk
+    are untouched); closing the last tab yields an empty registry, which renders as
+    the new-tab page everywhere.
+* **`static_files.rs`**: serves the embedded `web/dist` bundle from memory.
+
+### 3.5 Native Desktop GUI (`src/ui/state.rs`, `components/`)
+* **`GritApp`** is a pure registry client. Its tab list is derived exclusively from
+  `Message::WebTabsSync(Vec<WebTab>)` deliveries (fed by a subscription watching the
+  registry): unknown non-empty-path ids are adopted as local `RepoTab`s (and
+  auto-selected, hiding any open add-form); missing ids are dropped; known ids merge
+  server identity while preserving local UI fields (`commit_message`, `diff`,
+  `nuke_armed`, `error`).
+* Opening/closing repos calls the same shared ops as the web via `iced::Task`;
+  errors surface in the form. Git actions stay local (disk operations).
+* Zero tabs ⇒ the Add Repository form is the active view ("+" button toggles it
+  locally). No config is written by the GUI itself.
+* **`components/`**: `header.rs` (branch switcher, push/pull/fetch, nuke),
+  `staging.rs`, `diff.rs`, `commit.rs`, `history.rs`.
 
 ---
 
 ## 4. Primary Data & Event Flow
 
-### System Startup (`main.rs`)
+### Startup
 ```
 main.rs
-  ├── Parse CLI Flags (clap: --headless, --port, --path)
-  ├── Initialize Git Engine & Directory Watcher (.git/)
-  ├── Spawn Tokio Background Runtime
-  │     └── Axum Web Server (localhost:8080)
-  │           ├── GET /health -> HTTP 200
-  │           ├── GET /ws     -> Upgrades to WebSocket
-  │           └── GET /*      -> Serves static assets via rust-embed
+  ├── Parse CLI (clap: --headless, --port=5000 default, --path optional)
+  ├── Create TabRegistry (shared by clones)
+  ├── Spawn Tokio runtime → server::run(registry)
+  │     ├── boot(): restore-from-config-if-empty → watchers → persist task
+  │     └── Axum routes (/health /ws /files /commit /browse /*)
   └── IF NOT --headless:
-        └── Launch Iced GUI Engine (Main Thread)
+        └── Iced GUI (main thread), seeded by apply_sync(snapshot)
 ```
 
-### File System Watcher & Real-Time Sync Loop
+### Tab List Mutation (single writer)
 ```
-File System Event (.git/ index/HEAD modified)
-  │
-  ├──> notify::Watcher triggers debounced refresh event
-  │
-  ├──> Git Engine re-queries repository state (get_repository_status)
-  │
-  ├──> Broadcaster sends updated RepoState JSON payload via Axum WebSocket
-  │      └── All connected browser clients update UI components instantly
-  │
-  └──> Iced Subscription receives local event
-         └── Native desktop GUI state refreshes seamlessly
+User opens/closes a repo (desktop button OR web WS message)
+  └─> shared op: open_repo_tab() / close_tab_by_id()
+        └─> registry.set(new WebState)            [the ONLY list mutation]
+              ├─> watch channel fires
+              │     ├─> persist task writes config.json
+              │     └─> sync loop broadcasts snapshot to every WS client
+              ├─> web clients reconcile selection + URL (?t=N) and render
+              └─> desktop registry_subscription delivers WebTabsSync
+                    └─> apply_sync: adopt/drop/merge → render
 ```
 
-### Git Action Dispatch Flow
+### Refresh Loop (state content, not list membership)
 ```
-User Interaction (Desktop GUI Button OR Web Browser WS Message)
-  │
-  ├──> Dispatches GitAction (e.g., Stage("src/main.rs"))
-  │
-  ├──> Executed via std::process::Command calling local `git` CLI
-  │
-  ├──> Command succeeds / fails (returns GitResult<()>)
-  │
-  └──> Directory Watcher detects filesystem update -> Triggers Sync Loop
+.git change → debounced notify event → refresh_tab(id)
+  → get_repository_status → registry.update_state(id, state) [re-snapshots]
+  → broadcast (same pipeline as above)
+Desktop mirrors this with its own per-tab watcher subscriptions.
+```
+
+### Git Action Dispatch
+```
+UI interaction (desktop OR web) → GitAction → std::process::Command("git" ...)
+  → success/failure (GitError carries stderr) → refresh → broadcast
 ```
 
 ---
 
 ## 5. Architectural Invariants & Key Rules
 
-1. **Single-Binary Portability**: No external static files, node runtimes, or client side daemons must be required to run the application in release mode. All web UI assets must be embedded into the binary executable at compile time using `rust-embed`.
-2. **Unified Data Structures**: Both native `Iced` components and `Axum` WebSocket endpoints must consume identical data models defined in `src/git/types.rs`.
-3. **Non-Blocking UI Thread**: The main thread handling `Iced` GUI rendering must never perform blocking I/O or execute long-running `git` processes directly. All `git` execution must run through async Tokio tasks or background threads.
-4. **Git CLI Delegation**: Rely directly on standard local `git` CLI calls rather than complex native Git bindings (`git2-rs`/`libgit2`) to ensure full user SSH key, gpg signature, and local `.gitconfig` compatibility.
+1. **Single-Binary Portability**: no external static files, node runtimes, or sidecar daemons in release mode; all web assets embed via `rust-embed`. The JS stays tooling-free (no bundler).
+2. **Unified Data Structures**: desktop UI, WS payloads, and persisted config all derive from the models in `src/git/types.rs` + `registry::{WebState, WebTab}`.
+3. **Single Writer**: only registry operations mutate the tab list; clients are renderers + operation requesters. Ids are allocated once and never reused.
+4. **Non-Blocking UI Thread**: all `git` execution and filesystem work runs on Tokio tasks / background threads; the Iced thread only renders.
+5. **Git CLI Delegation**: shell out to local `git`; no `git2-rs`/libgit2 — preserves SSH keys, GPG signing, and `.gitconfig`.
+6. **Async Mutexes**: lock state across Axum/Tokio tasks with `tokio::sync::Mutex`, never `std::sync::Mutex`.
 
 ---
 
 ## 6. How to Extend
 
 ### Adding a New Git Operation
-1. Add a new variant to `GitAction` in `src/git/types.rs`.
-2. Implement the command execution logic in `src/git/mod.rs`.
-3. Update `src/server/websocket.rs` to handle parsing the new JSON action variant.
-4. Add corresponding UI triggers in `src/ui/components/` and `src/ui/state.rs`.
+1. Add a variant to `GitAction` in `src/git/types.rs`.
+2. Implement it in `execute_action` (`src/git/mod.rs`).
+3. Handle the JSON action string in `src/server/websocket.rs` dispatch.
+4. Add triggers in `web/dist/app.js` and/or `src/ui/components/` + `Message` in `src/ui/state.rs`.
 
 ### Adding a New Web / Desktop UI Component
-1. Build the widget layout in `src/ui/components/<component_name>.rs`.
-2. Hook component messages into `Message` enum in `src/ui/state.rs`.
-3. Mirror any corresponding web view elements in `web/` assets.
+1. Widget layout in `src/ui/components/<name>.rs`; hook into `GritApp::view`.
+2. Mirror the view in `web/dist/app.js` (rendered inside `render()`'s branches).
+3. Any new cross-client data must flow through `RepoState`/`WebTab` so both sides receive it via the existing sync pipelines.
 
 ---
 
 ## 7. Validation & Testing
 
-* **Build & Unit Verification**:
-  ```bash
-  cargo check
-  cargo test
-  ```
-* **Headless Execution Verification**:
-  ```bash
-  cargo run -- --headless --port 8080 --path /path/to/repo
-  ```
-* **Full Dual-Mode Verification**:
-  ```bash
-  cargo run -- --path /path/to/repo
-  ```
-* **Release Packaging Verification**:
-  ```bash
-  cargo build --release
-  ```
+```bash
+cargo check                              # quick compiler check (zero warnings expected)
+cargo test                               # unit + integration suites
+cargo run -- --headless --port 8080 --path /repo   # headless daemon
+cargo run -- --path .                    # dual-mode GUI + web (http://localhost:5000)
+cargo build --release                    # single-binary packaging
+```
+
+Integration tests boot real daemons on ephemeral ports with isolated
+`XDG_CONFIG_HOME` tempdirs, drive them over real WebSocket connections
+(`tokio-tungstenite`), and assert on broadcast sequences.
 
 ---
 
@@ -182,15 +224,17 @@ User Interaction (Desktop GUI Button OR Web Browser WS Message)
 
 | File | Purpose |
 |------|---------|
-| `Cargo.toml` | Project manifest and dependency declarations |
-| `src/main.rs` | CLI argument parser and mode execution router |
-| `src/git/types.rs` | Core Rust data models and state types |
-| `src/git/mod.rs` | Git CLI process invocation and error wrapping |
-| `src/git/watcher.rs` | Debounced file system watcher monitoring `.git/` changes |
-| `src/server/mod.rs` | Axum router configuration and HTTP route definitions |
-| `src/server/websocket.rs` | WebSocket JSON message protocol and broadcaster |
-| `src/server/static_files.rs` | Embedded memory-served static web frontend assets |
-| `src/ui/state.rs` | Top-level Iced desktop application state and messages |
-| `src/ui/components/` | Native desktop widget layout panels |
-| `TASKS.md` | AI-agent implementation task list and roadmap |
-| `Notes.md` | Architectural comparison and design decisions |
+| `src/main.rs` | CLI parsing, mode routing, registry construction |
+| `src/shared_config.rs` | Shared `config.json` persistence (load/save/restore/prune) |
+| `src/git/types.rs` | Core data models (`RepoState`, `FileChange`, `GitAction`, ...) |
+| `src/git/mod.rs` | Git CLI invocation + structured `GitError` |
+| `src/git/watcher.rs` | Debounced `.git` watcher |
+| `src/server/registry.rs` | `TabRegistry`: watch channel, monotonic ids, `WebState`/`WebTab` |
+| `src/server/mod.rs` | Router, `boot()`, sync loop, persist task, `/browse` `/files` `/commit` handlers |
+| `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
+| `src/server/static_files.rs` | rust-embed asset serving |
+| `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
+| `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history) |
+| `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links, rendering |
+| `TASKS.md` | Original build roadmap (historical) |
+| `Notes.md` | Design rationale |

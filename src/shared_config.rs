@@ -91,14 +91,14 @@ fn is_live_repo(path: &str) -> bool {
 }
 
 /// Drops saved tabs whose repository path no longer exists.
-pub fn prune_dead_tabs(tabs: Vec<SavedTab>) -> Vec<SavedTab> {
+fn prune_dead_tabs(tabs: Vec<SavedTab>) -> Vec<SavedTab> {
     tabs.into_iter()
         .filter(|t| is_live_repo(&t.path))
         .collect()
 }
 
 /// Builds a WebState from saved tabs.
-pub fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebState {
+fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebState {
     let mut tabs = Vec::new();
     for tab in saved {
         tabs.push(crate::server::registry::WebTab {

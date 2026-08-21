@@ -3,7 +3,6 @@
 pub mod registry;
 pub mod static_files;
 pub mod websocket;
-pub mod persistence;
 
 use std::path::PathBuf;
 
@@ -350,9 +349,9 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
 
     // Restore tabs from persistent storage only if registry is empty.
     if app.registry.snapshot().tabs.is_empty() {
-        let restored = crate::server::persistence::restore_web_state();
+        let restored = crate::shared_config::restore_web_state();
         // Rewrite the config so tabs pruned for dead paths vanish from disk too.
-        crate::server::persistence::persist_web_state(&restored);
+        crate::shared_config::persist_web_state(&restored);
         if !restored.tabs.is_empty() {
             app.registry
                 .raise_next_id_floor(restored.tabs.iter().map(|t| t.id));
@@ -390,7 +389,7 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
     let mut persist_rx = app.registry.subscribe();
     tokio::spawn(async move {
         while persist_rx.changed().await.is_ok() {
-            crate::server::persistence::persist_web_state(&persist_rx.borrow());
+            crate::shared_config::persist_web_state(&persist_rx.borrow());
         }
     });
 

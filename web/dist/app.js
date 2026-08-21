@@ -15,6 +15,8 @@ const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
 
+//#region Add-repo form ("+" is a client-local mode, never a server tab)
+
 function getTabNameFromPath(path) {
   const parts = path.trim().split(/[/\\]/).filter(p => p.length > 0);
   const name = parts[parts.length - 1] || "repo";
@@ -161,6 +163,10 @@ ws.onmessage = (event) => {
   render(state);
 };
 
+//#endregion
+
+//#region WebSocket send + selection helpers
+
 function sendAction(action) {
   ws.send(JSON.stringify({ tab: activeTabId, action }));
 }
@@ -168,6 +174,10 @@ function sendAction(action) {
 function activeTab(state) {
   return state.tabs.find((t) => t.id === activeTabId) ?? state.tabs[0];
 }
+
+//#endregion
+
+//#region Main render / view switching
 
 function render(state) {
   renderTabBar(state);
@@ -258,6 +268,10 @@ function render(state) {
     expandedCommitEl = null;
   }
 }
+
+//#endregion
+
+//#region Changes + commit rendering
 
 function appendChangeRow(container, change, tab) {
   const key = `${tab.id}:${change.path}`;
@@ -457,6 +471,10 @@ function renderCommitSummary(summary) {
   return div;
 }
 
+//#endregion
+
+//#region Tab bar, sorting, URL deep-linking
+
 function renderTabBar(state) {
   const tabsEl = document.getElementById("tabs");
   tabsEl.textContent = "";
@@ -549,6 +567,10 @@ async function showDiff(detailEl, tab, path) {
     detailEl.textContent = `Failed to load diff: ${err}`;
   }
 }
+
+//#endregion
+
+//#region Side-by-side diff rendering
 
 function renderFilePair(detailEl, pair) {
   detailEl.textContent = "";
@@ -674,6 +696,10 @@ function renderSideBySide(original, current) {
   return table;
 }
 
+//#endregion
+
+//#region Action wiring (buttons + delegated listeners)
+
 const nukeBtn = document.getElementById("nuke-btn");
 nukeBtn.onclick = () => {
   if (confirm("Nuke this repo? All local changes will be discarded and the repo reset to origin.")) {
@@ -781,4 +807,4 @@ document.querySelectorAll(".section-title").forEach((title) => {
     const arrow = title.querySelector(".arrow");
     arrow.innerHTML = section.classList.contains("collapsed") ? "&#9652;" : "&#9662;";
   };
-});
+});//#endregion
