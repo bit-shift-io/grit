@@ -33,14 +33,24 @@ fn main() -> iced::Result {
     let repo_path = resolve_path(cli.path.as_deref().unwrap_or(Path::new(".")));
 
     if cli.headless {
-        let registry = server::registry::TabRegistry::with_single_tab(
-            0,
-            repo_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| repo_path.display().to_string()),
-            repo_path,
-        );
+        // An explicit --path pins one tab; otherwise start empty so persisted
+        // tabs are restored by boot() instead of being shadowed by a CWD tab.
+        let registry = match cli.path {
+            Some(ref path) => {
+                if !repo_path.is_dir() || !repo_path.join(".git").exists() {
+                    eprintln!("error: --path {} is not a git repository", path.display());
+                    std::process::exit(2);
+                }
+                server::registry::TabRegistry::with_single_tab(
+                    0,
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                    repo_path,
+                )
+            }
+            None => server::registry::TabRegistry::new(),
+        };
         let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
         runtime.block_on(server::run(registry, cli.port));
         Ok(())

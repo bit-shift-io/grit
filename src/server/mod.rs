@@ -313,15 +313,24 @@ pub async fn refresh_all(app: &AppState) {
 pub async fn sync_loop(app: AppState, mut refresh_rx: mpsc::UnboundedReceiver<()>) {
     let mut registry_rx = app.registry.subscribe();
     let _ = app.broadcast.send(app.registry.snapshot());
+    // Once every watcher is gone the channel closes and recv() would return
+    // None instantly forever; disable that arm instead of busy-spinning.
+    let mut refresh_open = true;
     loop {
         tokio::select! {
-            _ = refresh_rx.recv() => {
-                refresh_all(&app).await;
-                let _ = app.broadcast.send(app.registry.snapshot());
-            }
+            res = refresh_rx.recv(), if refresh_open => match res {
+                Some(()) => {
+                    refresh_all(&app).await;
+                    let _ = app.broadcast.send(app.registry.snapshot());
+                }
+                None => refresh_open = false,
+            },
             changed = registry_rx.changed() => {
                 if changed.is_ok() {
                     let _ = app.broadcast.send(app.registry.snapshot());
+                } else {
+                    // Registry senders are gone; nothing can change anymore.
+                    std::future::pending::<()>().await;
                 }
             }
         }
@@ -650,6 +659,33 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["tab_count"], 1);
         assert_eq!(json["change_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn sync_loop_idles_when_refresh_channel_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        let app = app_for(&dir.path().to_path_buf());
+
+        // Simulate every watcher dying: the refresh channel closes up-front.
+        let (refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
+        drop(refresh_tx);
+
+        let mut bcast = app.broadcast.subscribe();
+        tokio::spawn(sync_loop(app.clone(), refresh_rx));
+
+        // A busy-spinning loop would starve this single-threaded runtime and
+        // hang the test before the sleep ever completes.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The loop must still re-broadcast registry changes while idling.
+        app.registry
+            .set(crate::server::registry::WebState {
+                active: 0,
+                tabs: vec![],
+            });
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), bcast.recv()).await;
+        assert!(received.is_ok(), "sync_loop stopped responding to changes");
     }
 
     #[tokio::test]

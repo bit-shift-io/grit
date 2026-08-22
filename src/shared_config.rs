@@ -71,7 +71,9 @@ pub fn persist_web_state(state: &crate::server::registry::WebState) {
     let tabs: Vec<SavedTab> = state
         .tabs
         .iter()
-        .filter(|t| !t.repo_path.is_empty())
+        // Never persist paths that are not live git repositories, whatever
+        // their origin; restore-side pruning alone would keep re-saving junk.
+        .filter(|t| is_live_repo(&t.repo_path))
         .map(|t| SavedTab {
             id: t.id,
             name: t.name.clone(),
@@ -82,7 +84,7 @@ pub fn persist_web_state(state: &crate::server::registry::WebState) {
 }
 
 /// Returns true when the path points at an existing git repository.
-fn is_live_repo(path: &str) -> bool {
+pub fn is_live_repo(path: &str) -> bool {
     if path.is_empty() {
         return false;
     }
