@@ -19,6 +19,7 @@ struct ClientMessage {
 
 /// Serializes a client operation into the exact wire format the browser
 /// uses, so the desktop GUI in remote mode speaks the same protocol.
+#[cfg(any(test, feature = "desktop"))]
 pub fn encode_client_message(tab: Option<usize>, action: &GitAction) -> String {
     serde_json::json!({ "tab": tab, "action": action }).to_string()
 }

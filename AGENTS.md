@@ -11,12 +11,19 @@ Grit is a fast, native, single-binary Git client written in Rust. It runs as bot
 ### Essential Execution Commands
 
 ```bash
-cargo check                     # Quick compiler check
+cargo check                     # Quick compiler check (web-only build, default)
 cargo test                      # Run unit and integration tests
-cargo run -- --path .           # Run full GUI + background server on current dir
 cargo run -- --headless         # Run headless server daemon mode (localhost:5000)
-cargo build --release           # Build final single-binary distribution executable
+cargo build --release           # Build web-only single-binary distribution executable
+
+cargo check --features desktop  # Check with the desktop GUI included
+cargo run --features desktop -- --path .   # Run full desktop GUI + background server
+cargo build --release --features desktop   # Build the desktop + web UI binary
 ```
+
+> **Build profiles:** The **default** build is web-only — it compiles just the
+> embedded web daemon and excludes `iced`/`rfd` and all GUI-only code paths.
+> Pass `--features desktop` to compile the native `Iced` desktop UI on top.
 
 ---
 

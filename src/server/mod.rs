@@ -21,6 +21,7 @@ use crate::server::registry::{TabRegistry, WebState};
 const BROADCAST_CAPACITY: usize = 128;
 
 /// Per-operation deadline for the raw-TCP daemon probe on `/health`.
+#[cfg(any(test, feature = "desktop"))]
 const DAEMON_PROBE_TIMEOUT_MS: u64 = 500;
 
 /// Listen backlog for the TCP listener (`socket.listen`).
@@ -438,6 +439,7 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
 /// Sends a minimal HTTP/1.1 request over a raw TCP connection so no HTTP
 /// client dependency is needed; verifies the 200 status line to avoid
 /// mistaking unrelated local services for a Grit daemon.
+#[cfg(any(test, feature = "desktop"))]
 pub async fn is_daemon_running(port: u16) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

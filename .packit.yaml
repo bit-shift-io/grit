@@ -1,0 +1,23 @@
+# .packit.yaml
+specfile_path: rust-grit.spec
+
+# Optional: How to dynamically append commit hash/date to the version
+release_suffix: "."
+
+jobs:
+  # Build on every commit pushed to main
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: gibbz
+    project: grit
+    targets:
+      - fedora-stable
+
+  # Optional: Also build PRs so you catch build breaks early
+  - job: copr_build
+    trigger: pull_request
+    owner: gibbz
+    project: grit
+    targets:
+      - fedora-stable

@@ -384,6 +384,9 @@ fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
     Ok(history)
 }
 
+/// Full-worktree diff for one file; only the desktop GUI renders diffs,
+/// so web-only builds omit this unless compiling tests.
+#[cfg(any(test, feature = "desktop"))]
 pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
     let diff = run(git_command(repo_path).args(["diff", "HEAD", "--", path]));
 
