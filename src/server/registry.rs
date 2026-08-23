@@ -38,8 +38,10 @@ pub struct TabRegistry {
     tx: watch::Sender<WebState>,
     rx: watch::Receiver<WebState>,
     /// Monotonic id allocator; ids are never reused within a session so
-    /// clients can treat every unseen id as a genuinely new tab.
-    next_id: std::sync::atomic::AtomicUsize,
+    /// clients can treat every unseen id as a genuinely new tab. Shared
+    /// through an `Arc` because every handle (server, desktop GUI) is a
+    /// clone: independent counters would hand out colliding ids.
+    next_id: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Clone for TabRegistry {
@@ -47,9 +49,7 @@ impl Clone for TabRegistry {
         Self {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
-            next_id: std::sync::atomic::AtomicUsize::new(
-                self.next_id.load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            next_id: std::sync::Arc::clone(&self.next_id),
         }
     }
 }
@@ -61,7 +61,7 @@ impl TabRegistry {
         Self {
             tx,
             rx,
-            next_id: std::sync::atomic::AtomicUsize::new(0),
+            next_id: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -240,11 +240,23 @@ mod tests {
     }
 
     #[test]
-    fn clone_shares_watch_channel_but_copies_counter() {
+    fn clones_share_one_id_allocator() {
+        let registry = TabRegistry::new();
+        let clone_a = registry.clone();
+        let clone_b = clone_a.clone();
+        let first = clone_a.alloc_id();
+        let second = clone_b.alloc_id();
+        let third = registry.alloc_id();
+        assert_ne!(first, second, "clones must not hand out duplicate ids");
+        assert_ne!(first, third);
+        assert_ne!(second, third);
+    }
+
+    #[test]
+    fn clone_shares_watch_channel() {
         let registry = TabRegistry::new();
         let _ = registry.alloc_id();
         let clone = registry.clone();
-        assert_eq!(clone.alloc_id(), 1);
         clone.set(WebState {
             active: 0,
             tabs: vec![sample_tab(9, "x")],

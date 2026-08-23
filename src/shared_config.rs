@@ -100,11 +100,30 @@ fn prune_dead_tabs(tabs: Vec<SavedTab>) -> Vec<SavedTab> {
 }
 
 /// Builds a WebState from saved tabs.
+///
+/// Ids must be unique — clients key selection and "active" styling on them
+/// — but configs written by earlier versions could contain collisions.
+/// Kept ids pass through untouched; a collision is reassigned above every
+/// id seen so far, keeping future allocations collision-free too.
 fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebState {
-    let mut tabs = Vec::new();
+    let mut tabs = Vec::with_capacity(saved.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut next_fallback = saved.iter().map(|t| t.id).max().unwrap_or(0) + 1;
     for tab in saved {
+        let id = if seen.insert(tab.id) {
+            tab.id
+        } else {
+            let id = next_fallback;
+            next_fallback += 1;
+            tracing::warn!(
+                "saved tabs contained duplicate id {}; reassigned {} to {id}",
+                tab.id,
+                tab.name
+            );
+            id
+        };
         tabs.push(crate::server::registry::WebTab {
-            id: tab.id,
+            id,
             name: tab.name,
             repo_path: tab.path,
             state: RepoState::default(),
@@ -174,6 +193,33 @@ mod tests {
         };
         let pruned = prune_dead_tabs(vec![dead, live.clone()]);
         assert_eq!(pruned, vec![live]);
+    }
+
+    #[test]
+    fn restored_states_never_contain_duplicate_ids() {
+        // A config written while the id-allocator bug was live can hold two
+        // tabs with the same id; restore must reassign one so clients never
+        // see two "active" tabs for a single selection id.
+        let healed = web_state_from_saved(vec![
+            SavedTab { id: 0, name: "a".into(), path: "/r/a".into() },
+            SavedTab { id: 1, name: "b".into(), path: "/r/b".into() },
+            SavedTab { id: 0, name: "grit".into(), path: "/r/grit".into() },
+            SavedTab { id: 3, name: "d".into(), path: "/r/d".into() },
+        ]);
+        let mut ids: Vec<usize> = healed.tabs.iter().map(|t| t.id).collect();
+        let len = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), len, "duplicate ids survived restore: {ids:?}");
+        // Existing ids keep their value; only collisions are reassigned.
+        assert_eq!(healed.tabs[0].id, 0);
+        assert_eq!(healed.tabs[1].id, 1);
+        assert_eq!(healed.tabs[2].name, "grit");
+        assert_ne!(healed.tabs[2].id, 0);
+        assert_eq!(healed.tabs[3].id, 3);
+        // Reassigned ids must stay above every other id so future allocs
+        // cannot collide either.
+        assert!(healed.tabs[2].id > 3);
     }
 
     // Helper for tests to use arbitrary paths
