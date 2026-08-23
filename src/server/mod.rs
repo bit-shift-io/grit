@@ -351,6 +351,62 @@ pub fn run_server(
     })
 }
 
+/// Keeps exactly one filesystem watcher alive per unique repository path
+/// among the open tabs, spawning and retiring them as tabs are opened or
+/// closed through any client (web UI, desktop GUI, or config restore).
+///
+/// Watchers cannot be one-shot at boot: tabs opened later would otherwise
+/// never stream filesystem updates to connected clients.
+async fn watch_reconciler(app: AppState, refresh_tx: mpsc::UnboundedSender<()>) {
+    let mut watchers: std::collections::HashMap<PathBuf, notify::RecommendedWatcher> =
+        std::collections::HashMap::new();
+    let mut registry_rx = app.registry.subscribe();
+
+    loop {
+        // Collect the canonical paths that should currently be watched.
+        let mut wanted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for tab in app.registry.snapshot().tabs {
+            if tab.repo_path.is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(&tab.repo_path);
+            if !path.exists() || !path.join(".git").exists() {
+                tracing::warn!("not watching tab {}: invalid repo path {}", tab.id, tab.repo_path);
+                continue;
+            }
+            let key = std::fs::canonicalize(&path).unwrap_or(path);
+            wanted.insert(key);
+        }
+
+        // Retire watchers whose repository no longer has an open tab;
+        // dropping a watcher also ends its debouncer thread.
+        watchers.retain(|path, _| wanted.contains(path));
+
+        // Spawn watchers for newly opened repositories. A fresh watcher is
+        // followed by a refresh kick so the tab's state is computed and
+        // broadcast even before its first filesystem event arrives.
+        for path in &wanted {
+            if watchers.contains_key(path) {
+                continue;
+            }
+            match crate::git::watcher::spawn_watcher(path.clone(), refresh_tx.clone()) {
+                Ok(w) => {
+                    tracing::debug!("watching {}", path.display());
+                    watchers.insert(path.clone(), w);
+                    let _ = refresh_tx.send(());
+                }
+                Err(e) => {
+                    tracing::warn!("file watcher failed to start for {}: {e}", path.display())
+                }
+            }
+        }
+
+        if registry_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 /// Boots shared daemon infrastructure: app state, watchers, and initial refresh.
 pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<()>) {
     let app = AppState::new(registry);
@@ -368,31 +424,9 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
         }
     }
 
-    for tab in app.registry.snapshot().tabs {
-        if tab.repo_path.is_empty() {
-            continue;
-        }
-        let repo_path = PathBuf::from(&tab.repo_path);
-        if !repo_path.exists() || !repo_path.join(".git").exists() {
-            tracing::warn!("skipping tab {} with invalid repo path: {}", tab.id, tab.repo_path);
-            continue;
-        }
-        let watcher = match crate::git::watcher::spawn_watcher(repo_path, refresh_tx.clone()) {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::warn!("file watcher failed to start for {}: {e}", tab.repo_path);
-                None
-            }
-        };
-
-        // Keep the watcher alive for the lifetime of the process.
-        if let Some(watcher) = watcher {
-            tokio::spawn(async move {
-                let _keep_alive = watcher;
-                std::future::pending::<()>().await;
-            });
-        }
-    }
+    // One watcher per open repository, kept in sync with the registry for
+    // the lifetime of the process.
+    tokio::spawn(watch_reconciler(app.clone(), refresh_tx.clone()));
 
     // Persist tabs on registry changes.
     let mut persist_rx = app.registry.subscribe();
@@ -930,6 +964,82 @@ mod tests {
         .await;
         assert_eq!(updated.tabs[0].state.changes.len(), 1);
         assert_eq!(updated.tabs[0].state.changes[0].path, "b.txt");
+    }
+
+    #[tokio::test]
+    async fn tabs_opened_after_boot_stream_filesystem_updates() {
+        // Isolate config persistence so the test never touches the real
+        // user configuration file.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Fresh machine: nothing is open (and thus watched) at boot.
+        let (app, refresh_rx) = boot(TabRegistry::new()).await;
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _initial = recv_state(&mut ws).await;
+
+        // Open the repository through the normal web-UI NewTab flow.
+        // Match on our repo path: a concurrent test sharing the process
+        // env may leak foreign tabs into the restored config.
+        let repo_path_string = dir.path().display().to_string();
+        ws.send(Message::Text(
+            format!(
+                r#"{{"tab":null,"action":{{"NewTab":"{{\"name\":\"\",\"path\":\"{}\"}}"}}}}"#,
+                repo_path_string
+            )
+            .into(),
+        ))
+        .await
+        .unwrap();
+        recv_state_until(&mut ws, |s| {
+            s.tabs.iter().any(|t| t.repo_path == repo_path_string)
+        })
+        .await;
+
+        // A file written after the tab exists must surface on its own.
+        // Re-write until observed: the watcher is spawned asynchronously
+        // after the registry change, so one single write could race it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem change in a post-boot tab was never broadcast"
+            );
+            std::fs::write(dir.path().join("late.txt"), "data").unwrap();
+            let pred = |s: &WebState| {
+                s.tabs
+                    .iter()
+                    .any(|t| t.repo_path == repo_path_string && t.state.changes.iter().any(|c| c.path == "late.txt"))
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                recv_state_until(&mut ws, pred),
+            )
+            .await
+            {
+                Ok(state) => {
+                    let mine = state
+                        .tabs
+                        .iter()
+                        .find(|t| t.repo_path == repo_path_string)
+                        .expect("opened tab present");
+                    assert!(
+                        mine.state.changes.iter().any(|c| c.path == "late.txt"),
+                        "got: {mine:?}"
+                    );
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
     }
 
     #[tokio::test]
