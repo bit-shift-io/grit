@@ -59,6 +59,7 @@ pub async fn open_repo_tab(
         name: tab_name,
         repo_path: repo_path.display().to_string(),
         state: crate::git::types::RepoState::default(),
+        log: Vec::new(),
     });
     new_state.active = new_state.tabs.len() - 1;
     registry.set(new_state);
@@ -185,15 +186,37 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
         tracing::debug!("ignoring action for unknown tab {}", tab_id);
         return;
     };
-    let result = tokio::task::spawn_blocking(move || {
-        crate::git::execute_action(&repo_path, msg.action)
-    })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::error!("action failed: {e}"),
+
+    // Broadcast a `running` entry up front so every client sees the command
+    // was entered even while a slow pull/push is still in flight.
+    let placeholder = crate::git::placeholder_command(&msg.action);
+    let log_seq = app.registry.start_log_entry(tab_id, placeholder);
+
+    let result =
+        tokio::task::spawn_blocking(move || crate::git::execute_action_logged(&repo_path, msg.action))
+            .await;
+    match &result {
+        Ok((Ok(()), _)) => {}
+        Ok((Err(e), _)) => tracing::error!("action failed: {e}"),
         Err(e) => tracing::error!("action task panicked: {e}"),
     }
+    if let Some(seq) = log_seq {
+        let transcript = result
+            .ok()
+            .map(|(_, log)| log)
+            .unwrap_or_else(|| {
+                vec![crate::git::types::LogEntry {
+                    seq: 0,
+                    command: "internal error".to_string(),
+                    output: "the action task panicked before completing".to_string(),
+                    status: crate::git::types::LogStatus::Failed,
+                    started_ms: 0,
+                    duration_ms: 0,
+                }]
+            });
+        app.registry.finish_log_entry(tab_id, seq, transcript);
+    }
+
     crate::server::refresh_tab(app, tab_id).await;
 }
 
@@ -327,7 +350,16 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = recv_state(&mut ws).await;
+        // Log broadcasts may interleave with state updates, so wait for the
+        // staged change rather than reading a single message.
+        let updated = recv_state_until(&mut ws, |s| {
+            s.tabs[0]
+                .state
+                .changes
+                .iter()
+                .any(|c| c.path == "a.txt" && c.is_staged)
+        })
+        .await;
         assert_eq!(updated.tabs[0].state.changes.len(), 1);
         assert_eq!(updated.tabs[0].state.changes[0].path, "a.txt");
         assert!(updated.tabs[0].state.changes[0].is_staged);
@@ -351,12 +383,14 @@ mod tests {
                     name: "one".to_string(),
                     repo_path: dir1.path().display().to_string(),
                     state: crate::git::types::RepoState::default(),
+                    log: Vec::new(),
                 },
                 crate::server::registry::WebTab {
                     id: 1,
                     name: "two".to_string(),
                     repo_path: dir2.path().display().to_string(),
                     state: crate::git::types::RepoState::default(),
+                    log: Vec::new(),
                 },
             ],
         });
@@ -377,7 +411,12 @@ mod tests {
             .await
             .unwrap();
 
-        let updated = recv_state(&mut ws).await;
+        let updated = recv_state_until(&mut ws, |s| {
+            s.tabs
+                .iter()
+                .any(|t| t.id == 1 && t.state.changes.iter().any(|c| c.path == "two.txt" && c.is_staged))
+        })
+        .await;
         let tab1 = updated.tabs.iter().find(|t| t.id == 1).unwrap();
         let tab0 = updated.tabs.iter().find(|t| t.id == 0).unwrap();
         assert!(tab1
@@ -419,6 +458,60 @@ mod tests {
         let state2 = recv_state(&mut ws2).await;
         assert_eq!(state1, state2);
         assert_eq!(state1.tabs[0].state.changes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn actions_stream_command_log_entries_to_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _ = recv_state(&mut ws).await;
+
+        // Commit with nothing staged must fail; the log entry carries git's
+        // own stderr so the user sees exactly what a terminal would show.
+        ws.send(Message::Text(r#"{"tab":0,"action":{"Commit":"empty"}}"#.into()))
+            .await
+            .unwrap();
+        let logged = recv_state_until(&mut ws, |s| {
+            s.tabs[0].log.iter().any(|e| {
+                e.command.contains("git commit")
+                    && e.status != crate::git::types::LogStatus::Running
+            })
+        })
+        .await;
+        let entries: Vec<&crate::git::types::LogEntry> = logged.tabs[0]
+            .log
+            .iter()
+            .filter(|e| {
+                e.command.contains("git commit")
+                    && e.status != crate::git::types::LogStatus::Running
+            })
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, crate::git::types::LogStatus::Failed);
+        assert!(
+            entries[0].output.contains("nothing added to commit"),
+            "got: {:?}",
+            entries[0].output
+        );
+
+        // The running placeholder must have been replaced (no dangling
+        // `running` entries after the action completes).
+        let state = app.registry.snapshot();
+        assert!(state.tabs[0]
+            .log
+            .iter()
+            .all(|e| e.status != crate::git::types::LogStatus::Running));
     }
 
     #[tokio::test]

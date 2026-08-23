@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use crate::git::types::RepoState;
+use crate::git::types::{LogEntry, RepoState};
+
+/// Upper bound on retained log entries per tab; oldest entries fall off.
+const MAX_LOG_ENTRIES: usize = 200;
 
 /// A repository tab as exposed to the web UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +17,9 @@ pub struct WebTab {
     pub name: String,
     pub repo_path: String,
     pub state: RepoState,
+    /// Transcript of executed git commands (terminal-style log).
+    #[serde(default)]
+    pub log: Vec<LogEntry>,
 }
 
 /// The full set of open tabs, broadcast to connected web clients.
@@ -42,6 +48,9 @@ pub struct TabRegistry {
     /// through an `Arc` because every handle (server, desktop GUI) is a
     /// clone: independent counters would hand out colliding ids.
     next_id: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Monotonic allocator for log entry ids; shared across clones for
+    /// the same reason as `next_id`.
+    next_log_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for TabRegistry {
@@ -50,6 +59,7 @@ impl Clone for TabRegistry {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
             next_id: std::sync::Arc::clone(&self.next_id),
+            next_log_seq: std::sync::Arc::clone(&self.next_log_seq),
         }
     }
 }
@@ -62,6 +72,7 @@ impl TabRegistry {
             tx,
             rx,
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            next_log_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -88,6 +99,7 @@ impl TabRegistry {
                 name,
                 repo_path: repo_path.display().to_string(),
                 state: RepoState::default(),
+                log: Vec::new(),
             }],
         });
         registry
@@ -125,6 +137,82 @@ impl TabRegistry {
             .find(|t| t.id == id)
             .map(|t| PathBuf::from(t.repo_path))
     }
+
+    /// Appends a `running` placeholder entry for `tab_id` so every client
+    /// sees a command was entered while it is still executing. Returns the
+    /// entry's seq for the later [`Self::finish_log_entry`] call, or None
+    /// when the tab no longer exists.
+    pub fn start_log_entry(&self, tab_id: usize, command: String) -> Option<u64> {
+        let seq = self.alloc_log_seq();
+        let mut current = self.snapshot();
+        let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return None;
+        };
+        tab.log.push(LogEntry {
+            seq,
+            command,
+            output: String::new(),
+            status: crate::git::types::LogStatus::Running,
+            started_ms: epoch_millis(),
+            duration_ms: 0,
+        });
+        truncate_log(&mut tab.log);
+        self.set(current);
+        Some(seq)
+    }
+
+    /// Replaces the `running` placeholder `seq` with the final transcript
+    /// entries (one per executed git command) and re-broadcasts. Unknown
+    /// seq or missing tabs are ignored; each new entry gets a fresh seq.
+    pub fn finish_log_entry(
+        &self,
+        tab_id: usize,
+        seq: u64,
+        entries: Vec<crate::git::types::LogEntry>,
+    ) {
+        if entries.is_empty() {
+            // Nothing to record (e.g. pure UI actions): drop the placeholder.
+            let mut current = self.snapshot();
+            if let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if tab.log.iter().any(|e| e.seq == seq) {
+                    tab.log.retain(|e| e.seq != seq);
+                    self.set(current);
+                }
+            }
+            return;
+        }
+        let mut finished = entries;
+        for entry in &mut finished {
+            entry.seq = self.alloc_log_seq();
+        }
+        let mut current = self.snapshot();
+        let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        tab.log.retain(|e| e.seq != seq);
+        tab.log.extend(finished);
+        truncate_log(&mut tab.log);
+        self.set(current);
+    }
+
+    fn alloc_log_seq(&self) -> u64 {
+        self.next_log_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn truncate_log(log: &mut Vec<LogEntry>) {
+    if log.len() > MAX_LOG_ENTRIES {
+        let excess = log.len() - MAX_LOG_ENTRIES;
+        log.drain(..excess);
+    }
 }
 
 impl Default for TabRegistry {
@@ -149,6 +237,7 @@ mod tests {
                 history: vec![],
                 scripts: vec![],
             },
+            log: Vec::new(),
         }
     }
 
@@ -262,5 +351,105 @@ mod tests {
             tabs: vec![sample_tab(9, "x")],
         });
         assert_eq!(registry.snapshot().tabs.len(), 1);
+    }
+
+    #[test]
+    fn start_and_finish_log_entry_replace_placeholder() {
+        use crate::git::types::LogStatus;
+
+        let registry =
+            TabRegistry::with_single_tab(1, "r".to_string(), PathBuf::from("/repo/r"));
+
+        let seq = registry
+            .start_log_entry(1, "git push".to_string())
+            .unwrap();
+        let log = &registry.snapshot().tabs[0].log;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].status, LogStatus::Running);
+        assert_eq!(log[0].command, "git push");
+
+        let done = vec![crate::git::types::LogEntry {
+            seq: 0,
+            command: "git add -A".to_string(),
+            output: String::new(),
+            status: LogStatus::Success,
+            started_ms: 0,
+            duration_ms: 5,
+        }];
+        registry.finish_log_entry(1, seq, done);
+        let log = &registry.snapshot().tabs[0].log;
+        assert_eq!(log.len(), 1);
+        assert_ne!(log[0].seq, seq, "finished entry gets a fresh seq");
+        assert_eq!(log[0].command, "git add -A");
+        assert_eq!(log[0].status, LogStatus::Success);
+    }
+
+    #[test]
+    fn finish_log_entry_without_entries_drops_placeholder() {
+        use crate::git::types::LogStatus;
+
+        let registry =
+            TabRegistry::with_single_tab(2, "r".to_string(), PathBuf::from("/repo/r"));
+        let seq = registry.start_log_entry(2, "noop".to_string()).unwrap();
+        registry.finish_log_entry(2, seq, Vec::new());
+        assert!(registry.snapshot().tabs[0].log.is_empty());
+
+        // Unknown seq/tab combinations are ignored.
+        let foreign = crate::git::types::LogEntry {
+            seq: 0,
+            command: "git status".to_string(),
+            output: String::new(),
+            status: LogStatus::Success,
+            started_ms: 0,
+            duration_ms: 0,
+        };
+        registry.finish_log_entry(99, seq, vec![foreign]);
+        assert!(
+            registry.snapshot().tabs[0].log.is_empty(),
+            "finish targeting an unknown tab must not touch any tab"
+        );
+    }
+
+    #[test]
+    fn start_log_entry_for_unknown_tab_returns_none() {
+        let registry = TabRegistry::new();
+        assert_eq!(registry.start_log_entry(42, "git pull".to_string()), None);
+    }
+
+    #[test]
+    fn log_is_capped_dropping_oldest() {
+        use crate::git::types::{LogEntry, LogStatus};
+
+        let registry =
+            TabRegistry::with_single_tab(3, "r".to_string(), PathBuf::from("/repo/r"));
+        for i in 0..(MAX_LOG_ENTRIES + 25) {
+            let seq = registry.start_log_entry(3, format!("cmd {i}")).unwrap();
+            registry.finish_log_entry(
+                3,
+                seq,
+                vec![LogEntry {
+                    seq: 0,
+                    command: format!("done {i}"),
+                    output: String::new(),
+                    status: LogStatus::Success,
+                    started_ms: 0,
+                    duration_ms: 0,
+                }],
+            );
+        }
+        let log = &registry.snapshot().tabs[0].log;
+        assert_eq!(log.len(), MAX_LOG_ENTRIES);
+        assert!(
+            log.last().unwrap().command.ends_with(&format!("done {}", MAX_LOG_ENTRIES + 24)),
+            "newest entry must be retained: {:?}",
+            log.last().unwrap()
+        );
+    }
+
+    #[test]
+    fn webtab_log_defaults_for_older_payloads() {
+        let json = r#"{"id":0,"name":"n","repo_path":"/repo/n","state":{"current_branch":"","branches":[],"changes":[],"history":[]}}"#;
+        let tab: WebTab = serde_json::from_str(json).unwrap();
+        assert!(tab.log.is_empty(), "missing log field must default");
     }
 }

@@ -127,6 +127,7 @@ fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebSta
             name: tab.name,
             repo_path: tab.path,
             state: RepoState::default(),
+            log: Vec::new(),
         });
     }
     let active = if tabs.is_empty() { 0 } else { 0 };

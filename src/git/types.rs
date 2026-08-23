@@ -73,6 +73,33 @@ pub struct CommitSummary {
     pub files: Vec<FileStat>,
 }
 
+/// Lifecycle of a logged command: broadcast as `running` the moment a
+/// client action arrives, then finalized with captured output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStatus {
+    Running,
+    Success,
+    Failed,
+}
+
+/// One executed git command as shown in the web UI log: the exact command
+/// line plus whatever git printed on stdout/stderr.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// Monotonic id for stable UI keys and in-place completion updates.
+    pub seq: u64,
+    /// Display form, e.g. `git push origin main`.
+    pub command: String,
+    /// Combined stdout+stderr exactly as git produced it (may be empty).
+    pub output: String,
+    pub status: LogStatus,
+    /// Epoch milliseconds when execution started.
+    pub started_ms: i64,
+    /// Wall-clock duration of the finished command; 0 while running.
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitAction {
     Stage(String),
@@ -166,6 +193,28 @@ mod tests {
             let parsed: GitAction = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, action);
         }
+    }
+
+    #[test]
+    fn log_entry_round_trips_and_defaults_status_names() {
+        let entry = LogEntry {
+            seq: 7,
+            command: "git pull".to_string(),
+            output: "Already up to date.".to_string(),
+            status: LogStatus::Success,
+            started_ms: 1_700_000_000_000,
+            duration_ms: 250,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"status\":\"success\""), "got: {json}");
+        let parsed: LogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+
+        let running: LogEntry = serde_json::from_str(
+            r#"{"seq":1,"command":"git push","output":"","status":"running","started_ms":0,"duration_ms":0}"#,
+        )
+        .unwrap();
+        assert_eq!(running.status, LogStatus::Running);
     }
 
     #[test]

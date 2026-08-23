@@ -2,12 +2,15 @@ pub mod types;
 pub mod watcher;
 
 pub use types::{
-    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, RepoState,
+    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, LogEntry,
+    LogStatus, RepoState,
 };
 
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitError {
@@ -29,6 +32,65 @@ impl fmt::Display for GitError {
 
 impl std::error::Error for GitError {}
 
+/// Per-entry cap so a chatty `push`/`clone` cannot flood the web UI log.
+const MAX_LOG_OUTPUT_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// Only set while [`execute_action_logged`] is on the stack, so status
+    /// refreshes and diff reads never pollute the action log.
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+    static PENDING_LOG: RefCell<Vec<LogEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Appends to the in-flight log when recording is active; a no-op otherwise.
+fn record_entry(entry: LogEntry) {
+    if RECORDING.with(Cell::get) {
+        PENDING_LOG.with(|pending| pending.borrow_mut().push(entry));
+    }
+}
+
+/// Records a command-free synthetic entry (used where no `run()` happened).
+fn record_synthetic(command: &str, output: impl Into<String>, status: LogStatus) {
+    record_entry(LogEntry {
+        seq: 0,
+        command: command.to_string(),
+        output: output.into(),
+        status,
+        started_ms: epoch_millis(),
+        duration_ms: 0,
+    });
+}
+
+fn epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Renders a `Command` back into its shell form for the log, e.g.
+/// `git add -- src/main.rs`.
+fn describe_command(cmd: &Command) -> String {
+    let mut line = cmd.get_program().to_string_lossy().into_owned();
+    for arg in cmd.get_args() {
+        line.push(' ');
+        line.push_str(&arg.to_string_lossy());
+    }
+    line
+}
+
+fn truncate_output(mut out: String) -> String {
+    if out.len() > MAX_LOG_OUTPUT_BYTES {
+        let mut cut = MAX_LOG_OUTPUT_BYTES;
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n… output truncated …");
+    }
+    out
+}
+
 fn git_command(repo_path: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_path);
@@ -37,16 +99,55 @@ fn git_command(repo_path: &Path) -> Command {
 }
 
 fn run(cmd: &mut Command) -> Result<String, GitError> {
-    let output = cmd
-        .output()
-        .map_err(|e| GitError {
-            message: format!("failed to execute git: {e}"),
-            stderr: String::new(),
-            stdout: String::new(),
-        })?;
+    let command_line = describe_command(cmd);
+    let started_ms = epoch_millis();
+    let started = Instant::now();
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(e) => {
+            record_synthetic(
+                &command_line,
+                format!("failed to execute git: {e}"),
+                LogStatus::Failed,
+            );
+            return Err(GitError {
+                message: format!("failed to execute git: {e}"),
+                stderr: String::new(),
+                stdout: String::new(),
+            });
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    // Terminal-like transcript: both streams verbatim, errors last.
+    let mut combined = String::new();
+    if !stdout.trim().is_empty() {
+        combined.push_str(stdout.trim_end());
+    }
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(stderr.trim_end());
+    }
+
+    let status = if output.status.success() {
+        LogStatus::Success
+    } else {
+        LogStatus::Failed
+    };
+    record_entry(LogEntry {
+        seq: 0,
+        command: command_line,
+        output: truncate_output(combined),
+        status,
+        started_ms,
+        duration_ms,
+    });
 
     if output.status.success() {
         Ok(stdout)
@@ -56,6 +157,37 @@ fn run(cmd: &mut Command) -> Result<String, GitError> {
             stderr,
             stdout,
         })
+    }
+}
+
+/// Shell-style preview of what an action will do. Broadcast immediately
+/// when a client action arrives so the log shows the command was entered
+/// even while it is still running; replaced by the real per-command
+/// entries once execution finishes.
+pub fn placeholder_command(action: &GitAction) -> String {
+    match action {
+        GitAction::Stage(path) => format!("git add -- {path}"),
+        GitAction::Unstage(path) => format!("git reset HEAD -- {path}"),
+        GitAction::Discard(path) => format!("git restore --staged --worktree -- {path}"),
+        GitAction::Commit(message) => format!("git commit -m \"{message}\""),
+        GitAction::CommitAll(message) => format!("git add -A && git commit -m \"{message}\""),
+        GitAction::CommitAllPush(message) => {
+            format!("git add -A && git commit -m \"{message}\" && git push")
+        }
+        GitAction::DiscardAll => "git reset --hard HEAD".to_string(),
+        GitAction::Push => "git push".to_string(),
+        GitAction::Pull => "git pull".to_string(),
+        GitAction::Fetch => "git fetch".to_string(),
+        GitAction::CheckoutBranch(branch) => format!("git checkout {branch}"),
+        GitAction::Revert(hash) => format!("git revert --no-edit {hash}"),
+        GitAction::CreateBranch(name, from) => format!("git checkout -b {name} {from}"),
+        GitAction::CreateTag(name, target) => format!("git tag {name} {target}"),
+        GitAction::DeleteTag(name) => format!("git tag -d {name}"),
+        GitAction::DeleteBranch(name) => format!("git branch -d {name}"),
+        GitAction::Nuke => "git fetch origin && git reset --hard origin/<branch> && git clean -fdx"
+            .to_string(),
+        GitAction::RunScript(rel_path) => format!("./{rel_path}"),
+        GitAction::NewTab(_) | GitAction::CloseTab => String::new(),
     }
 }
 
@@ -427,15 +559,41 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
             nuke_repo(repo_path)?;
         }
         GitAction::RunScript(rel_path) => {
-            crate::actions::launch(repo_path, &rel_path).map_err(|message| GitError {
-                message,
-                stderr: String::new(),
-                stdout: String::new(),
-            })?;
+            match crate::actions::launch(repo_path, &rel_path) {
+                Ok(()) => record_synthetic(
+                    &format!("./{rel_path}"),
+                    "launched in a separate terminal window",
+                    LogStatus::Success,
+                ),
+                Err(message) => {
+                    record_synthetic(&format!("./{rel_path}"), message.clone(), LogStatus::Failed);
+                    return Err(GitError {
+                        message,
+                        stderr: String::new(),
+                        stdout: String::new(),
+                    });
+                }
+            }
         }
         GitAction::NewTab(_) | GitAction::CloseTab => {}
     }
     Ok(())
+}
+
+/// Runs an action while capturing every executed git command and its
+/// output. Returns the action result plus the transcript in execution
+/// order; entries are produced even when the action fails mid-way.
+/// Must be called from a single thread (it uses a thread-local buffer).
+pub fn execute_action_logged(
+    repo_path: &Path,
+    action: GitAction,
+) -> (Result<(), GitError>, Vec<LogEntry>) {
+    RECORDING.with(|r| r.set(true));
+    PENDING_LOG.with(|p| p.borrow_mut().clear());
+    let result = execute_action(repo_path, action);
+    let log = PENDING_LOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    RECORDING.with(|r| r.set(false));
+    (result, log)
 }
 
 fn nuke_repo(repo_path: &Path) -> Result<(), GitError> {
@@ -722,6 +880,80 @@ mod tests {
         .unwrap_err();
         let display = err.to_string();
         assert!(display.contains("nothing to commit"), "got: {display}");
+    }
+
+    #[test]
+    fn execute_action_logged_captures_commands_and_output() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+
+        let (result, log) =
+            execute_action_logged(dir.path(), GitAction::Stage("file.txt".to_string()));
+        assert!(result.is_ok());
+        assert_eq!(log.len(), 1, "got: {log:?}");
+        assert_eq!(log[0].command, "git add -- file.txt");
+        assert_eq!(log[0].status, LogStatus::Success);
+    }
+
+    #[test]
+    fn execute_action_logged_captures_multi_command_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+
+        // CommitAllPush runs add + commit (+ push); push fails with no remote.
+        let (result, log) =
+            execute_action_logged(dir.path(), GitAction::CommitAllPush("ship".to_string()));
+        assert!(result.is_err());
+        let commands: Vec<&str> = log.iter().map(|e| e.command.as_str()).collect();
+        assert!(
+            commands.iter().any(|c| c.starts_with("git add -A")),
+            "got: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("git commit")),
+            "got: {commands:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|e| e.status == LogStatus::Failed && !e.output.is_empty()),
+            "failed entries must carry git's own output: {log:?}"
+        );
+        assert!(
+            log.last().map(|e| e.status == LogStatus::Failed).unwrap_or(false),
+            "transcript must end with the failing command: {log:?}"
+        );
+    }
+
+    #[test]
+    fn failed_commit_log_carries_git_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+
+        let (_, log) =
+            execute_action_logged(dir.path(), GitAction::Commit("empty".to_string()));
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].status, LogStatus::Failed);
+        assert!(
+            log[0].output.contains("nothing to commit"),
+            "got: {:?}",
+            log[0].output
+        );
+    }
+
+    #[test]
+    fn placeholder_command_previews_real_invocations() {
+        assert_eq!(
+            placeholder_command(&GitAction::Pull),
+            "git pull"
+        );
+        assert_eq!(
+            placeholder_command(&GitAction::Stage("a b.txt".to_string())),
+            "git add -- a b.txt"
+        );
+        assert!(placeholder_command(&GitAction::CloseTab).is_empty());
     }
 
     #[test]

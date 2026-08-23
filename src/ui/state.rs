@@ -774,6 +774,7 @@ mod tests {
             name: name.to_string(),
             repo_path: path.display().to_string(),
             state: RepoState::default(),
+            log: Vec::new(),
         }
     }
 
@@ -1074,6 +1075,7 @@ mod tests {
             name: "new".to_string(),
             repo_path: String::new(),
             state: RepoState::default(),
+            log: Vec::new(),
         }]));
         assert!(
             !app.tabs.iter().any(|t| t.id == 9),
@@ -1131,6 +1133,7 @@ mod tests {
             name: "renamed".to_string(),
             repo_path: dir.path().display().to_string(),
             state: repo_state("dev"),
+            log: Vec::new(),
         };
         let _ = app.update(Message::WebTabsSync(vec![renamed]));
 
@@ -1166,6 +1169,7 @@ mod tests {
             name: "t".to_string(),
             repo_path: dir.path().display().to_string(),
             state: crate::git::types::RepoState::default(),
+            log: Vec::new(),
         }];
         app.apply_sync(&live);
 

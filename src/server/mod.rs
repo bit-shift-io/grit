@@ -828,12 +828,14 @@ mod tests {
                     name: "one".to_string(),
                     repo_path: dir1.path().display().to_string(),
                     state: crate::git::types::RepoState::default(),
+                    log: Vec::new(),
                 },
                 crate::server::registry::WebTab {
                     id: 1,
                     name: "two".to_string(),
                     repo_path: dir2.path().display().to_string(),
                     state: crate::git::types::RepoState::default(),
+                    log: Vec::new(),
                 },
             ],
         });

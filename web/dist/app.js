@@ -7,6 +7,8 @@ let expandedDetailEl = null;
 let expandedCommitKey = null;
 let expandedCommitEl = null;
 let awaitingNewTab = false;
+// Client-local view state: entries with seq <= this are hidden by "Clear".
+let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
 let browserDir = null;
@@ -185,6 +187,7 @@ function render(state) {
   const addRepoForm = document.getElementById("add-repo-form");
   const repoView = document.getElementById("repo-view");
   const historySection = document.getElementById("history-section");
+  const logSection = document.getElementById("log-section");
   const actionsSection = document.getElementById("actions");
 
   if (showAddForm || state.tabs.length === 0) {
@@ -192,6 +195,7 @@ function render(state) {
     addRepoForm.style.display = "block";
     repoView.style.display = "none";
     historySection.style.display = "none";
+    logSection.style.display = "none";
     actionsSection.style.display = "none";
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
@@ -202,12 +206,14 @@ function render(state) {
   addRepoForm.style.display = "none";
   repoView.style.display = "block";
   historySection.style.display = "block";
+  logSection.style.display = "block";
   actionsSection.style.display = "block";
   document.title = `Grit | ${tab.name}`;
   document.getElementById("overview").textContent =
     `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;
 
   renderScriptRunner(tab);
+  renderLog(tab);
 
   const changesEl = document.getElementById("changes");
   let stillOpen = false;
@@ -304,6 +310,70 @@ document.getElementById("run-script-btn").onclick = () => {
   const relPath = document.getElementById("script-select").value;
   if (!relPath) return;
   sendAction({ RunScript: relPath });
+};
+
+//#endregion
+
+//#region Command log (terminal-style transcript per tab)
+
+function renderLog(tab) {
+  const logEl = document.getElementById("log");
+  // Stick to the bottom while streaming, unless the user scrolled up.
+  const nearBottom =
+    logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 48;
+
+  const entries = (tab.log || []).filter((e) => e.seq > clearedUpToSeq);
+  if (entries.length === 0) {
+    logEl.textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "log-empty muted";
+    empty.textContent = "No commands yet.";
+    logEl.appendChild(empty);
+    return;
+  }
+
+  logEl.textContent = "";
+  for (const entry of entries) {
+    const row = document.createElement("div");
+    row.className = `log-entry ${entry.status}`;
+
+    const head = document.createElement("div");
+    head.className = "log-cmd";
+
+    const cmd = document.createElement("span");
+    cmd.className = "log-cmd-text";
+    cmd.textContent = entry.command;
+    head.appendChild(cmd);
+
+    if (entry.duration_ms > 0) {
+      const dur = document.createElement("span");
+      dur.className = "log-duration";
+      dur.textContent = `${(entry.duration_ms / 1000).toFixed(1)}s`;
+      head.appendChild(dur);
+    }
+
+    row.appendChild(head);
+
+    if (entry.output) {
+      const out = document.createElement("pre");
+      out.className = "log-out";
+      out.textContent = entry.output;
+      row.appendChild(out);
+    }
+
+    logEl.appendChild(row);
+  }
+  if (nearBottom) {
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
+document.getElementById("clear-log-btn").onclick = () => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  const maxSeq = Math.max(0, ...(tab.log || []).map((e) => e.seq));
+  clearedUpToSeq = maxSeq;
+  render(lastState);
 };
 
 //#endregion
