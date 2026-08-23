@@ -35,6 +35,9 @@ impl std::error::Error for GitError {}
 /// Per-entry cap so a chatty `push`/`clone` cannot flood the web UI log.
 const MAX_LOG_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// Maximum commits fetched for the History panel.
+const HISTORY_LIMIT: &str = "50";
+
 thread_local! {
     /// Only set while [`execute_action_logged`] is on the stack, so status
     /// refreshes and diff reads never pollute the action log.
@@ -61,7 +64,7 @@ fn record_synthetic(command: &str, output: impl Into<String>, status: LogStatus)
     });
 }
 
-fn epoch_millis() -> i64 {
+pub(crate) fn epoch_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -70,13 +73,26 @@ fn epoch_millis() -> i64 {
 
 /// Renders a `Command` back into its shell form for the log, e.g.
 /// `git add -- src/main.rs`.
-fn describe_command(cmd: &Command) -> String {
-    let mut line = cmd.get_program().to_string_lossy().into_owned();
-    for arg in cmd.get_args() {
+/// Renders a program plus its argv as a single space-joined line. Shared
+/// by transcript logging and action previews so both always look alike.
+fn format_argv<I, A>(program: &str, args: I) -> String
+where
+    I: IntoIterator<Item = A>,
+    A: AsRef<str>,
+{
+    let mut line = program.to_string();
+    for arg in args {
         line.push(' ');
-        line.push_str(&arg.to_string_lossy());
+        line.push_str(arg.as_ref());
     }
     line
+}
+
+fn describe_command(cmd: &Command) -> String {
+    format_argv(
+        &cmd.get_program().to_string_lossy(),
+        cmd.get_args().map(|a| a.to_string_lossy()),
+    )
 }
 
 fn truncate_output(mut out: String) -> String {
@@ -160,34 +176,66 @@ fn run(cmd: &mut Command) -> Result<String, GitError> {
     }
 }
 
+/// The exact argv sequences a table-backed action executes. Single source
+/// of truth for both execution (`execute_action`) and its shell-style
+/// preview (`placeholder_command`), so they cannot drift apart.
+///
+/// Returns `None` for actions with bespoke execution (Nuke's remote
+/// fallback, RunScript's terminal launch) or no server-side effect
+/// (NewTab/CloseTab).
+fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
+    fn seq(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+    let seqs: Vec<Vec<String>> = match action {
+        GitAction::Stage(p) => vec![seq(&["add", "--", p])],
+        GitAction::Unstage(p) => vec![seq(&["reset", "HEAD", "--", p])],
+        GitAction::Discard(p) => vec![seq(&["restore", "--staged", "--worktree", "--", p])],
+        GitAction::Commit(m) => vec![seq(&["commit", "-m", m])],
+        GitAction::CommitAll(m) => vec![seq(&["add", "-A"]), seq(&["commit", "-m", m])],
+        GitAction::CommitAllPush(m) => {
+            vec![seq(&["add", "-A"]), seq(&["commit", "-m", m]), seq(&["push"])]
+        }
+        GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"])],
+        GitAction::Push => vec![seq(&["push"])],
+        GitAction::Pull => vec![seq(&["pull"])],
+        GitAction::Fetch => vec![seq(&["fetch"])],
+        GitAction::CheckoutBranch(b) => vec![seq(&["checkout", b])],
+        GitAction::Revert(h) => vec![seq(&["revert", "--no-edit", h])],
+        GitAction::CreateBranch(n, f) => vec![seq(&["checkout", "-b", n, f])],
+        GitAction::CreateTag(n, t) => vec![seq(&["tag", n, t])],
+        GitAction::DeleteTag(n) => vec![seq(&["tag", "-d", n])],
+        GitAction::DeleteBranch(n) => vec![seq(&["branch", "-d", n])],
+        GitAction::Nuke | GitAction::RunScript(_) | GitAction::NewTab(_) | GitAction::CloseTab => {
+            return None;
+        }
+    };
+    Some(seqs)
+}
+
 /// Shell-style preview of what an action will do. Broadcast immediately
 /// when a client action arrives so the log shows the command was entered
 /// even while it is still running; replaced by the real per-command
 /// entries once execution finishes.
+///
+/// Derived from [`action_argv`] and rendered by the same [`format_argv`]
+/// used for real transcripts, so previews cannot drift from execution.
 pub fn placeholder_command(action: &GitAction) -> String {
+    if let Some(seqs) = action_argv(action) {
+        return seqs
+            .iter()
+            .map(|seq| format_argv("git", seq))
+            .collect::<Vec<_>>()
+            .join(" && ");
+    }
     match action {
-        GitAction::Stage(path) => format!("git add -- {path}"),
-        GitAction::Unstage(path) => format!("git reset HEAD -- {path}"),
-        GitAction::Discard(path) => format!("git restore --staged --worktree -- {path}"),
-        GitAction::Commit(message) => format!("git commit -m \"{message}\""),
-        GitAction::CommitAll(message) => format!("git add -A && git commit -m \"{message}\""),
-        GitAction::CommitAllPush(message) => {
-            format!("git add -A && git commit -m \"{message}\" && git push")
+        GitAction::Nuke => {
+            "git fetch origin && git reset --hard origin/<branch> && git clean -fdx".to_string()
         }
-        GitAction::DiscardAll => "git reset --hard HEAD".to_string(),
-        GitAction::Push => "git push".to_string(),
-        GitAction::Pull => "git pull".to_string(),
-        GitAction::Fetch => "git fetch".to_string(),
-        GitAction::CheckoutBranch(branch) => format!("git checkout {branch}"),
-        GitAction::Revert(hash) => format!("git revert --no-edit {hash}"),
-        GitAction::CreateBranch(name, from) => format!("git checkout -b {name} {from}"),
-        GitAction::CreateTag(name, target) => format!("git tag {name} {target}"),
-        GitAction::DeleteTag(name) => format!("git tag -d {name}"),
-        GitAction::DeleteBranch(name) => format!("git branch -d {name}"),
-        GitAction::Nuke => "git fetch origin && git reset --hard origin/<branch> && git clean -fdx"
-            .to_string(),
         GitAction::RunScript(rel_path) => format!("./{rel_path}"),
-        GitAction::NewTab(_) | GitAction::CloseTab => String::new(),
+        // Unreachable in practice: every other variant is table-backed
+        // and handled above.
+        _ => String::new(),
     }
 }
 
@@ -227,41 +275,13 @@ fn list_changes(repo_path: &Path) -> Result<Vec<FileChange>, GitError> {
         git_command(repo_path)
             .args(["diff", "--name-status", "--cached", "--diff-filter=ACMRD"]),
     )?;
-    for line in staged.lines() {
-        if let Some((status, path)) = parse_status_line(line) {
-            changes.push(FileChange {
-                path: path.to_string(),
-                status: if status == "R" {
-                    GitStatus::Renamed
-                } else if status == "D" {
-                    GitStatus::Deleted
-                } else {
-                    GitStatus::Staged
-                },
-                is_staged: true,
-            });
-        }
-    }
+    changes.extend(parse_name_status(&staged, true, GitStatus::Staged));
 
     let unstaged = run(
         git_command(repo_path)
             .args(["diff", "--name-status", "--diff-filter=ACMRD"]),
     )?;
-    for line in unstaged.lines() {
-        if let Some((status, path)) = parse_status_line(line) {
-            changes.push(FileChange {
-                path: path.to_string(),
-                status: if status == "R" {
-                    GitStatus::Renamed
-                } else if status == "D" {
-                    GitStatus::Deleted
-                } else {
-                    GitStatus::Modified
-                },
-                is_staged: false,
-            });
-        }
-    }
+    changes.extend(parse_name_status(&unstaged, false, GitStatus::Modified));
 
     let untracked = run(
         git_command(repo_path)
@@ -282,13 +302,50 @@ fn list_changes(repo_path: &Path) -> Result<Vec<FileChange>, GitError> {
 }
 
 fn parse_status_line(line: &str) -> Option<(&str, &str)> {
-    let mut parts = line.splitn(2, '\t');
-    let status = parts.next()?.trim();
-    let path = parts.next()?.trim();
+    let mut fields = line.split('\t');
+    let status = fields.next()?.trim();
+    if status.is_empty() {
+        return None;
+    }
+    // Rename/copy entries carry a similarity score plus both paths; the
+    // destination (final field) is the live path.
+    if status.starts_with('R') || status.starts_with('C') {
+        fields.next()?;
+    }
+    let path = fields.next()?.trim();
     if path.is_empty() {
         return None;
     }
     Some((status, path))
+}
+
+/// Maps `diff --name-status` output to `FileChange`s. Renames and deletions
+/// carry their own status; everything else falls back to the caller's
+/// staged/unstaged default.
+fn parse_name_status(output: &str, is_staged: bool, fallback: GitStatus) -> Vec<FileChange> {
+    output
+        .lines()
+        .filter_map(parse_status_line)
+        .map(|(status, path)| FileChange {
+            path: path.to_string(),
+            status: if status.starts_with('R') {
+                GitStatus::Renamed
+            } else if status == "D" {
+                GitStatus::Deleted
+            } else {
+                fallback.clone()
+            },
+            is_staged,
+        })
+        .collect()
+}
+
+fn parse_epoch(field: &str) -> Result<i64, GitError> {
+    field.trim().parse::<i64>().map_err(|_| GitError {
+        message: format!("malformed commit timestamp {field:?}"),
+        stderr: String::new(),
+        stdout: String::new(),
+    })
 }
 
 fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
@@ -297,7 +354,7 @@ fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
             "log",
             "--format=%H%x09%an%x09%ct%x09%s",
             "-n",
-            "50",
+            HISTORY_LIMIT,
         ]),
     ) {
         Ok(output) => output,
@@ -321,7 +378,7 @@ fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
             hash: hash.to_string(),
             author: author.to_string(),
             message: message.to_string(),
-            timestamp: timestamp.parse().unwrap_or(0),
+            timestamp: parse_epoch(timestamp)?,
         });
     }
     Ok(history)
@@ -386,8 +443,98 @@ pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
 pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError> {
     let original = run(git_command(repo_path).args(["show", &format!("HEAD:{path}")]))
         .unwrap_or_default();
-    let current = std::fs::read_to_string(repo_path.join(path)).unwrap_or_default();
+    let current = match std::fs::read_to_string(repo_path.join(path)) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(GitError {
+                message: format!("failed to read worktree file {path}"),
+                stderr: e.to_string(),
+                stdout: String::new(),
+            })
+        }
+    };
     Ok(FilePair { original, current })
+}
+
+/// Parses a `--shortstat` line like "3 files changed, 10 insertions(+),
+/// 2 deletions(-)" into (files_changed, insertions, deletions). Zeros when
+/// no stat line is present.
+fn parse_shortstat(output: &str) -> (i64, i64, i64) {
+    let Some(line) = output.lines().find(|l| l.contains("changed")) else {
+        return (0, 0, 0);
+    };
+    let mut files_changed = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+    for part in line.split(',') {
+        let part = part.trim();
+        let num: i64 = part
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if part.contains("insertion") {
+            insertions = num;
+        } else if part.contains("deletion") {
+            deletions = num;
+        } else {
+            files_changed = num;
+        }
+    }
+    (files_changed, insertions, deletions)
+}
+
+/// Human label for a `--name-status` letter code.
+fn file_status_label(letter: char) -> &'static str {
+    match letter {
+        'A' => "Added",
+        'D' => "Deleted",
+        'M' => "Modified",
+        'R' => "Renamed",
+        'C' => "Copied",
+        'T' => "Type Changed",
+        _ => "Changed",
+    }
+}
+
+/// Pairs `--name-status` output with `--numstat` counts into per-file
+/// stats, positionally. Rows without a numstat counterpart report zeros.
+fn parse_commit_files(name_status: &str, numstat: &str) -> Vec<FileStat> {
+    let name_lines: Vec<&str> = name_status.lines().filter(|l| !l.trim().is_empty()).collect();
+    let num_lines: Vec<&str> = numstat.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut files = Vec::new();
+    for (i, line) in name_lines.iter().enumerate() {
+        let mut fields = line.splitn(3, '\t');
+        let letter = fields
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .chars()
+            .next()
+            .unwrap_or('M');
+        let path = fields.last().unwrap_or_default().trim().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let (insertions, deletions) = num_lines
+            .get(i)
+            .map(|num| {
+                let mut nf = num.splitn(3, '\t');
+                (
+                    nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+                    nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0));
+        files.push(FileStat {
+            status: file_status_label(letter).to_string(),
+            path,
+            insertions,
+            deletions,
+        });
+    }
+    files
 }
 
 pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary, GitError> {
@@ -398,7 +545,7 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
     let header = lines.next().unwrap_or_default();
     let mut parts = header.splitn(3, '\t');
     let author = parts.next().unwrap_or_default().to_string();
-    let timestamp: i64 = parts.next().unwrap_or_default().trim().parse().unwrap_or(0);
+    let timestamp = parse_epoch(parts.next().unwrap_or_default())?;
     let subject = parts.next().unwrap_or_default().to_string();
 
     let mut body: Vec<&str> = lines.collect();
@@ -411,74 +558,16 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
         message.push_str(&body.join("\n"));
     }
 
-    let mut files_changed = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-    if let Ok(stat) =
+    let (files_changed, insertions, deletions) =
         run(git_command(repo_path).args(["show", "--format=", "--shortstat", hash]))
-    {
-        if let Some(line) = stat.lines().find(|l| l.contains("changed")) {
-            for part in line.split(',') {
-                let part = part.trim();
-                let num: i64 = part
-                    .split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                if part.contains("insertion") {
-                    insertions = num;
-                } else if part.contains("deletion") {
-                    deletions = num;
-                } else {
-                    files_changed = num;
-                }
-            }
-        }
-    }
+            .map(|stat| parse_shortstat(&stat))
+            .unwrap_or((0, 0, 0));
 
-    let mut files = Vec::new();
     let name_status = run(git_command(repo_path).args(["show", "--format=", "--name-status", hash]))
         .unwrap_or_default();
     let numstat = run(git_command(repo_path).args(["show", "--format=", "--numstat", hash]))
         .unwrap_or_default();
-    let name_lines: Vec<&str> = name_status.lines().filter(|l| !l.trim().is_empty()).collect();
-    let num_lines: Vec<&str> = numstat.lines().filter(|l| !l.trim().is_empty()).collect();
-    for (i, line) in name_lines.iter().enumerate() {
-        let mut fields = line.splitn(3, '\t');
-        let status_letter = fields
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .chars()
-            .next()
-            .unwrap_or('M');
-        let path = fields.last().unwrap_or_default().trim().to_string();
-        if path.is_empty() {
-            continue;
-        }
-        let status = match status_letter {
-            'A' => "Added",
-            'D' => "Deleted",
-            'M' => "Modified",
-            'R' => "Renamed",
-            'C' => "Copied",
-            'T' => "Type Changed",
-            _ => "Changed",
-        };
-        let mut insertions = 0;
-        let mut deletions = 0;
-        if let Some(num) = num_lines.get(i) {
-            let mut nf = num.splitn(3, '\t');
-            insertions = nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-            deletions = nf.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        }
-        files.push(FileStat {
-            status: status.to_string(),
-            path,
-            insertions,
-            deletions,
-        });
-    }
+    let files = parse_commit_files(&name_status, &numstat);
 
     Ok(CommitSummary {
         message,
@@ -492,72 +581,14 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
 }
 
 pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitError> {
+    if let Some(seqs) = action_argv(&action) {
+        for seq in seqs {
+            run(git_command(repo_path).args(seq))?;
+        }
+        return Ok(());
+    }
     match action {
-        GitAction::Stage(path) => {
-            run(git_command(repo_path).args(["add", "--", path.as_str()]))?;
-        }
-        GitAction::Unstage(path) => {
-            run(git_command(repo_path).args(["reset", "HEAD", "--", path.as_str()]))?;
-        }
-        GitAction::Discard(path) => {
-            run(git_command(repo_path).args([
-                "restore",
-                "--staged",
-                "--worktree",
-                "--",
-                path.as_str(),
-            ]))?;
-        }
-        GitAction::Commit(message) => {
-            run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
-        }
-        GitAction::CommitAll(message) => {
-            run(git_command(repo_path).args(["add", "-A"]))?;
-            run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
-        }
-        GitAction::CommitAllPush(message) => {
-            run(git_command(repo_path).args(["add", "-A"]))?;
-            run(git_command(repo_path).args(["commit", "-m", message.as_str()]))?;
-            run(git_command(repo_path).args(["push"]))?;
-        }
-        GitAction::DiscardAll => {
-            run(git_command(repo_path).args(["reset", "--hard", "HEAD"]))?;
-        }
-        GitAction::Push => {
-            run(git_command(repo_path).args(["push"]))?;
-        }
-        GitAction::Pull => {
-            run(git_command(repo_path).args(["pull"]))?;
-        }
-        GitAction::Fetch => {
-            run(git_command(repo_path).args(["fetch"]))?;
-        }
-        GitAction::CheckoutBranch(branch) => {
-            run(git_command(repo_path).args(["checkout", branch.as_str()]))?;
-        }
-        GitAction::Revert(hash) => {
-            run(git_command(repo_path).args(["revert", "--no-edit", hash.as_str()]))?;
-        }
-        GitAction::CreateBranch(name, from) => {
-            run(git_command(repo_path).args([
-                "checkout",
-                "-b",
-                name.as_str(),
-                from.as_str(),
-            ]))?;
-        }
-        GitAction::CreateTag(name, target) => {
-            run(git_command(repo_path).args(["tag", name.as_str(), target.as_str()]))?;
-        }
-        GitAction::DeleteTag(name) => {
-            run(git_command(repo_path).args(["tag", "-d", name.as_str()]))?;
-        }
-        GitAction::DeleteBranch(name) => {
-            run(git_command(repo_path).args(["branch", "-d", name.as_str()]))?;
-        }
-        GitAction::Nuke => {
-            nuke_repo(repo_path)?;
-        }
+        GitAction::Nuke => nuke_repo(repo_path)?,
         GitAction::RunScript(rel_path) => {
             match crate::actions::launch(repo_path, &rel_path) {
                 Ok(()) => record_synthetic(
@@ -576,6 +607,8 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
             }
         }
         GitAction::NewTab(_) | GitAction::CloseTab => {}
+        // Unreachable in practice: every other variant is table-backed.
+        _ => {}
     }
     Ok(())
 }
@@ -628,38 +661,54 @@ fn nuke_repo(repo_path: &Path) -> Result<(), GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{commit_all, init_repo};
     use std::fs;
     use std::process::Command as OsCommand;
 
-    fn init_repo(dir: &Path) {
-        OsCommand::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        OsCommand::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        OsCommand::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
+    #[test]
+    fn malformed_timestamps_are_errors_not_epoch_zero() {
+        let err = parse_epoch("not-a-number").unwrap_err();
+        assert!(err.message.contains("timestamp"), "got: {}", err.message);
+        assert_eq!(parse_epoch(" 1700000000 ").unwrap(), 1_700_000_000);
     }
 
-    fn commit_all(dir: &Path, message: &str) {
-        OsCommand::new("git")
-            .args(["add", "-A"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        OsCommand::new("git")
-            .args(["commit", "-q", "-m", message])
-            .current_dir(dir)
-            .output()
-            .unwrap();
+    #[test]
+    fn parse_name_status_maps_rename_delete_and_fallback() {
+        let changes = parse_name_status(
+            "R100\told.txt\tnew.txt\nD\tgone.txt\nM\ttouched.txt\n",
+            true,
+            GitStatus::Staged,
+        );
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            changes[0],
+            FileChange {
+                path: "new.txt".to_string(),
+                status: GitStatus::Renamed,
+                is_staged: true
+            }
+        );
+        assert_eq!(
+            changes[1],
+            FileChange {
+                path: "gone.txt".to_string(),
+                status: GitStatus::Deleted,
+                is_staged: true
+            }
+        );
+        assert_eq!(changes[2].status, GitStatus::Staged);
+
+        let changes = parse_name_status("M\ttouched.txt\n", false, GitStatus::Modified);
+        assert_eq!(
+            changes[0],
+            FileChange {
+                path: "touched.txt".to_string(),
+                status: GitStatus::Modified,
+                is_staged: false
+            }
+        );
+
+        assert!(parse_name_status("", false, GitStatus::Modified).is_empty());
     }
 
     #[test]
@@ -714,6 +763,28 @@ mod tests {
             .changes
             .iter()
             .any(|c| c.path == "tracked.txt" && c.status == GitStatus::Modified && !c.is_staged));
+    }
+
+    #[test]
+    fn renamed_files_map_to_renamed_status_with_destination_path() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("old-name.txt"), "content\n").unwrap();
+        commit_all(dir.path(), "initial");
+        OsCommand::new("git")
+            .args(["mv", "old-name.txt", "new-name.txt"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(
+            state.changes.iter().any(|c| c.path == "new-name.txt"
+                && c.status == GitStatus::Renamed
+                && c.is_staged),
+            "expected staged rename to new-name.txt, got: {:?}",
+            state.changes
+        );
     }
 
     #[test]
@@ -949,11 +1020,55 @@ mod tests {
             placeholder_command(&GitAction::Pull),
             "git pull"
         );
+        // Previews render exactly like real transcript lines: raw
+        // space-joined argv, no added quoting.
         assert_eq!(
             placeholder_command(&GitAction::Stage("a b.txt".to_string())),
             "git add -- a b.txt"
         );
         assert!(placeholder_command(&GitAction::CloseTab).is_empty());
+    }
+
+    #[test]
+    fn multi_command_actions_preview_the_full_chain() {
+        assert_eq!(
+            placeholder_command(&GitAction::CommitAllPush("done".to_string())),
+            "git add -A && git commit -m done && git push"
+        );
+        assert_eq!(
+            placeholder_command(&GitAction::CommitAll("wip message".to_string())),
+            "git add -A && git commit -m wip message"
+        );
+    }
+
+    #[test]
+    fn table_backed_actions_always_preview_as_git_invocations() {
+        use crate::git::types::GitAction::*;
+        let actions: Vec<GitAction> = vec![
+            Stage("f".into()),
+            Unstage("f".into()),
+            Discard("f".into()),
+            Commit("m".into()),
+            CommitAll("m".into()),
+            CommitAllPush("m".into()),
+            DiscardAll,
+            Push,
+            Pull,
+            Fetch,
+            CheckoutBranch("b".into()),
+            Revert("abc".into()),
+            CreateBranch("n".into(), "main".into()),
+            CreateTag("t".into(), "head".into()),
+            DeleteTag("t".into()),
+            DeleteBranch("b".into()),
+        ];
+        for action in actions {
+            let preview = placeholder_command(&action);
+            assert!(
+                preview.starts_with("git "),
+                "{action:?} must preview as a git invocation, got: {preview}"
+            );
+        }
     }
 
     #[test]
@@ -1040,6 +1155,32 @@ mod tests {
     }
 
     #[test]
+    fn get_file_pair_errors_when_worktree_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let result = get_file_pair(dir.path(), "subdir");
+        assert!(
+            result.is_err(),
+            "unreadable worktree paths must surface as errors, not empty diffs"
+        );
+    }
+
+    #[test]
+    fn get_file_pair_treats_deleted_worktree_file_as_empty_current() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("gone.txt"), "was here\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+
+        let pair = get_file_pair(dir.path(), "gone.txt").unwrap();
+        assert_eq!(pair.original, "was here\n");
+        assert_eq!(pair.current, "");
+    }
+
+    #[test]
     fn create_branch_from_commit_and_switches() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
@@ -1063,6 +1204,37 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "feature");
+    }
+
+    #[test]
+    fn parse_shortstat_extracts_totals() {
+        assert_eq!(
+            parse_shortstat(" 3 files changed, 10 insertions(+), 2 deletions(-)\n"),
+            (3, 10, 2)
+        );
+        assert_eq!(parse_shortstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn parse_commit_files_pairs_name_status_with_numstat() {
+        let name_status = "M\tsrc/a.rs\nA\tnew.txt\n";
+        let numstat = "5\t1\tsrc/a.rs\n0\t0\tnew.txt\n";
+        let files = parse_commit_files(name_status, numstat);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, "Modified");
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].insertions, 5);
+        assert_eq!(files[0].deletions, 1);
+        assert_eq!(files[1].status, "Added");
+
+        // Missing numstat row falls back to zeros; unknown letters map to
+        // the generic label.
+        let orphan = parse_commit_files("D\tgone.txt", "");
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(orphan[0].status, "Deleted");
+        assert_eq!(orphan[0].insertions, 0);
+        let unknown = parse_commit_files("X\tweird.bin", "");
+        assert_eq!(unknown[0].status, "Changed");
     }
 
     #[test]

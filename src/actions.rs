@@ -5,17 +5,13 @@
 //! Launches are detached (`spawn` + drop): Grit never tracks, waits on, or
 //! captures launched processes.
 //!
-//! This module is deliberately self-contained. To disable the feature at
-//! runtime set [`ENABLED`] to `false`; to excise it entirely delete this
-//! file plus the few `actions::` call sites in `git/mod.rs` and the UI.
+//! This module is deliberately self-contained; to excise the feature
+//! entirely, delete this file plus the few `actions::` call sites in
+//! `git/mod.rs` and the UI.
 
 use std::path::Path;
 
 use crate::git::types::ScriptEntry;
-
-/// Runtime kill-switch. `false` makes [`discover`] return an empty list and
-/// [`launch`] refuse every request — no scripts are surfaced or run.
-pub const ENABLED: bool = true;
 
 /// Subdirectory names scanned for executables, matched **case-insensitively**
 /// against actual root-level directories (`Scripts/`, `TOOLS/`, ... all work).
@@ -25,13 +21,16 @@ const SCAN_DIR_NAMES: [&str; 2] = ["scripts", "tools"];
 /// Upper bound on surfaced scripts, keeping the UI sane on messy repos.
 const MAX_SCRIPTS: usize = 32;
 
+/// Maximum `/proc` parent-chain hops when hunting for the ancestor terminal.
+const PROC_ANCESTOR_WALK_LIMIT: u32 = 16;
+
+/// `ENOEXEC`: the kernel refused to exec the file (no shebang, wrong
+/// format) — retry through `/bin/sh` so shebang-less scripts still run.
+const ENOEXEC: i32 = 8;
+
 /// Discovers executable files in the repository's scan directories.
 /// Results are sorted by relative path for a stable dropdown order.
 pub fn discover(repo_path: &Path) -> Vec<ScriptEntry> {
-    if !ENABLED {
-        return Vec::new();
-    }
-
     let mut found: Vec<ScriptEntry> = Vec::new();
     scan_dir(repo_path, "", &mut found);
 
@@ -103,9 +102,6 @@ fn scan_dir(dir: &Path, prefix: &str, out: &mut Vec<ScriptEntry>) {
 /// terminal can be spawned (or `GRIT_NO_TERMINAL=1`, used by tests), the
 /// script falls back to a direct detached spawn with inherited stdio.
 pub fn launch(repo_path: &Path, rel_path: &str) -> Result<(), String> {
-    if !ENABLED {
-        return Err("Project actions are disabled".to_string());
-    }
     if rel_path.starts_with('/') || rel_path.contains("..") {
         return Err(format!("refusing suspicious path: {rel_path}"));
     }
@@ -173,7 +169,7 @@ fn spawn_direct(script: &Path, cwd: &Path) -> std::io::Result<std::process::Chil
     base_command(script, cwd)
         .spawn()
         .or_else(|e| {
-            if cfg!(unix) && e.raw_os_error() == Some(8) {
+            if cfg!(unix) && e.raw_os_error() == Some(ENOEXEC) {
                 base_command(Path::new("/bin/sh"), cwd).arg(script).spawn()
             } else {
                 Err(e)
@@ -236,7 +232,7 @@ fn ancestor_terminal() -> Option<(String, Vec<String>)> {
     use std::os::unix::ffi::OsStrExt;
 
     let mut pid = std::process::id();
-    for _ in 0..16 {
+    for _ in 0..PROC_ANCESTOR_WALK_LIMIT {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let comm_end = stat.rfind(')')?;
         let ppid: u32 = stat[comm_end + 2..]
@@ -353,11 +349,58 @@ fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Ch
     use std::process::Command;
 
     let payload = keep_open_payload(script);
+    let (attempts, positional_fallbacks) = build_terminal_probe_list();
 
-    // Probe order: explicit $TERMINAL, the terminal Grit runs inside,
-    // freedesktop launchers, installed .desktop entries, DE preferences,
-    // then the full known list.
-    // Each entry is (program, flags preceding the command).
+    for (program, flags) in attempts {
+        let Some(exe) = find_in_path(&program) else {
+            continue;
+        };
+        let mut cmd = Command::new(exe);
+        cmd.args(flags).args(["sh", "-c", &payload]).current_dir(cwd);
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!("launched script in terminal window via {program}");
+                return Ok(child);
+            }
+            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
+        }
+    }
+
+    for program in &positional_fallbacks {
+        // Last resort: terminals we have no flag table entry for get the
+        // command passed positionally — the most common convention.
+        let Some(exe) = find_in_path(program) else {
+            continue;
+        };
+        match Command::new(exe)
+            .args(["sh", "-c", &payload])
+            .current_dir(cwd)
+            .spawn()
+        {
+            Ok(child) => {
+                tracing::info!("launched script in terminal window via {program}");
+                return Ok(child);
+            }
+            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no terminal emulator found",
+    ))
+}
+
+/// Builds the ordered terminal-probe list. Probe order: explicit
+/// `$TERMINAL`, the terminal Grit runs inside, freedesktop launchers,
+/// installed `.desktop` entries, DE preferences, then the full known list.
+/// Each entry is (program, flags preceding the command); duplicates are
+/// dropped with first occurrence winning.
+///
+/// Returns `(flagged_probes, positional_fallbacks)` — unknown desktop
+/// entries that lack a flag table entry are tried last without flags.
+#[cfg(not(target_os = "macos"))]
+fn build_terminal_probe_list() -> (Vec<(String, Vec<String>)>, Vec<String>) {
     let mut attempts: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
@@ -402,44 +445,7 @@ fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Ch
         ));
     }
 
-    for (program, flags) in attempts {
-        let Some(exe) = find_in_path(&program) else {
-            continue;
-        };
-        let mut cmd = Command::new(exe);
-        cmd.args(flags).args(["sh", "-c", &payload]).current_dir(cwd);
-        match cmd.spawn() {
-            Ok(child) => {
-                tracing::info!("launched script in terminal window via {program}");
-                return Ok(child);
-            }
-            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
-        }
-    }
-
-    for program in &desktop_unknown {
-        // Last resort: terminals we have no flag table entry for get the
-        // command passed positionally — the most common convention.
-        let Some(exe) = find_in_path(program) else {
-            continue;
-        };
-        match Command::new(exe)
-            .args(["sh", "-c", &payload])
-            .current_dir(cwd)
-            .spawn()
-        {
-            Ok(child) => {
-                tracing::info!("launched script in terminal window via {program}");
-                return Ok(child);
-            }
-            Err(e) => tracing::debug!("terminal {program} failed: {e}"),
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no terminal emulator found",
-    ))
+    (attempts, desktop_unknown)
 }
 
 /// Maps `TERM_PROGRAM` (set by terminals for their child processes) to a
@@ -661,6 +667,31 @@ mod tests {
         assert!(flags_for("gnome-terminal").is_some());
         assert!(flags_for("kgx").is_some());
         assert!(flags_for("bash").is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn probe_list_leads_with_explicit_terminal_and_dedupes() {
+        std::env::set_var("TERMINAL", "foot");
+        let (attempts, unknown) = build_terminal_probe_list();
+        std::env::remove_var("TERMINAL");
+
+        assert_eq!(attempts[0].0, "foot");
+        assert_eq!(attempts[0].1, vec!["-e".to_string()]);
+
+        // First occurrence wins: no program may be probed twice.
+        for (i, (program, _)) in attempts.iter().enumerate() {
+            assert!(
+                !attempts[..i].iter().any(|(p, _)| p == program),
+                "duplicate probe entry: {program}"
+            );
+        }
+        assert!(
+            unknown
+                .iter()
+                .all(|p| !attempts.iter().any(|(a, _)| a == p)),
+            "positional fallbacks must not duplicate flagged probes"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

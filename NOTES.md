@@ -1,5 +1,9 @@
 # Architectural Notes: Grit Project
 
+> **Historical document.** Written during early design; details below reflect
+> the state at that time. In particular, all `localhost:8080` mentions predate
+> the current default daemon port **5000** (`--port` still overrides it).
+
 ## 1. Context & Motivation
 SourceGit is an excellent C#/AvaloniaUI desktop Git client with complex UI components (visual commit graphs, syntax-highlighted diffs, tabbed workspaces). When evaluating a port to a Rust-based stack, direct client-side web rendering faces severe browser sandbox constraints: browsers cannot execute local `git` CLI binaries, manage SSH keys, or access filesystem directories freely.
 
@@ -26,7 +30,7 @@ To bridge the gap between desktop performance and browser convenience, we design
    * Uses `rust-embed` to embed Web assets (HTML/CSS/JS or Iced Wasm) directly into the Rust binary at compile time.
    * Eliminates multi-file installation or external daemon management.
 3. **Dual Execution Modes:**
-   * **GUI Mode (Default):** Spawns an Iced desktop window AND starts an Axum WebSocket background server on `localhost:8080`.
+   * **GUI Mode (Default):** Spawns an Iced desktop window AND starts an Axum WebSocket background server on `localhost:8080`. *(historical port; now 5000)*
    * **Headless Mode (`--headless`):** Skips OS window creation entirely; runs as a background service ideal for headless Linux boxes or SSH tunnels.
 4. **State Synchronization:**
    * Uses the `notify` crate to watch `.git/` directory changes.
@@ -47,7 +51,7 @@ To bridge the gap between desktop performance and browser convenience, we design
 ### Key Features
 * **Core Git Workflow:** Focused on essential operations—`stage`, `unstage`, `commit`, `push`, `pull`, `branch`, `revert`, and basic history view.
 * **Dual Execution Modes:**
-  * **Desktop Mode (Default):** Launches a native OS window while serving the web interface locally on `localhost:8080`.
+  * **Desktop Mode (Default):** Launches a native OS window while serving the web interface locally on `localhost:8080`. *(historical port; now 5000)*
   * **Headless Mode (`--headless`):** Skips GUI creation and runs exclusively as a background daemon for browser access.
 * **Single-Binary Deployment:** All static web assets/Wasm bundles are baked directly into the binary using `rust-embed`.
 
@@ -143,9 +147,9 @@ grit/
 # Build unified release executable
 cargo build --release
 
-# Run as Native Desktop App (also serves Web UI at http://localhost:8080)
+# Run as Native Desktop App (also serves Web UI at http://localhost:8080)  # historical port; default is now 5000
 ./target/release/grit
 
 # Run as Headless Daemon (Web UI only)
-./target/release/grit --headless --port 8080
+./target/release/grit --headless --port 8080  # historical example; default port is 5000
 ```

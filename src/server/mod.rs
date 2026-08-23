@@ -16,6 +16,16 @@ use tower_http::cors::CorsLayer;
 
 use crate::server::registry::{TabRegistry, WebState};
 
+/// Capacity of the state-broadcast channel fanning frames out to every
+/// connected client (slow clients lag rather than block publishers).
+const BROADCAST_CAPACITY: usize = 128;
+
+/// Per-operation deadline for the raw-TCP daemon probe on `/health`.
+const DAEMON_PROBE_TIMEOUT_MS: u64 = 500;
+
+/// Listen backlog for the TCP listener (`socket.listen`).
+const LISTEN_BACKLOG: u32 = 1024;
+
 /// Shared application state for the Axum server.
 #[derive(Clone)]
 pub struct AppState {
@@ -25,14 +35,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(registry: TabRegistry) -> Self {
-        let (broadcast, _) = broadcast::channel(128);
+        let (broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self { registry, broadcast }
     }
 }
 
 #[derive(Serialize)]
 pub struct HealthResponse {
-    pub status: &'static str,
     pub tab_count: usize,
     pub current_branch: String,
     pub change_count: usize,
@@ -58,36 +67,50 @@ struct FilesQuery {
     path: String,
 }
 
+/// Shared shape of the tab-scoped detail endpoints: resolve the tab's
+/// repository, run one blocking git call off-thread, and map each failure
+/// tier onto (status code, message) for the caller's fallback payload.
+async fn tab_scoped_git_call<T, F>(
+    app: &AppState,
+    tab: usize,
+    op_name: &str,
+    call: F,
+) -> Result<T, (StatusCode, String)>
+where
+    F: FnOnce(std::path::PathBuf) -> Result<T, crate::git::GitError> + Send + 'static,
+    T: serde::Serialize + Send + 'static,
+{
+    let Some(repo_path) = app.registry.repo_path_for(tab) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no repository tabs open".to_string(),
+        ));
+    };
+    match tokio::task::spawn_blocking(move || call(repo_path)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{op_name} task panicked: {e}"),
+        )),
+    }
+}
+
 async fn files_handler(
     State(app): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<FilesQuery>,
 ) -> (StatusCode, Json<crate::git::types::FilePair>) {
-    let repo_path = app.registry.repo_path_for(query.tab);
-    let Some(repo_path) = repo_path else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(crate::git::types::FilePair {
-                original: "no repository tabs open".to_string(),
-                current: String::new(),
-            }),
-        );
-    };
     let file_path = query.path.clone();
-    let result =
-        tokio::task::spawn_blocking(move || crate::git::get_file_pair(&repo_path, &file_path)).await;
-    match result {
-        Ok(Ok(pair)) => (StatusCode::OK, Json(pair)),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    match tab_scoped_git_call(&app, query.tab, "files", move |repo_path| {
+        crate::git::get_file_pair(&repo_path, &file_path)
+    })
+    .await
+    {
+        Ok(pair) => (StatusCode::OK, Json(pair)),
+        Err((status, message)) => (
+            status,
             Json(crate::git::types::FilePair {
-                original: e.to_string(),
-                current: String::new(),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(crate::git::types::FilePair {
-                original: format!("files task panicked: {e}"),
+                original: message,
                 current: String::new(),
             }),
         ),
@@ -104,69 +127,22 @@ async fn commit_handler(
     State(app): State<AppState>,
     axum::extract::Query(query): axum::extract::Query<CommitQuery>,
 ) -> (StatusCode, Json<crate::git::types::CommitSummary>) {
-    let repo_path = app.registry.repo_path_for(query.tab);
-    let Some(repo_path) = repo_path else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(crate::git::types::CommitSummary {
-                message: "no repository tabs open".to_string(),
-                author: String::new(),
-                timestamp: 0,
-                files_changed: 0,
-                insertions: 0,
-                deletions: 0,
-                files: Vec::new(),
-            }),
-        );
-    };
     let hash = query.hash.clone();
-    let result =
-        tokio::task::spawn_blocking(move || crate::git::get_commit_summary(&repo_path, &hash)).await;
-    match result {
-        Ok(Ok(summary)) => (StatusCode::OK, Json(summary)),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(crate::git::types::CommitSummary {
-                message: e.to_string(),
-                author: String::new(),
-                timestamp: 0,
-                files_changed: 0,
-                insertions: 0,
-                deletions: 0,
-                files: Vec::new(),
-            }),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(crate::git::types::CommitSummary {
-                message: format!("commit task panicked: {e}"),
-                author: String::new(),
-                timestamp: 0,
-                files_changed: 0,
-                insertions: 0,
-                deletions: 0,
-                files: Vec::new(),
-            }),
+    match tab_scoped_git_call(&app, query.tab, "commit", move |repo_path| {
+        crate::git::get_commit_summary(&repo_path, &hash)
+    })
+    .await
+    {
+        Ok(summary) => (StatusCode::OK, Json(summary)),
+        Err((status, message)) => (
+            status,
+            Json(crate::git::types::CommitSummary::error(message)),
         ),
     }
 }
 
 /// Expands a leading `~` in a user-supplied path to the home directory.
-pub fn expand_tilde(path: &str) -> PathBuf {
-    expand_tilde_with(std::env::var("HOME").ok().as_deref(), path)
-}
-
-fn expand_tilde_with(home: Option<&str>, path: &str) -> PathBuf {
-    if path == "~" {
-        return home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        if let Some(home) = home {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
+pub use crate::git::types::expand_tilde;
 
 /// Renders a path with `$HOME` abbreviated to `~` for friendlier display.
 fn shorten_path(path: &std::path::Path) -> String {
@@ -268,7 +244,6 @@ async fn health_handler(State(app): State<AppState>) -> (StatusCode, Json<Health
     (
         StatusCode::OK,
         Json(HealthResponse {
-            status: "ok",
             tab_count: state.tabs.len(),
             current_branch: active_tab
                 .map(|t| t.state.current_branch.clone())
@@ -319,27 +294,28 @@ pub async fn sync_loop(app: AppState, mut refresh_rx: mpsc::UnboundedReceiver<()
     loop {
         tokio::select! {
             res = refresh_rx.recv(), if refresh_open => match res {
-                Some(()) => {
-                    let before = app.registry.revision();
-                    refresh_all(&app).await;
-                    // A mutation landing mid-refresh already broadcast its
-                    // own fresh frame; only publish when nothing changed
-                    // during the run, so no stale frame can trail a close.
-                    if app.registry.revision() == before {
-                        let _ = app.broadcast.send(app.registry.snapshot());
-                    }
-                }
+                Some(()) => refresh_and_broadcast_if_quiet(&app).await,
                 None => refresh_open = false,
             },
             changed = registry_rx.changed() => {
-                if changed.is_ok() {
-                    let _ = app.broadcast.send(app.registry.snapshot());
-                } else {
+                if changed.is_err() {
                     // Registry senders are gone; nothing can change anymore.
                     std::future::pending::<()>().await;
                 }
+                let _ = app.broadcast.send(app.registry.snapshot());
             }
         }
+    }
+}
+
+/// Refreshes every tab and re-broadcasts, unless a mutation landed while
+/// the refresh was running: that mutation already broadcast its own fresh
+/// frame, so publishing here would trail a close with a stale frame.
+async fn refresh_and_broadcast_if_quiet(app: &AppState) {
+    let before = app.registry.revision();
+    refresh_all(app).await;
+    if app.registry.revision() == before {
+        let _ = app.broadcast.send(app.registry.snapshot());
     }
 }
 
@@ -467,7 +443,8 @@ pub async fn is_daemon_running(port: u16) -> bool {
 
     let connect = tokio::net::TcpStream::connect(("127.0.0.1", port));
     let Ok(Ok(mut stream)) =
-        tokio::time::timeout(std::time::Duration::from_millis(500), connect).await
+        tokio::time::timeout(std::time::Duration::from_millis(DAEMON_PROBE_TIMEOUT_MS), connect)
+            .await
     else {
         return false;
     };
@@ -476,10 +453,13 @@ pub async fn is_daemon_running(port: u16) -> bool {
         return false;
     }
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
-        .await
-        .map(|r| r.unwrap_or(0))
-        .unwrap_or(0);
+    let n = tokio::time::timeout(
+        std::time::Duration::from_millis(DAEMON_PROBE_TIMEOUT_MS),
+        stream.read(&mut buf),
+    )
+    .await
+    .map(|r| r.unwrap_or(0))
+    .unwrap_or(0);
     buf[..n].starts_with(b"HTTP/1.1 200") || buf[..n].starts_with(b"HTTP/1.0 200")
 }
 
@@ -510,12 +490,12 @@ pub(crate) async fn create_listener(port: u16) -> std::io::Result<tokio::net::Tc
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    socket.listen(1024)
+    socket.listen(LISTEN_BACKLOG)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -526,98 +506,9 @@ mod tests {
 
     use super::*;
     use crate::server::registry::TabRegistry;
-
-    fn init_repo(dir: &PathBuf) {
-        std::process::Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
-
-    fn app_for(path: &PathBuf) -> AppState {
-        AppState::new(TabRegistry::with_single_tab(
-            0,
-            "repo".to_string(),
-            path.clone(),
-        ))
-    }
-
-    async fn connect_with_retry(url: &str) -> tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    > {
-        for _ in 0..40 {
-            if let Ok((ws, _)) = tokio_tungstenite::connect_async(url).await {
-                return ws;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("failed to connect to {url}");
-    }
-
-    async fn recv_state(ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >) -> WebState {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for ws message"))
-            .expect("stream closed")
-            .expect("ws error");
-        match msg {
-            Message::Text(text) => serde_json::from_str(&text).unwrap(),
-            other => panic!("expected text state message, got {other:?}"),
-        }
-    }
-
-    async fn recv_state_until(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        mut pred: impl FnMut(&WebState) -> bool,
-    ) -> WebState {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let state = recv_state(ws).await;
-                if pred(&state) {
-                    return state;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for matching state"))
-    }
-
-    #[test]
-    fn expand_tilde_resolves_home_prefixes() {
-        let home = "/home/bronson";
-        assert_eq!(
-            expand_tilde_with(Some(home), "~/projects/grit"),
-            PathBuf::from("/home/bronson/projects/grit")
-        );
-        assert_eq!(expand_tilde_with(Some(home), "~"), PathBuf::from(home));
-        assert_eq!(
-            expand_tilde_with(Some(home), "/usr/local"),
-            PathBuf::from("/usr/local")
-        );
-        assert_eq!(
-            expand_tilde_with(None, "~/projects"),
-            PathBuf::from("~/projects")
-        );
-        assert_eq!(
-            expand_tilde_with(Some(home), "~other/x"),
-            PathBuf::from("~other/x")
-        );
-    }
+    use crate::test_support::{
+        app_for, connect_with_retry, init_repo, recv_state, recv_state_until,
+    };
 
     #[test]
     fn shorten_path_abbreviates_home() {
@@ -721,7 +612,6 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["status"], "ok");
         assert_eq!(json["tab_count"], 1);
         assert_eq!(json["change_count"], 0);
     }
@@ -1110,9 +1000,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Every broadcast within the hold window must have no tabs.
+        // The close echo itself proves delivery; a fixed window here raced
+        // under suite-wide load because nothing else broadcasts once idle.
+        let emptied = recv_state_until(&mut ws, |s| s.tabs.is_empty()).await;
+        assert!(emptied.tabs.is_empty());
+
+        // Every later broadcast within the hold window must stay empty.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(700);
-        let mut seen_empty = false;
         while std::time::Instant::now() < deadline {
             match tokio::time::timeout(std::time::Duration::from_millis(120), ws.next()).await {
                 Ok(Some(Ok(Message::Text(txt)))) => {
@@ -1121,12 +1015,10 @@ mod tests {
                         s.tabs.is_empty(),
                         "broadcast after closing the last tab must be empty, got {txt}"
                     );
-                    seen_empty = true;
                 }
                 Ok(None) => break,
                 _ => {}
             }
         }
-        assert!(seen_empty, "expected at least one post-close broadcast");
     }
 }

@@ -24,8 +24,8 @@ all contained in one self-contained executable.
   `tools/` (any casing) are auto-discovered (live, via the file watcher) into
   an Actions dropdown; picking one launches it in a new terminal window
   (interactive menu scripts work; window stays open showing exit status),
-  fire-and-forget, disableable via `actions::ENABLED`
-- Nuke button: wipe all local changes and re-clone the repository from scratch
+  fire-and-forget (spawn + drop, no process tracking)
+- Nuke button: reset the working tree to the remote — runs `git fetch origin` + `git reset --hard origin/<branch>` + `git clean -fdx` in place (no delete, no re-clone)
 - Open tabs persist across restarts via a shared config file
   (`$XDG_CONFIG_HOME/bitshift/grit/config.json`)
 - Connect-mode: if a Grit daemon is already running on `--port` (e.g. a

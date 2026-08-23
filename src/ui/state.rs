@@ -12,7 +12,16 @@ use iced::widget::{button, column, row, rule, text, text_input};
 use iced::{Element, Length, Subscription, Task};
 
 use crate::git::types::{GitAction, RepoState};
+use crate::server::registry::WebTab;
 use crate::ui::components;
+
+/// Buffer of the futures-channel pipes feeding remote sync frames into the
+/// GUI subscription loop.
+const REMOTE_SYNC_CHANNEL: usize = 100;
+
+/// Initial desktop window size in logical pixels.
+const WINDOW_WIDTH: f32 = 960.0;
+const WINDOW_HEIGHT: f32 = 680.0;
 
 /// UI events produced by widgets and background tasks.
 #[derive(Debug, Clone, PartialEq)]
@@ -168,9 +177,8 @@ impl GritApp {
             }
             self.show_add_form = false;
         }
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        }
+        self.active =
+            crate::server::registry::TabRegistry::clamp_active_index(self.active, self.tabs.len());
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -191,34 +199,7 @@ impl GritApp {
                 }
                 Task::none()
             }
-            Message::CloseTab(index) => {
-                let Some(tab) = self.tabs.get(index) else {
-                    return Task::none();
-                };
-                let id = tab.id;
-                if let Some(port) = self.remote_port {
-                    // Remote mode: ask the daemon to close; the echo sync
-                    // performs the local removal.
-                    return Self::remote_op(port, None, crate::git::types::GitAction::CloseTab);
-                }
-                match self.registry.clone() {
-                    Some(registry) => Task::perform(
-                        async move {
-                            crate::server::websocket::close_tab_by_id(&registry, id);
-                            Message::Nop
-                        },
-                        |m| m,
-                    ),
-                    None => {
-                        // No shared workspace (standalone): remove locally.
-                        self.tabs.remove(index);
-                        if self.active >= self.tabs.len() {
-                            self.active = self.tabs.len().saturating_sub(1);
-                        }
-                        Task::none()
-                    }
-                }
-            }
+            Message::CloseTab(index) => self.handle_close_tab(index),
             Message::NewRepoNameChanged(name) => {
                 self.add_name = name;
                 Task::none()
@@ -241,50 +222,7 @@ impl GritApp {
                 }
                 Task::none()
             }
-            Message::OpenNewRepo => {
-                let name = self.add_name.trim().to_string();
-                let path = self.add_path.trim().to_string();
-                // Instant client-side validation; the shared op re-validates.
-                let validation_error = if path.is_empty() {
-                    Some("Folder path is required".to_string())
-                } else if !PathBuf::from(&path).is_dir() {
-                    Some(format!("Not a directory: {path}"))
-                } else {
-                    None
-                };
-                if let Some(error) = validation_error {
-                    self.add_error = Some(error);
-                    return Task::none();
-                }
-                if let Some(port) = self.remote_port {
-                    // Remote mode: the daemon opens the repo; adoption via
-                    // sync clears the form.
-                    let payload = serde_json::json!({ "name": name, "path": path }).to_string();
-                    return Self::remote_op(
-                        port,
-                        None,
-                        crate::git::types::GitAction::NewTab(payload),
-                    );
-                }
-                match self.registry.clone() {
-                    Some(registry) => Task::perform(
-                        async move {
-                            Message::OpenRepoResult(
-                                crate::server::websocket::open_repo_tab(
-                                    &registry, name, path,
-                                )
-                                .await,
-                            )
-                        },
-                        |m| m,
-                    ),
-                    None => {
-                        self.add_error =
-                            Some("No workspace available".to_string());
-                        Task::none()
-                    }
-                }
-            }
+            Message::OpenNewRepo => self.handle_open_new_repo(),
             Message::OpenRepoResult(result) => {
                 match result {
                     Ok(id) => {
@@ -412,23 +350,7 @@ impl GritApp {
                 }
                 Task::none()
             }
-            Message::WebTabsSync(live_tabs) => {
-                self.apply_sync(&live_tabs);
-                // Remote startup: open an explicitly requested repo once the
-                // daemon's tab list is known.
-                if let (Some(port), Some(path)) = (self.remote_port, self.pending_open.take()) {
-                    if !live_tabs.iter().any(|t| t.repo_path == path) {
-                        let payload =
-                            serde_json::json!({ "name": "", "path": path }).to_string();
-                        return Self::remote_op(
-                            port,
-                            None,
-                            crate::git::types::GitAction::NewTab(payload),
-                        );
-                    }
-                }
-                Task::none()
-            }
+            Message::WebTabsSync(live_tabs) => self.handle_web_tabs_sync(&live_tabs),
             Message::Nop => Task::none(),
         }
     }
@@ -445,10 +367,103 @@ impl GritApp {
         run_action_on(tab.id, tab.repo_path.clone(), action)
     }
 
+    /// Closes a tab. Remote mode asks the daemon (the echo performs the
+    /// local removal); shared-workspace mode closes by id; standalone
+    /// removes locally.
+    fn handle_close_tab(&mut self, index: usize) -> Task<Message> {
+        let Some(tab) = self.tabs.get(index) else {
+            return Task::none();
+        };
+        let id = tab.id;
+        if let Some(port) = self.remote_port {
+            return Self::send_remote(port, Self::close_tab_payload(id));
+        }
+        match self.registry.clone() {
+            Some(registry) => Task::perform(
+                async move {
+                    crate::server::websocket::close_tab_by_id(&registry, id);
+                    Message::Nop
+                },
+                |m| m,
+            ),
+            None => {
+                // No shared workspace (standalone): remove locally.
+                self.tabs.remove(index);
+                self.active = crate::server::registry::TabRegistry::clamp_active_index(
+                    self.active,
+                    self.tabs.len(),
+                );
+                Task::none()
+            }
+        }
+    }
+
+    /// Opens the repository typed into the add form.
+    fn handle_open_new_repo(&mut self) -> Task<Message> {
+        let name = self.add_name.trim().to_string();
+        let path = self.add_path.trim().to_string();
+        // Instant client-side validation with the daemon's exact rules;
+        // the shared op re-validates.
+        if let Err(error) = crate::git::types::validate_open_repo_input(&path) {
+            self.add_error = Some(error);
+            return Task::none();
+        }
+        if let Some(port) = self.remote_port {
+            // Remote mode: the daemon opens the repo; adoption via sync
+            // clears the form.
+            return Self::send_remote(port, Self::new_tab_payload(&name, &path));
+        }
+        match self.registry.clone() {
+            Some(registry) => Task::perform(
+                async move {
+                    Message::OpenRepoResult(
+                        crate::server::websocket::open_repo_tab(&registry, name, path).await,
+                    )
+                },
+                |m| m,
+            ),
+            None => {
+                self.add_error = Some("No workspace available".to_string());
+                Task::none()
+            }
+        }
+    }
+
+    /// Adopts the daemon's live tab list; remote startup may still owe a
+    /// pending repo open once the tab list is known.
+    fn handle_web_tabs_sync(&mut self, live_tabs: &[WebTab]) -> Task<Message> {
+        self.apply_sync(live_tabs);
+        if let (Some(port), Some(path)) = (self.remote_port, self.pending_open.take()) {
+            if !live_tabs.iter().any(|t| t.repo_path == path) {
+                return Self::send_remote(port, Self::new_tab_payload("", &path));
+            }
+        }
+        Task::none()
+    }
+
     /// Fire-and-forget dispatch of a client message to the daemon.
     fn remote_op(port: u16, tab: Option<usize>, action: GitAction) -> Task<Message> {
-        let json = crate::server::websocket::encode_client_message(tab, &action);
-        Task::perform(crate::ui::remote::send_op(port, json), |_| Message::Nop)
+        Self::send_remote(
+            port,
+            crate::server::websocket::encode_client_message(tab, &action),
+        )
+    }
+
+    /// Single fire-and-forget send of a pre-encoded wire payload.
+    fn send_remote(port: u16, payload: String) -> Task<Message> {
+        Task::perform(crate::ui::remote::send_op(port, payload), |_| Message::Nop)
+    }
+
+    /// NewTab wire payload shared by the add form and pending-open startup.
+    fn new_tab_payload(name: &str, path: &str) -> String {
+        serde_json::json!({ "name": name, "path": path }).to_string()
+    }
+
+    pub(crate) fn close_tab_payload(id: usize) -> String {
+        crate::server::websocket::encode_client_message(
+            Some(id),
+            &crate::git::types::GitAction::CloseTab,
+        )
     }
 
     /// Streams updates into the GUI. Repository watching is owned by the
@@ -503,12 +518,7 @@ impl GritApp {
     }
 
     fn repo_view<'a>(&self, tab: &'a RepoTab) -> Element<'a, Message> {
-        let error_bar = if let Some(error) = &tab.error {
-            text(format!("Error: {error}"))
-                .color(iced::Color::from_rgb(0.9, 0.25, 0.25))
-        } else {
-            text("")
-        };
+        let error_bar = error_bar(tab.error.as_ref());
 
         let mut view = column![
             components::header::header(&tab.repo_state, tab.nuke_armed),
@@ -532,6 +542,15 @@ impl GritApp {
 impl Default for GritApp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Red error line shared by the repo view and the add-repository form.
+fn error_bar<'a>(error: Option<&'a String>) -> iced::widget::Text<'a> {
+    if let Some(error) = error {
+        text(format!("Error: {error}")).color(iced::Color::from_rgb(0.9, 0.25, 0.25))
+    } else {
+        text("")
     }
 }
 
@@ -565,12 +584,7 @@ fn add_repo_view<'a>(
     path: &'a str,
     error: Option<&'a String>,
 ) -> Element<'a, Message> {
-    let error_bar = if let Some(error) = error {
-        text(format!("Error: {error}"))
-            .color(iced::Color::from_rgb(0.9, 0.25, 0.25))
-    } else {
-        text("")
-    };
+    let error_bar = error_bar(error);
 
     column![
         text("Add Repository").size(20),
@@ -606,7 +620,7 @@ static SHARED_REGISTRY: std::sync::OnceLock<crate::server::registry::TabRegistry
 fn remote_subscription(port: u16) -> Subscription<Message> {
     Subscription::run_with(port, |p| {
         let port = *p;
-        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
+        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(REMOTE_SYNC_CHANNEL);
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -632,7 +646,7 @@ fn remote_subscription(port: u16) -> Subscription<Message> {
 }
 fn registry_subscription() -> Subscription<Message> {
     Subscription::run(|| {
-        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(100);
+        let (mut tx, rx) = futures_channel::mpsc::channel::<Message>(REMOTE_SYNC_CHANNEL);
         if let Some(registry) = SHARED_REGISTRY.get() {
             let registry = registry.clone();
             std::thread::spawn(move || {
@@ -757,7 +771,7 @@ pub fn run(mode: GuiMode, repo_path: PathBuf, open_explicit: bool) -> iced::Resu
     )
     .title("Grit")
     .theme(iced::Theme::Dark)
-    .window_size(iced::Size::new(960.0, 680.0))
+    .window_size(iced::Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
     .subscription(GritApp::subscription)
     .run()
 }
@@ -1151,6 +1165,36 @@ mod tests {
     fn zero_tabs_default_to_add_form() {
         let app = GritApp::new();
         assert!(app.showing_add_form());
+    }
+
+    #[test]
+    fn open_new_repo_rejects_non_git_folder_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = GritApp::new();
+        app.add_path = dir.path().display().to_string();
+
+        let _ = app.update(Message::OpenNewRepo);
+
+        assert!(
+            app.add_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Not a git repository"),
+            "shared validation must surface the daemon's exact rule, got {:?}",
+            app.add_error
+        );
+    }
+
+    #[test]
+    fn close_tab_remote_payload_carries_the_tab_id() {
+        let payload = GritApp::close_tab_payload(0);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            v["tab"],
+            serde_json::json!(0),
+            "the daemon drops id-less CloseTab requests"
+        );
+        assert_eq!(v["action"], serde_json::json!("CloseTab"));
     }
 
     #[test]

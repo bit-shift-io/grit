@@ -3,6 +3,8 @@ mod server;
 mod ui;
 mod shared_config;
 pub mod actions;
+#[cfg(test)]
+mod test_support;
 
 use std::path::{Path, PathBuf};
 

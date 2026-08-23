@@ -45,7 +45,7 @@ ids come from one monotonic allocator and are never reused within a session.
     ├── git/                 # Git Engine subsystem
     │   ├── mod.rs           # Git CLI command execution logic and status queries
     │   ├── types.rs         # Core data models (RepoState, GitStatus, FileChange, GitAction)
-    │   └── watcher.rs       # Debounced workspace file-system monitoring (.git/ directory)
+    │   └── watcher.rs       # Debounced recursive repo-root FS monitoring
     ├── server/              # Embedded Axum Web Server subsystem
     │   ├── mod.rs           # Axum router setup, AppState, boot/sync loops, /browse /files /commit
     │   ├── registry.rs      # TabRegistry: single-writer tab list + watch channel + id allocator
@@ -85,6 +85,10 @@ ids come from one monotonic allocator and are never reused within a session.
 * Without an explicit `--path` and with an empty config, startup lands on the
   Add Repository form instead of seeding a fallback `"."` tab — a cleared
   workspace stays cleared across restarts.
+* **Headless display fallback**: when GUI mode is requested but no display
+  server is detected (`WAYLAND_DISPLAY`/`WAYLAND_SOCKET`/`DISPLAY` all unset
+  or empty), `display_available()` (`main.rs`) downgrades the request to
+  headless daemon mode — safe under systemd units and SSH sessions.
 
 ### 3.2 Core Git Engine & Data Types (`src/git/`)
 * **`types.rs`**: strictly typed models — `GitStatus`, `FileChange`, `FilePair`,
@@ -100,16 +104,30 @@ ids come from one monotonic allocator and are never reused within a session.
   debouncing: pure reads (`Access`) never arm a refresh, nor do events living
   exclusively inside churn directories (`target`, `node_modules`,
   `__pycache__`, `.venv`, `venv`) — so builds and package installs cannot spin
-  the refresh loop. Watching itself is server-owned only (`boot`); the desktop
+  the refresh loop. Watching itself is server-owned only: a single persistent
+  `watch_reconciler` task (`src/server/mod.rs`) keeps exactly one recursive
+  root watcher alive per unique canonical repository path among the open
+  tabs, spawning and retiring them as tabs are opened or closed through any
+  client (each new watch is followed by a refresh kick). The desktop
   GUI subscribes to sync broadcasts instead of the filesystem.
 
 ### 3.3 Tab Registry & Shared Persistence (`src/server/registry.rs`, `src/shared_config.rs`)
 * **`TabRegistry`** holds `WebState { active, tabs: Vec<WebTab> }` behind a
   `tokio::sync::watch` channel plus an `AtomicUsize` id allocator
   (`alloc_id()` never repeats; `raise_next_id_floor()` protects ids adopted from
-  disk). Cloning copies the counter but shares the channel.
-* **`WebTab`** = `{ id, name, repo_path, state: RepoState }` — the wire format for
-  both WS broadcasts and desktop sync messages.
+  disk). Cloning copies the counters but shares the channel. Mutations run
+  through `modify()` behind a short-held `write_lock: std::sync::Mutex<()>`
+  (poison-tolerant: a panicked writer cannot wedge later mutations).
+  Two `AtomicU64` counters complete the picture:
+  * `revision` — bumped on every mutation; `sync_loop` compares it before and
+    after each refresh and skips the broadcast when nothing changed.
+  * `next_log_seq` — monotonic sequencer giving every log entry a stable
+    order across clients (`append_log`/`finish_log_entry`).
+* **`WebTab`** = `{ id, name, repo_path, state: RepoState, log: Vec<LogEntry> }`
+  — the wire format for both WS broadcasts and desktop sync messages.
+* **`WebState.active` is daemon-side truth**: the web client reconciles its
+  selection from it (deep-link `?t=N`), while the desktop `apply_sync`
+  deliberately ignores it and keeps selection local.
 * **`shared_config.rs`** owns `$XDG_CONFIG_HOME/bitshift/grit/config.json`
   (`SavedTab { id, name, path }`): `save_tabs`, `load_tabs(_from)`,
   `persist_web_state`, `restore_web_state` (with `prune_dead_tabs` filtering
@@ -120,10 +138,18 @@ ids come from one monotonic allocator and are never reused within a session.
   `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
   the add-repo form), `/*` embedded static assets.
 * **`boot(registry)`**: restores tabs from config **only if the registry is empty**
-  (then re-persists the healed state), spawns per-tab `.git` watchers, starts the
-  persist task (writes config on every registry change), and runs the sync loop
-  broadcasting snapshots to all WS clients on registry/watcher events.
-  `refresh_tab` re-validates that the path still contains `.git` before shelling out.
+  (then re-persists the healed state), spawns the `watch_reconciler`, and starts
+  the persist task (writes config on every registry change). It then kicks off a
+  **background initial refresh**: clients may connect while git scans are still
+  running; each finished tab's `update_state` publish flows through the sync
+  loop, so tabs appear one by one. `boot` returns `(AppState, refresh_rx)` and
+  does NOT run the sync loop itself — `run_server(listener, app, refresh_rx)`
+  spawns `sync_loop` (broadcasting snapshots to every WS client on
+  registry/watcher events), and `run()` wires boot → `create_listener` →
+  run_server. `refresh_tab` re-validates that the path still contains `.git`
+  before shelling out.
+* **`create_listener(port)`** binds with `SO_REUSEADDR` so an immediate
+  close-and-restart can rebind the port even with lingering TIME_WAIT sockets.
 * **`websocket.rs`**: parses `ClientMessage { tab: Option<usize>, action }`.
   Git actions execute against the target tab's repo then trigger a refresh;
   tab mutations go through the extracted shared ops:
@@ -152,8 +178,8 @@ ids come from one monotonic allocator and are never reused within a session.
 ### 3.6 Project Actions (`src/actions.rs`)
 * **Self-contained subsystem** for discovering and launching repository
   executables; removable by deleting the file plus its few `actions::` call
-  sites. A compile-time constant `actions::ENABLED` is the runtime kill-switch:
-  `false` yields empty discovery and refuses every launch.
+  sites. Security comes from the containment checks in `launch`, not a
+  kill-switch.
 * **Discovery** (`discover`): non-recursive scan of only the repo root,
   `scripts/`, and `tools/`; unix exec-bit detection (`#[cfg(windows)]`
   extension fallback: `.bat/.cmd/.ps1/.exe`); hidden files skipped; results
@@ -190,10 +216,12 @@ ids come from one monotonic allocator and are never reused within a session.
 ```
 main.rs
   ├── Parse CLI (clap: --headless, --port=5000 default, --path optional)
-  └── IF --headless:
+  └── IF --headless (or GUI requested but no display server detected):
         └── Spawn Tokio runtime → server::run(registry)
-              ├── boot(): restore-from-config-if-empty → watchers → persist task
-              └── Axum routes (/health /ws /files /commit /browse /*)
+              ├── boot(): restore-from-config-if-empty → watch_reconciler +
+              │     persist task + background initial refresh (→ refresh_rx)
+              └── run_server(): spawns sync_loop, then Axum routes
+                    (/health /ws /files /commit /browse /*)
       ELSE (GUI):
         ├── Probe GET /health on 127.0.0.1:<port>
         ├── Daemon found (Remote): Iced GUI as WS client of that daemon
@@ -221,7 +249,8 @@ User opens/closes a repo (desktop button OR web WS message)
 .git change → debounced notify event → refresh_tab(id)
   → get_repository_status → registry.update_state(id, state) [re-snapshots]
   → broadcast (same pipeline as above)
-Desktop mirrors this with its own per-tab watcher subscriptions.
+The desktop does NOT watch the filesystem; it mirrors these updates purely
+through sync broadcasts (`WebTabsSync` / registry subscription).
 ```
 
 ### Git Action Dispatch
@@ -282,14 +311,14 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/shared_config.rs` | Shared `config.json` persistence (load/save/restore/prune) |
 | `src/git/types.rs` | Core data models (`RepoState`, `FileChange`, `GitAction`, ...) |
 | `src/git/mod.rs` | Git CLI invocation + structured `GitError` |
-| `src/git/watcher.rs` | Debounced `.git` watcher |
+| `src/git/watcher.rs` | Debounced recursive repo-root watcher |
 | `src/server/registry.rs` | `TabRegistry`: watch channel, monotonic ids, `WebState`/`WebTab` |
 | `src/server/mod.rs` | Router, `boot()`, sync loop, persist task, `/browse` `/files` `/commit` handlers |
 | `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
 | `src/server/static_files.rs` | rust-embed asset serving |
 | `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
 | `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
-| `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history) |
+| `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
 | `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links, rendering |
 | `TASKS.md` | Original build roadmap (historical) |
 | `Notes.md` | Design rationale |

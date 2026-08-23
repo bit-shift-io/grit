@@ -95,7 +95,12 @@ impl TabRegistry {
     /// Applies `f` to the current state under the write lock and broadcasts
     /// only when `f` reports a change.
     fn modify<F: FnOnce(&mut WebState) -> bool>(&self, f: F) -> bool {
-        let _guard = self.write_lock.lock().unwrap();
+        // A panicking writer poisons the mutex; recovering with the guard's
+        // data is safe here because the payload is the empty `()` marker.
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut current = self.snapshot();
         if f(&mut current) {
             self.set(current);
@@ -172,15 +177,22 @@ impl TabRegistry {
             match current.tabs.iter().position(|t| t.id == id) {
                 Some(idx) => {
                     removed = Some(current.tabs.remove(idx));
-                    if current.active >= current.tabs.len() {
-                        current.active = current.tabs.len().saturating_sub(1);
-                    }
+                    current.active = Self::clamp_active_index(current.active, current.tabs.len());
                     true
                 }
                 None => false,
             }
         });
         removed
+    }
+
+    /// Clamps an active-tab index back into `0..tab_count` (0 when empty).
+    pub fn clamp_active_index(active: usize, tab_count: usize) -> usize {
+        if tab_count == 0 {
+            0
+        } else {
+            active.min(tab_count - 1)
+        }
     }
 
     /// Resolves the repository path backing a tab id.
@@ -198,7 +210,7 @@ impl TabRegistry {
     /// when the tab no longer exists.
     pub fn start_log_entry(&self, tab_id: usize, command: String) -> Option<u64> {
         let seq = self.alloc_log_seq();
-        let started = epoch_millis();
+        let started = crate::git::epoch_millis();
         let applied = self.modify(|current| {
             let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
                 return false;
@@ -259,13 +271,6 @@ impl TabRegistry {
         self.next_log_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
-}
-
-fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn truncate_log(log: &mut Vec<LogEntry>) {
@@ -511,5 +516,40 @@ mod tests {
         let json = r#"{"id":0,"name":"n","repo_path":"/repo/n","state":{"current_branch":"","branches":[],"changes":[],"history":[]}}"#;
         let tab: WebTab = serde_json::from_str(json).unwrap();
         assert!(tab.log.is_empty(), "missing log field must default");
+    }
+
+    #[test]
+    fn mutations_survive_a_poisoned_write_lock() {
+        let registry =
+            TabRegistry::with_single_tab(0, "r".to_string(), PathBuf::from("/repo/r"));
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.write_lock.lock().unwrap();
+            panic!("simulated writer panic");
+        }));
+        assert!(poisoned.is_err(), "setup: the lock must actually poison");
+
+        let fresh = RepoState {
+            current_branch: "dev".to_string(),
+            branches: vec!["dev".to_string()],
+            changes: vec![],
+            history: vec![],
+            scripts: vec![],
+        };
+        registry.update_state(0, fresh);
+        assert_eq!(
+            registry.snapshot().tabs[0].state.current_branch,
+            "dev",
+            "a panicked writer must not wedge every later mutation"
+        );
+    }
+
+    #[test]
+    fn clamp_active_index_keeps_active_in_bounds() {
+        assert_eq!(TabRegistry::clamp_active_index(5, 3), 2);
+        assert_eq!(TabRegistry::clamp_active_index(2, 3), 2, "in-range stays");
+        assert_eq!(TabRegistry::clamp_active_index(1, 3), 1);
+        assert_eq!(TabRegistry::clamp_active_index(0, 0), 0, "empty workspace");
+        assert_eq!(TabRegistry::clamp_active_index(9, 1), 0);
     }
 }

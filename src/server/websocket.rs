@@ -34,16 +34,7 @@ pub async fn open_repo_tab(
     name: String,
     path: String,
 ) -> Result<usize, String> {
-    if path.is_empty() {
-        return Err("Folder path is required".to_string());
-    }
-    let repo_path = crate::server::expand_tilde(&path);
-    if !repo_path.is_dir() {
-        return Err(format!("Not a directory: {path}"));
-    }
-    if !repo_path.join(".git").exists() {
-        return Err(format!("Not a git repository: {path}"));
-    }
+    let repo_path = crate::git::types::validate_open_repo_input(&path)?;
     let tab_name = if name.is_empty() || name == "new" {
         repo_path
             .file_name()
@@ -122,35 +113,43 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
 
     loop {
         tokio::select! {
-            incoming = receiver.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(msg) => dispatch_and_refresh(&app, msg).await,
-                            Err(e) => {
-                                tracing::debug!("ignoring malformed action: {e}");
-                            }
-                        }
+            incoming = receiver.next() => match incoming {
+                Some(Ok(Message::Text(text))) => handle_client_text(&app, &text).await,
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            },
+            update = broadcast_rx.recv() => match update {
+                Ok(state) => {
+                    if !push_state(&mut sender, state).await {
+                        break;
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
                 }
-            }
-            update = broadcast_rx.recv() => {
-                match update {
-                    Ok(state) => {
-                        if let Ok(text) = serde_json::to_string(&state) {
-if sender.send(Message::Text(text.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
         }
     }
+}
+
+/// Parses and runs one inbound client action; malformed payloads are logged
+/// and dropped rather than tearing down the connection.
+async fn handle_client_text(app: &AppState, text: &str) {
+    match serde_json::from_str::<ClientMessage>(text) {
+        Ok(msg) => dispatch_and_refresh(app, msg).await,
+        Err(e) => tracing::debug!("ignoring malformed action: {e}"),
+    }
+}
+
+/// Serializes and sends one state frame. Returns false only when the peer
+/// is gone, signalling the caller to end the session.
+async fn push_state(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    state: crate::server::registry::WebState,
+) -> bool {
+    let Ok(text) = serde_json::to_string(&state) else {
+        return true;
+    };
+    sender.send(Message::Text(text.into())).await.is_ok()
 }
 
 async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
@@ -226,6 +225,9 @@ mod tests {
     use crate::git::types::{GitAction, GitStatus};
     use crate::server::registry::TabRegistry;
     use crate::server::{run_server, AppState};
+    use crate::test_support::{
+        app_for, connect_with_retry, init_repo, recv_state, recv_state_until,
+    };
 
     #[test]
     fn encoded_client_messages_round_trip() {
@@ -244,78 +246,6 @@ mod tests {
         let msg: super::ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.tab, None);
         assert!(matches!(msg.action, GitAction::NewTab(p) if p == payload));
-    }
-
-    fn init_repo(dir: &std::path::Path) {
-        std::process::Command::new("git")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
-
-    fn app_for(dir: &std::path::Path) -> AppState {
-        AppState::new(TabRegistry::with_single_tab(
-            0,
-            "repo".to_string(),
-            dir.to_path_buf(),
-        ))
-    }
-
-    async fn connect_with_retry(url: &str) -> tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    > {
-        for _ in 0..100 {
-            if let Ok((ws, _)) = tokio_tungstenite::connect_async(url).await {
-                return ws;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("failed to connect to {url}");
-    }
-
-    async fn recv_state(ws: &mut tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >) -> crate::server::registry::WebState {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(20), ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for ws message"))
-            .expect("stream closed")
-            .expect("ws error");
-        match msg {
-            Message::Text(text) => serde_json::from_str(&text).unwrap(),
-            other => panic!("expected text state message, got {other:?}"),
-        }
-    }
-
-    async fn recv_state_until(
-        ws: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-        mut pred: impl FnMut(&crate::server::registry::WebState) -> bool,
-    ) -> crate::server::registry::WebState {
-        // Generous ceiling: the full suite runs many git-spawning tests
-        // concurrently and can starve an individual exchange for seconds.
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            loop {
-                let state = recv_state(ws).await;
-                if pred(&state) {
-                    return state;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for matching state"))
     }
 
     #[tokio::test]
@@ -665,6 +595,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_tab_targets_the_addressed_id_not_the_first_tab() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        init_repo(dir_a.path());
+        init_repo(dir_b.path());
+
+        let app = app_for(dir_a.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let initial = recv_state(&mut ws).await;
+        assert_eq!(initial.tabs.len(), 1);
+        let id_a = initial.tabs[0].id;
+
+        let inner = serde_json::json!({
+            "name": "",
+            "path": dir_b.path().display().to_string()
+        })
+        .to_string();
+        let wire = serde_json::json!({ "tab": null, "action": { "NewTab": inner } })
+            .to_string();
+        ws.send(Message::Text(wire.into())).await.unwrap();
+
+        let two = recv_state_until(&mut ws, |s| s.tabs.len() == 2).await;
+        let id_b = two
+            .tabs
+            .iter()
+            .find(|t| t.repo_path == dir_b.path().display().to_string())
+            .map(|t| t.id)
+            .expect("second tab must exist");
+
+        ws.send(Message::Text(
+            encode_client_message(Some(id_b), &GitAction::CloseTab).into(),
+        ))
+        .await
+        .unwrap();
+        let after = recv_state_until(&mut ws, |s| s.tabs.len() == 1).await;
+        assert_eq!(
+            after.tabs[0].id, id_a,
+            "the closed tab must be the addressed one, not the first"
+        );
+    }
+
+    #[tokio::test]
     async fn run_script_action_launches_script_and_surfaces_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -847,7 +826,8 @@ mod tests {
 
         let url = format!("ws://{addr}/ws");
         let mut first = connect_with_retry(&url).await;
-        let initial = recv_state_until(&mut first, |s| {
+        // Wait until the daemon has served real state before killing it.
+        let _ = recv_state_until(&mut first, |s| {
             !s.tabs.is_empty() && s.tabs[0].state.current_branch == "main"
         })
         .await;

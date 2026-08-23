@@ -389,8 +389,7 @@ button.danger:hover { background: #d93a30; }
 }
 .browser-bar code { font-size: 0.8rem; overflow-wrap: anywhere; }
 .browser-nav { display: flex; gap: 0.25rem; }
-.browser-nav button,
-.browser-actions button {
+.browser-nav button {
   background: var(--btn-bg, #eee);
   border: 1px solid var(--btn-border, #ccc);
   border-radius: 4px;
@@ -399,8 +398,7 @@ button.danger:hover { background: #d93a30; }
   font: inherit;
   color: inherit;
 }
-.browser-nav button:hover,
-.browser-actions button:hover { background: var(--btn-hover, #ddd); }
+.browser-nav button:hover { background: var(--btn-hover, #ddd); }
 .browser-nav button:disabled { opacity: 0.4; cursor: default; }
 .browser-entries { max-height: 28rem; overflow-y: auto; padding: 0.25rem; }
 .browser-entry {

@@ -953,19 +953,12 @@ document.getElementById("remove-tab-btn").onclick = () => {
 };
 
 const commitMsg = document.getElementById("commit-msg");
-  document.getElementById("stage-commit-push-btn").onclick = () => {
-    if (!commitMsg.value.trim()) return;
-    sendAction({ CommitAllPush: commitMsg.value.trim() });
-    commitMsg.value = "";
-  };
-  document.getElementById("commit-push-btn").onclick = () => {
-    if (!commitMsg.value.trim()) return;
-    const msg = commitMsg.value.trim();
-    sendAction({ Commit: msg });
-    sendAction("Push");
-    commitMsg.value = "";
-  };
-  document.getElementById("commit-btn").onclick = () => {
+document.getElementById("stage-commit-push-btn").onclick = () => {
+  if (!commitMsg.value.trim()) return;
+  sendAction({ CommitAllPush: commitMsg.value.trim() });
+  commitMsg.value = "";
+};
+document.getElementById("commit-btn").onclick = () => {
   if (!commitMsg.value.trim()) return;
   sendAction({ CommitAll: commitMsg.value.trim() });
   commitMsg.value = "";
@@ -1040,4 +1033,5 @@ document.querySelectorAll(".section-title").forEach((title) => {
     const arrow = title.querySelector(".arrow");
     arrow.innerHTML = section.classList.contains("collapsed") ? "&#9652;" : "&#9662;";
   };
-});//#endregion
+});
+//#endregion

@@ -1,4 +1,40 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Expands a leading `~` in a user-supplied path to the home directory.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with(std::env::var("HOME").ok().as_deref(), path)
+}
+
+fn expand_tilde_with(home: Option<&str>, path: &str) -> PathBuf {
+    if path == "~" {
+        return home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Shared validation for "open repository" requests so the desktop GUI and
+/// the WebSocket daemon enforce identical rules with identical messages.
+/// Returns the tilde-expanded repository path on success.
+pub(crate) fn validate_open_repo_input(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Folder path is required".to_string());
+    }
+    let repo_path = expand_tilde(trimmed);
+    if !repo_path.is_dir() {
+        return Err(format!("Not a directory: {trimmed}"));
+    }
+    if !repo_path.join(".git").exists() {
+        return Err(format!("Not a git repository: {trimmed}"));
+    }
+    Ok(repo_path)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitStatus {
@@ -71,6 +107,22 @@ pub struct CommitSummary {
     pub insertions: i64,
     pub deletions: i64,
     pub files: Vec<FileStat>,
+}
+
+impl CommitSummary {
+    /// Neutral fallback payload for error responses: every content field is
+    /// zeroed and the message slot carries the failure reason.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            author: String::new(),
+            timestamp: 0,
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            files: Vec::new(),
+        }
+    }
 }
 
 /// Lifecycle of a logged command: broadcast as `running` the moment a
@@ -157,6 +209,22 @@ mod tests {
     }
 
     #[test]
+    fn commit_summary_error_payload_is_neutral() {
+        let summary = CommitSummary::error("no repository tabs open");
+        assert_eq!(summary.message, "no repository tabs open");
+        assert_eq!(summary.author, "");
+        assert_eq!(summary.timestamp, 0);
+        assert_eq!(summary.files_changed, 0);
+        assert_eq!(summary.insertions, 0);
+        assert_eq!(summary.deletions, 0);
+        assert!(summary.files.is_empty());
+
+        // Accepts anything string-like; the wire shape must stay stable.
+        let owned = CommitSummary::error(String::from("boom"));
+        assert_eq!(owned.message, "boom");
+    }
+
+    #[test]
     fn repostate_defaults_scripts_for_older_payloads() {
         let parsed: RepoState =
             serde_json::from_str(r#"{"current_branch":"","branches":[],"changes":[],"history":[]}"#)
@@ -222,5 +290,58 @@ mod tests {
         assert_ne!(GitStatus::Modified, GitStatus::Untracked);
         assert_ne!(GitStatus::Renamed, GitStatus::Deleted);
         assert_ne!(GitStatus::Staged, GitStatus::Modified);
+    }
+
+    #[test]
+    fn validate_open_repo_input_enforces_shared_rules() {
+        assert_eq!(
+            super::validate_open_repo_input("   "),
+            Err("Folder path is required".to_string())
+        );
+
+        let missing = "/definitely/not/a/dir";
+        assert_eq!(
+            super::validate_open_repo_input(missing),
+            Err(format!("Not a directory: {missing}"))
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let typed = dir.path().to_str().unwrap();
+        assert_eq!(
+            super::validate_open_repo_input(typed),
+            Err(format!("Not a git repository: {typed}")),
+            "a plain directory is not a repository"
+        );
+
+        crate::test_support::init_repo(dir.path());
+        assert_eq!(
+            super::validate_open_repo_input(typed),
+            Ok(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home_prefixes() {
+        let home = "/home/bronson";
+        assert_eq!(
+            super::expand_tilde_with(Some(home), "~/projects/grit"),
+            PathBuf::from("/home/bronson/projects/grit")
+        );
+        assert_eq!(
+            super::expand_tilde_with(Some(home), "~"),
+            PathBuf::from(home)
+        );
+        assert_eq!(
+            super::expand_tilde_with(Some(home), "/usr/local"),
+            PathBuf::from("/usr/local")
+        );
+        assert_eq!(
+            super::expand_tilde_with(None, "~/projects"),
+            PathBuf::from("~/projects")
+        );
+        assert_eq!(
+            super::expand_tilde_with(Some(home), "~other/x"),
+            PathBuf::from("~other/x")
+        );
     }
 }
