@@ -488,6 +488,10 @@ pub async fn run(registry: TabRegistry, port: u16) {
     let listener = match create_listener(port).await {
         Ok(l) => l,
         Err(e) => {
+            // Loud on stderr too: a silent exit here looks exactly like "the
+            // web UI never comes up" from the browser side.
+            eprintln!("error: failed to bind 127.0.0.1:{port}: {e}");
+            eprintln!("       is another Grit daemon already running on this port?");
             tracing::error!("failed to bind 127.0.0.1:{port}: {e}");
             return;
         }

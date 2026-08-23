@@ -67,7 +67,7 @@ let expandedDetailEl = null;
 let expandedCommitKey = null;
 let expandedCommitEl = null;
 let awaitingNewTab = false;
-// Client-local view state: entries with seq <= this are hidden by "Clear".
+// Client-local view state: entries with seq <= this are hidden by "Clear Log".
 let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
@@ -280,13 +280,9 @@ function render(state) {
   const changesEl = document.getElementById("changes");
   let stillOpen = false;
   expandedDetailEl = null;
-  if (tab.state.changes.length === 0) {
-    changesEl.textContent = "Working tree clean";
-  } else {
-    changesEl.textContent = "";
-    for (const change of tab.state.changes) {
-      if (appendChangeRow(changesEl, change, tab)) stillOpen = true;
-    }
+  changesEl.textContent = "";
+  for (const change of tab.state.changes) {
+    if (appendChangeRow(changesEl, change, tab)) stillOpen = true;
   }
   if (!stillOpen) {
     expandedKey = null;
@@ -345,10 +341,11 @@ function render(state) {
 
 function renderScriptRunner(tab) {
   const scripts = tab.state.scripts || [];
-  const runner = document.getElementById("script-runner");
   const select = document.getElementById("script-select");
+  const runBtn = document.getElementById("run-script-btn");
   if (scripts.length === 0) {
-    runner.style.display = "none";
+    select.style.display = "none";
+    runBtn.style.display = "none";
     select.textContent = "";
     return;
   }
@@ -365,7 +362,8 @@ function renderScriptRunner(tab) {
   if (scripts.some((s) => s.rel_path === previous)) {
     select.value = previous;
   }
-  runner.style.display = "flex";
+  select.style.display = "";
+  runBtn.style.display = "";
 }
 
 document.getElementById("run-script-btn").onclick = () => {

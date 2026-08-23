@@ -176,9 +176,10 @@ ids come from one monotonic allocator and are never reused within a session.
 * **Wire format**: `GitAction::RunScript(rel_path)` executes via the normal
   action dispatch in both Embedded and Remote modes; picking a script in the
   dropdown launches it immediately (no confirmation step). The section is
-  hidden when no scripts exist. The web UI exposes the same launcher inside
-  its Actions section (`#script-runner`: `<select>` + Run button), fed by
-  the identical `RepoState.scripts` payload.
+   hidden when no scripts exist. The web UI exposes the same launcher inside
+   its Actions section action row (`#script-select` + `#run-script-btn`,
+   inline with the other buttons), fed by
+   the identical `RepoState.scripts` payload.
 
 
 ---
