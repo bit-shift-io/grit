@@ -1,4 +1,64 @@
-const ws = new WebSocket(`ws://${location.host}/ws`);
+let ws = null;
+let reconnectTimer = null;
+let reconnectDelayMs = 500;
+
+function scheduleReconnect(delay) {
+  if (reconnectTimer !== null) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    openSocket();
+  }, delay);
+}
+
+function openSocket() {
+  const socket = new WebSocket(`ws://${location.host}/ws`);
+  ws = socket;
+  socket.onopen = () => {
+    reconnectDelayMs = 500;
+    setConnStatus(true);
+  };
+  socket.onmessage = handleStateMessage;
+  socket.onclose = () => {
+    if (ws === socket) setConnStatus(false);
+    scheduleReconnect(reconnectDelayMs);
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000);
+  };
+}
+
+function setConnStatus(connected) {
+  if (connected) {
+    document.getElementById("conn-status")?.remove();
+    return;
+  }
+  if (document.getElementById("conn-status")) return;
+  const banner = document.createElement("div");
+  banner.id = "conn-status";
+  banner.textContent = "Grit daemon unreachable — retrying...";
+  document.body.prepend(banner);
+}
+
+function sendRaw(payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(payload);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  openSocket();
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted) return;
+  if (ws && ws.readyState !== WebSocket.CLOSED) return;
+  openSocket();
+});
+
+openSocket();
 
 let activeTabId = null;
 let lastState = null;
@@ -133,7 +193,7 @@ function setupAddRepoForm(tab) {
   };
 }
 
-ws.onmessage = (event) => {
+function handleStateMessage(event) {
   const state = JSON.parse(event.data);
   // Invariant: exactly one active view at all times — a real tab whenever
   // any exist, otherwise the client-local "+" form (activeTabId === null).
@@ -170,7 +230,7 @@ ws.onmessage = (event) => {
 //#region WebSocket send + selection helpers
 
 function sendAction(action) {
-  ws.send(JSON.stringify({ tab: activeTabId, action }));
+  sendRaw(JSON.stringify({ tab: activeTabId, action }));
 }
 
 function activeTab(state) {
@@ -823,7 +883,7 @@ document.getElementById("remove-tab-btn").onclick = () => {
   if (!tab) return;
   if (confirm(`Remove "${tab.name}"? The repository on disk is kept.`)) {
     // Send the explicit id: removal must not depend on selection state.
-    ws.send(JSON.stringify({ tab: tab.id, action: "CloseTab" }));
+    sendRaw(JSON.stringify({ tab: tab.id, action: "CloseTab" }));
     activeTabId = null;
     awaitingNewTab = false;
     showAddForm = false;

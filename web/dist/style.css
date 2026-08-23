@@ -1,5 +1,16 @@
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 body { margin: 0; padding: 1rem; }
+#conn-status {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.4rem 1rem;
+  background: var(--danger-bg, #b3261e);
+  color: #fff;
+  font-size: 0.85rem;
+  z-index: 10;
+}
 .muted { color: var(--muted, #888); }
 
 .section { margin-top: 1rem; }
