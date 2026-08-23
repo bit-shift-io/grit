@@ -320,8 +320,14 @@ pub async fn sync_loop(app: AppState, mut refresh_rx: mpsc::UnboundedReceiver<()
         tokio::select! {
             res = refresh_rx.recv(), if refresh_open => match res {
                 Some(()) => {
+                    let before = app.registry.revision();
                     refresh_all(&app).await;
-                    let _ = app.broadcast.send(app.registry.snapshot());
+                    // A mutation landing mid-refresh already broadcast its
+                    // own fresh frame; only publish when nothing changed
+                    // during the run, so no stale frame can trail a close.
+                    if app.registry.revision() == before {
+                        let _ = app.broadcast.send(app.registry.snapshot());
+                    }
                 }
                 None => refresh_open = false,
             },
@@ -436,7 +442,18 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
         }
     });
 
-    refresh_all(&app).await;
+    // Refresh statuses in the background so clients can connect while git
+    // commands are still running; each finished tab's update_state publish
+    // flows through sync_loop to every client, so tabs appear one by one.
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            for tab in app.registry.snapshot().tabs {
+                refresh_tab(&app, tab.id).await;
+            }
+        }
+    });
+
     (app, refresh_rx)
 }
 
@@ -468,7 +485,7 @@ pub async fn is_daemon_running(port: u16) -> bool {
 
 /// Boots the full headless daemon: watcher, state sync, and HTTP server.
 pub async fn run(registry: TabRegistry, port: u16) {
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+    let listener = match create_listener(port).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("failed to bind 127.0.0.1:{port}: {e}");
@@ -480,6 +497,16 @@ pub async fn run(registry: TabRegistry, port: u16) {
     let (app, refresh_rx) = boot(registry).await;
     let handle = run_server(listener, app, refresh_rx);
     handle.await.ok();
+}
+
+/// SO_REUSEADDR lets an immediate close-and-restart rebind the port even
+/// while old client sockets still linger in TIME_WAIT.
+pub(crate) async fn create_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 #[cfg(test)]
@@ -930,8 +957,11 @@ mod tests {
         let url = format!("ws://{addr}/ws");
         let mut ws = connect_with_retry(&url).await;
 
-        let initial = recv_state(&mut ws).await;
-        assert_eq!(initial.tabs[0].state.current_branch, "main");
+        // The initial refresh now runs in the background; wait until the
+        // first tab has been fully computed before asserting on it.
+        let initial =
+            recv_state_until(&mut ws, |s| !s.tabs.is_empty() && s.tabs[0].state.current_branch == "main")
+                .await;
         assert_eq!(initial.tabs[0].state.changes.len(), 1);
         assert_eq!(initial.tabs[0].state.changes[0].path, "a.txt");
 
@@ -1065,7 +1095,12 @@ mod tests {
         let _server = run_server(listener, app.clone(), refresh_rx);
 
         let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
-        let _initial = recv_state(&mut ws).await;
+        // Let the boot-time refresh finish so no late refresh broadcast can
+        // arrive after the tab is closed below.
+        let _initial = recv_state_until(&mut ws, |s| {
+            !s.tabs.is_empty() && s.tabs[0].state.current_branch == "main"
+        })
+        .await;
 
         ws.send(Message::Text(r#"{"tab":0,"action":"CloseTab"}"#.into()))
             .await

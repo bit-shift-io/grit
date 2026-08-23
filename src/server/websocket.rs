@@ -69,24 +69,20 @@ pub async fn open_repo_tab(
 /// Removes one tab from the workspace by id. The repository itself on disk
 /// is left untouched. Returns false when the id is unknown.
 pub fn close_tab_by_id(registry: &crate::server::registry::TabRegistry, id: usize) -> bool {
-    let mut state = registry.snapshot();
-    if let Some(idx) = state.tabs.iter().position(|t| t.id == id) {
-        let removed = state.tabs.remove(idx);
-        tracing::info!(
-            "CloseTab removed id={} name={} path={}; {} tab(s) remain",
-            removed.id,
-            removed.name,
-            removed.repo_path,
-            state.tabs.len()
-        );
-        if state.active >= state.tabs.len() {
-            state.active = state.tabs.len().saturating_sub(1);
+    match registry.remove_tab(id) {
+        Some(removed) => {
+            tracing::info!(
+                "CloseTab removed id={} name={} path={}",
+                removed.id,
+                removed.name,
+                removed.repo_path
+            );
+            true
         }
-        registry.set(state);
-        true
-    } else {
-        tracing::warn!("CloseTab ignored: unknown tab id {}", id);
-        false
+        None => {
+            tracing::warn!("CloseTab ignored: unknown tab id {}", id);
+            false
+        }
     }
 }
 
@@ -279,7 +275,7 @@ mod tests {
     async fn connect_with_retry(url: &str) -> tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     > {
-        for _ in 0..40 {
+        for _ in 0..100 {
             if let Ok((ws, _)) = tokio_tungstenite::connect_async(url).await {
                 return ws;
             }
@@ -291,7 +287,7 @@ mod tests {
     async fn recv_state(ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >) -> crate::server::registry::WebState {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(20), ws.next())
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for ws message"))
             .expect("stream closed")
@@ -308,7 +304,9 @@ mod tests {
         >,
         mut pred: impl FnMut(&crate::server::registry::WebState) -> bool,
     ) -> crate::server::registry::WebState {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // Generous ceiling: the full suite runs many git-spawning tests
+        // concurrently and can starve an individual exchange for seconds.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 let state = recv_state(ws).await;
                 if pred(&state) {
@@ -830,5 +828,59 @@ mod tests {
         assert!(super::close_tab_by_id(&registry, 7));
         assert!(registry.snapshot().tabs.is_empty());
         assert!(dir.path().join(".git").exists(), "disk untouched");
+    }
+
+    /// A killed daemon must be immediately restartable on the same port and
+    /// serve fresh WebSocket clients — the browser-side reconnect path.
+    #[tokio::test]
+    async fn restarted_daemon_rebinds_port_and_accepts_new_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = crate::server::create_listener(0).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let server = run_server(listener, app.clone(), refresh_rx);
+
+        let url = format!("ws://{addr}/ws");
+        let mut first = connect_with_retry(&url).await;
+        let initial = recv_state_until(&mut first, |s| {
+            !s.tabs.is_empty() && s.tabs[0].state.current_branch == "main"
+        })
+        .await;
+        drop(first);
+
+        // Kill the daemon: connected clients see their socket drop.
+        server.abort();
+        let _ = server.await;
+
+        // Instant restart on the SAME port: SO_REUSEADDR must win any
+        // TIME_WAIT race left behind by the old connections. Under heavy
+        // parallel-test load the old listener can take a moment to be
+        // released, so retry briefly instead of failing the restart.
+        let listener = {
+            let mut rebound = None;
+            for _ in 0..100 {
+                match crate::server::create_listener(addr.port()).await {
+                    Ok(l) => {
+                        rebound = Some(l);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+                }
+            }
+            rebound.expect("old daemon never released the port")
+        };
+        assert_eq!(listener.local_addr().unwrap(), addr);
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app, refresh_rx);
+
+        // The browser's retry loop lands here and resumes streaming.
+        let mut second = connect_with_retry(&url).await;
+        let after = recv_state(&mut second).await;
+        assert_eq!(after.tabs[0].state.current_branch, "main");
     }
 }

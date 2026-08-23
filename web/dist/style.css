@@ -6,7 +6,7 @@ body { margin: 0; padding: 1rem; }
   right: 0;
   bottom: 0;
   padding: 0.4rem 1rem;
-  background: var(--danger-bg, #b3261e);
+  background: rgba(179, 38, 30, 0.6);
   color: #fff;
   font-size: 0.85rem;
   z-index: 10;
@@ -154,6 +154,7 @@ body { margin: 0; padding: 1rem; }
 }
 .action-btn:hover { background: #ececec; }
 .discard-btn:hover { background: #b3261e; color: #fff; border-color: #b3261e; }
+.change-row:not(.open) .block-nav { display: none; }
 .change-diff {
   max-height: 400px;
   overflow: auto;
@@ -168,19 +169,8 @@ body { margin: 0; padding: 1rem; }
   font-family: ui-monospace, monospace;
   font-size: 0.8rem;
 }
-.side-by-side th,
 .side-by-side td {
   width: 50%;
-}
-.side-by-side th {
-  text-align: left;
-  padding: 0.35rem 0.5rem;
-  border-bottom: 1px solid var(--btn-border, #ccc);
-  position: sticky;
-  top: 0;
-  background: var(--section-bg, #e0e0e0);
-}
-.side-by-side td {
   padding: 0;
   vertical-align: top;
 }
@@ -382,9 +372,6 @@ button.danger:hover { background: #d93a30; }
   color: inherit;
   font: inherit;
 }
-.path-input-row { display: flex; gap: 0.5rem; }
-.path-input-row input { flex: 1; }
-.path-input-row button,
 .form-actions button {
   background: var(--btn-bg, #eee);
   border: 1px solid var(--btn-border, #ccc);
@@ -394,7 +381,6 @@ button.danger:hover { background: #d93a30; }
   font: inherit;
   color: inherit;
 }
-.path-input-row button:hover,
 .form-actions button:hover { background: var(--btn-hover, #ddd); }
 .form-actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
 .form-actions .primary {

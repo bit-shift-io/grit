@@ -32,7 +32,17 @@ fn main() -> iced::Result {
     let open_explicit = cli.path.is_some();
     let repo_path = resolve_path(cli.path.as_deref().unwrap_or(Path::new(".")));
 
-    if cli.headless {
+    let mut headless = cli.headless;
+    if !headless && !display_available() {
+        headless = true;
+        eprintln!(
+            "No display server detected (DISPLAY/WAYLAND_DISPLAY unset); \
+             serving the web UI at http://127.0.0.1:{} instead",
+            cli.port
+        );
+    }
+
+    if headless {
         // An explicit --path pins one tab; otherwise start empty so persisted
         // tabs are restored by boot() instead of being shadowed by a CWD tab.
         let registry = match cli.path {
@@ -67,6 +77,12 @@ fn main() -> iced::Result {
         };
         ui::state::run(mode, repo_path, open_explicit)
     }
+}
+
+fn display_available() -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
+        .into_iter()
+        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
 }
 
 /// Picks the GUI's data source: attach to an already-running daemon when one

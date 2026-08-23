@@ -33,17 +33,13 @@
       <div class="section-body">
         <div class="form-group">
           <label for="new-repo-path">Directory</label>
-          <div class="path-input-row">
-            <input id="new-repo-path" type="text" placeholder="~/projects/my-repo">
-            <button id="browse-folder-btn" type="button">Browse...</button>
-          </div>
-          <div id="folder-browser" class="folder-browser" style="display: none;">
+          <input id="new-repo-path" type="text" placeholder="~/projects/my-repo">
+          <div id="folder-browser" class="folder-browser">
             <div class="browser-bar">
               <code id="browser-current"></code>
               <span class="browser-nav">
                 <button id="browser-up-btn" type="button">Up</button>
                 <button id="browser-home-btn" type="button">Home</button>
-                <button id="browser-select-btn" type="button">Select</button>
               </span>
             </div>
             <div id="browser-entries" class="browser-entries"></div>

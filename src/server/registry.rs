@@ -43,6 +43,10 @@ impl Default for WebState {
 pub struct TabRegistry {
     tx: watch::Sender<WebState>,
     rx: watch::Receiver<WebState>,
+    /// Serializes read-modify-write mutations: without it a status refresh
+    /// finishing after CloseTab would resurrect the closed tab from its
+    /// stale pre-close snapshot.
+    write_lock: std::sync::Mutex<()>,
     /// Monotonic id allocator; ids are never reused within a session so
     /// clients can treat every unseen id as a genuinely new tab. Shared
     /// through an `Arc` because every handle (server, desktop GUI) is a
@@ -51,6 +55,9 @@ pub struct TabRegistry {
     /// Monotonic allocator for log entry ids; shared across clones for
     /// the same reason as `next_id`.
     next_log_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Bumped on every publish so observers can detect mutations that
+    /// happened while they were busy (e.g. a status refresh mid-flight).
+    revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for TabRegistry {
@@ -58,8 +65,10 @@ impl Clone for TabRegistry {
         Self {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
+            write_lock: std::sync::Mutex::new(()),
             next_id: std::sync::Arc::clone(&self.next_id),
             next_log_seq: std::sync::Arc::clone(&self.next_log_seq),
+            revision: std::sync::Arc::clone(&self.revision),
         }
     }
 }
@@ -71,8 +80,28 @@ impl TabRegistry {
         Self {
             tx,
             rx,
+            write_lock: std::sync::Mutex::new(()),
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_log_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Current publish revision; changes on every mutation.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Applies `f` to the current state under the write lock and broadcasts
+    /// only when `f` reports a change.
+    fn modify<F: FnOnce(&mut WebState) -> bool>(&self, f: F) -> bool {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut current = self.snapshot();
+        if f(&mut current) {
+            self.set(current);
+            true
+        } else {
+            false
         }
     }
 
@@ -107,6 +136,8 @@ impl TabRegistry {
 
     /// Replaces the entire tab list.
     pub fn set(&self, state: WebState) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _ = self.tx.send(state);
     }
 
@@ -122,11 +153,34 @@ impl TabRegistry {
 
     /// Updates the state of a single tab in place.
     pub fn update_state(&self, id: usize, state: RepoState) {
-        let mut current = self.snapshot();
-        if let Some(tab) = current.tabs.iter_mut().find(|t| t.id == id) {
-            tab.state = state;
-            self.set(current);
-        }
+        self.modify(|current| {
+            match current.tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) => {
+                    tab.state = state;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
+    /// Removes one tab by id under the write lock, healing `active`.
+    /// Returns the removed tab, or None when the id is unknown.
+    pub fn remove_tab(&self, id: usize) -> Option<WebTab> {
+        let mut removed = None;
+        self.modify(|current| {
+            match current.tabs.iter().position(|t| t.id == id) {
+                Some(idx) => {
+                    removed = Some(current.tabs.remove(idx));
+                    if current.active >= current.tabs.len() {
+                        current.active = current.tabs.len().saturating_sub(1);
+                    }
+                    true
+                }
+                None => false,
+            }
+        });
+        removed
     }
 
     /// Resolves the repository path backing a tab id.
@@ -144,21 +198,23 @@ impl TabRegistry {
     /// when the tab no longer exists.
     pub fn start_log_entry(&self, tab_id: usize, command: String) -> Option<u64> {
         let seq = self.alloc_log_seq();
-        let mut current = self.snapshot();
-        let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
-            return None;
-        };
-        tab.log.push(LogEntry {
-            seq,
-            command,
-            output: String::new(),
-            status: crate::git::types::LogStatus::Running,
-            started_ms: epoch_millis(),
-            duration_ms: 0,
+        let started = epoch_millis();
+        let applied = self.modify(|current| {
+            let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                return false;
+            };
+            tab.log.push(LogEntry {
+                seq,
+                command,
+                output: String::new(),
+                status: crate::git::types::LogStatus::Running,
+                started_ms: started,
+                duration_ms: 0,
+            });
+            truncate_log(&mut tab.log);
+            true
         });
-        truncate_log(&mut tab.log);
-        self.set(current);
-        Some(seq)
+        applied.then_some(seq)
     }
 
     /// Replaces the `running` placeholder `seq` with the final transcript
@@ -172,27 +228,31 @@ impl TabRegistry {
     ) {
         if entries.is_empty() {
             // Nothing to record (e.g. pure UI actions): drop the placeholder.
-            let mut current = self.snapshot();
-            if let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) {
-                if tab.log.iter().any(|e| e.seq == seq) {
-                    tab.log.retain(|e| e.seq != seq);
-                    self.set(current);
+            self.modify(|current| {
+                let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                    return false;
+                };
+                if !tab.log.iter().any(|e| e.seq == seq) {
+                    return false;
                 }
-            }
+                tab.log.retain(|e| e.seq != seq);
+                true
+            });
             return;
         }
         let mut finished = entries;
         for entry in &mut finished {
             entry.seq = self.alloc_log_seq();
         }
-        let mut current = self.snapshot();
-        let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
-            return;
-        };
-        tab.log.retain(|e| e.seq != seq);
-        tab.log.extend(finished);
-        truncate_log(&mut tab.log);
-        self.set(current);
+        self.modify(move |current| {
+            let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                return false;
+            };
+            tab.log.retain(|e| e.seq != seq);
+            tab.log.extend(finished);
+            truncate_log(&mut tab.log);
+            true
+        });
     }
 
     fn alloc_log_seq(&self) -> u64 {

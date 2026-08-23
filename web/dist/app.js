@@ -73,6 +73,7 @@ let clearedUpToSeq = 0;
 let showAddForm = false;
 let browserDir = null;
 let browserParent = null;
+let browserSeeding = false;
 const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
@@ -97,20 +98,27 @@ function setupAddRepoForm(tab) {
     delete nameInput.dataset.userSet;
     errorEl.style.display = "none";
     browserDir = null;
-    document.getElementById("folder-browser").style.display = "none";
+    document.getElementById("folder-browser").style.display = "block";
   }
 
-  const browseBtn = document.getElementById("browse-folder-btn");
   const browserEl = document.getElementById("folder-browser");
   const browserCurrent = document.getElementById("browser-current");
   const browserEntries = document.getElementById("browser-entries");
   const upBtn = document.getElementById("browser-up-btn");
   const homeBtn = document.getElementById("browser-home-btn");
-  const selectBtn = document.getElementById("browser-select-btn");
   const openBtn = document.getElementById("open-repo-btn");
   const cancelBtn = document.getElementById("cancel-repo-btn");
 
   nameInput.oninput = () => { nameInput.dataset.userSet = "true"; };
+
+  // The path and name fields follow the browser's current folder so the
+  // user can just hit "Open Repository" without a separate select step.
+  function applyDir(dir) {
+    pathInput.value = dir;
+    if (!nameInput.dataset.userSet) {
+      nameInput.value = getTabNameFromPath(dir);
+    }
+  }
 
   async function loadBrowser(path) {
     try {
@@ -121,6 +129,7 @@ function setupAddRepoForm(tab) {
       browserParent = data.parent;
       browserCurrent.textContent = data.current;
       upBtn.disabled = !data.parent;
+      applyDir(data.current);
       browserEntries.textContent = "";
       if (data.entries.length === 0) {
         const empty = document.createElement("div");
@@ -143,23 +152,16 @@ function setupAddRepoForm(tab) {
     }
   }
 
-  browseBtn.onclick = () => {
-    const show = browserEl.style.display === "none";
-    browserEl.style.display = show ? "block" : "none";
-    if (show && !browserDir) {
-      loadBrowser(pathInput.value.trim());
-    }
-  };
   upBtn.onclick = () => { if (browserParent) loadBrowser(browserParent); };
   homeBtn.onclick = () => loadBrowser("");
-  selectBtn.onclick = () => {
-    if (!browserDir) return;
-    pathInput.value = browserDir;
-    if (!nameInput.dataset.userSet) {
-      nameInput.value = getTabNameFromPath(browserDir);
-    }
-    browserEl.style.display = "none";
-  };
+
+  // The browser is always open: seed it once per form appearance.
+  if (!browserDir && !browserSeeding) {
+    browserSeeding = true;
+    loadBrowser(pathInput.value.trim()).finally(() => {
+      browserSeeding = false;
+    });
+  }
 
   pathInput.oninput = () => {
     if (!nameInput.dataset.userSet && pathInput.value) {
@@ -463,6 +465,21 @@ function appendChangeRow(container, change, tab) {
   const actions = document.createElement("div");
   actions.className = "change-actions";
 
+  const navDown = document.createElement("button");
+  navDown.className = "action-btn block-nav";
+  navDown.dataset.action = "next-block";
+  navDown.textContent = "v";
+  navDown.title = "Scroll to next change block";
+
+  const navUp = document.createElement("button");
+  navUp.className = "action-btn block-nav";
+  navUp.dataset.action = "prev-block";
+  navUp.textContent = "^";
+  navUp.title = "Scroll to previous change block";
+
+  actions.appendChild(navDown);
+  actions.appendChild(navUp);
+
   const action = document.createElement("button");
   action.className = "action-btn";
   action.dataset.path = change.path;
@@ -498,6 +515,9 @@ function appendChangeRow(container, change, tab) {
 
   row.appendChild(head);
   row.appendChild(detail);
+  if (expanded) {
+    row.classList.add("open");
+  }
   container.appendChild(row);
   return expanded;
 }
@@ -705,16 +725,56 @@ async function toggleDiff(detailEl, tab, path) {
     expandedDetailEl.style.display = "none";
     expandedDetailEl.textContent = "";
     expandedDetailEl = null;
+    detailEl.closest(".change-row").classList.remove("open");
     return;
   }
   if (expandedDetailEl) {
     expandedDetailEl.style.display = "none";
     expandedDetailEl.textContent = "";
+    expandedDetailEl.closest(".change-row").classList.remove("open");
   }
   expandedKey = key;
   expandedDetailEl = detailEl;
   detailEl.style.display = "block";
+  detailEl.closest(".change-row").classList.add("open");
   await showDiff(detailEl, tab, path);
+  if (expandedDetailEl === detailEl) {
+    scrollToFirstDiffBlock(detailEl);
+  }
+}
+
+function scrollToFirstDiffBlock(detailEl) {
+  const first = detailEl.querySelector("tbody.diff-block");
+  if (first) {
+    scrollDetailToBlock(detailEl, first);
+  }
+}
+
+// Scrolls only the diff's own scroll box (never the page), centering the
+// target block vertically.
+function scrollDetailToBlock(detailEl, block) {
+  const dRect = detailEl.getBoundingClientRect();
+  const bRect = block.getBoundingClientRect();
+  const delta =
+    bRect.top - dRect.top - (dRect.height - bRect.height) / 2;
+  detailEl.scrollBy({ top: delta, behavior: "smooth" });
+}
+
+// Steps between contiguous changed-row groups ("blocks") in an expanded diff.
+// The current block is derived from the scroll position so manual scrolling
+// never desyncs the ^/v buttons.
+function stepDiffBlock(headEl, delta) {
+  const detail = headEl ? headEl.nextElementSibling : null;
+  if (!detail || detail.style.display === "none") return;
+  const blocks = detail.querySelectorAll("tbody.diff-block");
+  if (blocks.length === 0) return;
+  const marker = detail.getBoundingClientRect().top + detail.clientHeight * 0.35;
+  let index = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].getBoundingClientRect().top <= marker) index = i;
+  }
+  const target = Math.max(0, Math.min(index + delta, blocks.length - 1));
+  scrollDetailToBlock(detail, blocks[target]);
 }
 
 async function showDiff(detailEl, tab, path) {
@@ -828,18 +888,22 @@ function renderSideBySide(original, current) {
   const table = document.createElement("table");
   table.className = "side-by-side";
 
-  const thead = document.createElement("thead");
-  const headRow = document.createElement("tr");
-  for (const label of ["Original", "New"]) {
-    const th = document.createElement("th");
-    th.textContent = label;
-    headRow.appendChild(th);
-  }
-  thead.appendChild(headRow);
-  table.appendChild(thead);
-
-  const tbody = document.createElement("tbody");
+  // Contiguous runs of changed rows are grouped into their own tbody so the
+  // ^/v buttons can scroll block by block.
+  let tbody = document.createElement("tbody");
+  let inBlock = false;
   for (const row of rows) {
+    const changed =
+      (row.left && row.left.type !== "same") ||
+      (row.right && row.right.type !== "same");
+    if (changed !== inBlock) {
+      table.appendChild(tbody);
+      tbody = document.createElement("tbody");
+      if (changed) {
+        tbody.className = "diff-block";
+      }
+      inBlock = changed;
+    }
     const tr = document.createElement("tr");
     for (const side of ["left", "right"]) {
       const cell = document.createElement("td");
@@ -942,7 +1006,11 @@ document.getElementById("changes").addEventListener("click", (event) => {
   const actionBtn = event.target.closest(".action-btn");
   if (actionBtn) {
     const path = actionBtn.dataset.path;
-    if (actionBtn.dataset.action === "discard") {
+    if (actionBtn.dataset.action === "prev-block") {
+      stepDiffBlock(actionBtn.closest(".change-head"), -1);
+    } else if (actionBtn.dataset.action === "next-block") {
+      stepDiffBlock(actionBtn.closest(".change-head"), 1);
+    } else if (actionBtn.dataset.action === "discard") {
       if (confirm(`Discard changes to ${path}?`)) {
         sendAction({ Discard: path });
       }
