@@ -191,6 +191,18 @@ body { margin: 0; padding: 1rem; }
   :root { --muted: #888; --tab-border: #444; --btn-bg: #2a2a2a; --btn-border: #444; --btn-hover: #333; --section-bg: #2a2a2a; --section-hover: #333; --row-hover: #333; }
 }
 
+#history-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  background: var(--btn-bg, #eee);
+  color: inherit;
+  font: inherit;
+}
+
 #history {
   max-height: 15rem;
   overflow-y: auto;

@@ -74,6 +74,7 @@ let showAddForm = false;
 let browserDir = null;
 let browserParent = null;
 let browserSeeding = false;
+let historyQuery = "";
 const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
@@ -289,11 +290,43 @@ function render(state) {
     expandedDetailEl = null;
   }
 
+  renderHistory(tab);
+}
+
+//#endregion
+
+//#region History panel (recent commits + full-history search)
+
+const RECENT_COMMIT_COUNT = 4;
+
+function commitMatches(commit, needle) {
+  return (
+    commit.hash.toLowerCase().includes(needle) ||
+    commit.author.toLowerCase().includes(needle) ||
+    commit.message.toLowerCase().includes(needle)
+  );
+}
+
+function renderHistory(tab) {
   const historyEl = document.getElementById("history");
   historyEl.textContent = "";
+
+  const needle = historyQuery.trim().toLowerCase();
+  const commits = needle
+    ? tab.state.history.filter((c) => commitMatches(c, needle))
+    : tab.state.history.slice(0, RECENT_COMMIT_COUNT);
+
+  if (commits.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = needle ? "No matching commits." : "No commits yet.";
+    historyEl.appendChild(empty);
+    return;
+  }
+
   let commitStillOpen = false;
   expandedCommitEl = null;
-  for (const commit of tab.state.history) {
+  for (const commit of commits) {
     const key = `${tab.id}:${commit.hash}`;
     const row = document.createElement("div");
     row.className = "commit-row";
@@ -1024,6 +1057,12 @@ document.getElementById("history").addEventListener("click", (event) => {
   const head = event.target.closest(".commit-head");
   if (!head) return;
   toggleCommitActions(head.nextElementSibling, tab, head.dataset.hash);
+});
+
+document.getElementById("history-search").addEventListener("input", (event) => {
+  historyQuery = event.target.value;
+  if (!lastState) return;
+  renderHistory(activeTab(lastState));
 });
 
 document.querySelectorAll(".section-title").forEach((title) => {

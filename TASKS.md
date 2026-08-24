@@ -122,3 +122,10 @@
 - [x] Regression test `running_entry_reaches_issuing_client_mid_action`: sleeping `pre-commit` hook + CommitAll over WS; the `Running` placeholder must reach the issuing connection well inside the hook sleep, then be sealed by the final transcript (126 tests total) (1 file)
 
 
+
+## Phase 16 — History Panel: Recent List + Full-History Search
+
+- [x] Web UI default view shows only the 4 most recent commits (`RECENT_COMMIT_COUNT` in `web/dist/app.js`); `renderHistory(tab)` extracted out of `render()` so broadcasts re-render just the panel (1 file)
+- [x] Search box `#history-search` added at the top of the History section (`web/dist/index.html`); non-empty queries filter the FULL commit history client-side by case-insensitive substring on hash/author/message, empty state text for no matches; input lives outside the re-rendered `#history` so focus survives state refreshes; wired via an `input` listener (2 files)
+- [x] Styling for `#history-search` matches existing inputs (`web/dist/style.css`); `#history` keeps its scroll box for large search result sets (1 file)
+- [x] Verification: `cargo check`, `cargo check --features desktop`, `cargo test` all green (web-only change) (no command)
