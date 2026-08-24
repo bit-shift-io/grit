@@ -155,16 +155,18 @@ fn notify_progress(sink: &ProgressSink, snapshot: String) {
 /// of each stream plus the exit success flag; the final transcript keeps
 /// the exact shape the blocking path produces.
 fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(String, String, bool)> {
-    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::Mutex;
 
-    /// Appends one output line to its stream buffer and pushes a live
+    /// Appends one raw output chunk to its stream buffer and pushes a live
     /// snapshot on first content, then at most once per flush interval.
-    fn flush_line(
+    /// Carriage returns are normalized to newlines: git draws progress
+    /// meters with `\r` redraws, which would otherwise coalesce into a
+    /// single giant line delivered only at exit.
+    fn flush_chunk(
         buffers: &Mutex<(String, String, Option<Instant>)>,
         is_stdout: bool,
-        line: String,
+        chunk: String,
         sink: &ProgressSink,
     ) {
         let mut guard = match buffers.lock() {
@@ -172,12 +174,11 @@ fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(Stri
             Err(poisoned) => poisoned.into_inner(),
         };
         let (stdout, stderr, last_flush) = &mut *guard;
+        let chunk = chunk.replace('\r', "\n");
         if is_stdout {
-            stdout.push_str(&line);
-            stdout.push('\n');
+            stdout.push_str(&chunk);
         } else {
-            stderr.push_str(&line);
-            stderr.push('\n');
+            stderr.push_str(&chunk);
         }
         let due = last_flush.map_or(true, |t| t.elapsed() >= STREAM_FLUSH_INTERVAL);
         if due {
@@ -200,8 +201,20 @@ fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(Stri
         let buffers = std::sync::Arc::clone(&buffers);
         let sink = std::sync::Arc::clone(sink);
         move || {
-            for line in BufReader::new(stdout_pipe).lines().map_while(Result::ok) {
-                flush_line(&buffers, true, line, &sink);
+            // Fixed-size chunk reads (not line reads): git's progress
+            // meters redraw with `\r` and would buffer until exit.
+            let mut pipe = stdout_pipe;
+            let mut buf = [0u8; 512];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => flush_chunk(
+                        &buffers,
+                        true,
+                        String::from_utf8_lossy(&buf[..n]).into_owned(),
+                        &sink,
+                    ),
+                }
             }
         }
     });
@@ -209,8 +222,18 @@ fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(Stri
         let buffers = std::sync::Arc::clone(&buffers);
         let sink = std::sync::Arc::clone(sink);
         move || {
-            for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
-                flush_line(&buffers, false, line, &sink);
+            let mut pipe = stderr_pipe;
+            let mut buf = [0u8; 512];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => flush_chunk(
+                        &buffers,
+                        false,
+                        String::from_utf8_lossy(&buf[..n]).into_owned(),
+                        &sink,
+                    ),
+                }
             }
         }
     });
@@ -308,12 +331,18 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::Commit(m) => vec![seq(&["commit", "-m", m])],
         GitAction::CommitAll(m) => vec![seq(&["add", "-A"]), seq(&["commit", "-m", m])],
         GitAction::CommitAllPush(m) => {
-            vec![seq(&["add", "-A"]), seq(&["commit", "-m", m]), seq(&["push"])]
+            vec![
+                seq(&["add", "-A"]),
+                seq(&["commit", "-m", m]),
+                seq(&["push", "--progress"]),
+            ]
         }
         GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"])],
-        GitAction::Push => vec![seq(&["push"])],
-        GitAction::Pull => vec![seq(&["pull"])],
-        GitAction::Fetch => vec![seq(&["fetch"])],
+        // `--progress` forces git's progress meters on: they are suppressed
+        // when output is piped, which would hide live feedback entirely.
+        GitAction::Push => vec![seq(&["push", "--progress"])],
+        GitAction::Pull => vec![seq(&["pull", "--progress"])],
+        GitAction::Fetch => vec![seq(&["fetch", "--progress"])],
         GitAction::CheckoutBranch(b) => vec![seq(&["checkout", b])],
         GitAction::Revert(h) => vec![seq(&["revert", "--no-edit", h])],
         GitAction::CreateBranch(n, f) => vec![seq(&["checkout", "-b", n, f])],
@@ -1221,7 +1250,7 @@ mod tests {
     fn placeholder_command_previews_real_invocations() {
         assert_eq!(
             placeholder_command(&GitAction::Pull),
-            "git pull"
+            "git pull --progress"
         );
         // Previews render exactly like real transcript lines: raw
         // space-joined argv, no added quoting.
@@ -1236,7 +1265,7 @@ mod tests {
     fn multi_command_actions_preview_the_full_chain() {
         assert_eq!(
             placeholder_command(&GitAction::CommitAllPush("done".to_string())),
-            "git add -A && git commit -m done && git push"
+            "git add -A && git commit -m done && git push --progress"
         );
         assert_eq!(
             placeholder_command(&GitAction::CommitAll("wip message".to_string())),

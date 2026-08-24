@@ -112,10 +112,28 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
 
     let mut broadcast_rx = app.broadcast.subscribe();
 
+    // Actions execute on a dedicated worker so this select loop never blocks
+    // on a slow git command. While a pull/push runs, streaming log revisions
+    // broadcast through `broadcast_rx` and must reach this very connection
+    // immediately — awaiting dispatch inline here is exactly what froze them
+    // until the command exited. The worker consumes one action at a time to
+    // preserve per-client ordering.
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let worker_app = app.clone();
+    let worker = tokio::spawn(async move {
+        while let Some(text) = action_rx.recv().await {
+            handle_client_text(&worker_app, &text).await;
+        }
+    });
+
     loop {
         tokio::select! {
             incoming = receiver.next() => match incoming {
-                Some(Ok(Message::Text(text))) => handle_client_text(&app, &text).await,
+                Some(Ok(Message::Text(text))) => {
+                    if action_tx.send(text.to_string()).is_err() {
+                        break;
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
             },
@@ -130,6 +148,11 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
             },
         }
     }
+
+    // Closing the channel ends the worker after any in-flight action, so its
+    // transcript still lands in the registry even if the peer vanished.
+    drop(action_tx);
+    let _ = worker.await;
 }
 
 /// Parses and runs one inbound client action; malformed payloads are logged
@@ -242,7 +265,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::encode_client_message;
-    use crate::git::types::{GitAction, GitStatus};
+    use crate::git::types::{GitAction, GitStatus, LogStatus};
     use crate::server::registry::TabRegistry;
     use crate::server::{run_server, AppState};
     use crate::test_support::{
@@ -882,5 +905,73 @@ mod tests {
         let mut second = connect_with_retry(&url).await;
         let after = recv_state(&mut second).await;
         assert_eq!(after.tabs[0].state.current_branch, "main");
+    }
+
+    /// Regression: the issuing connection must see its own action's
+    /// `running` log entry while the command still executes. The handler
+    /// used to await dispatch inline in the per-connection select loop, so
+    /// every streaming frame queued up behind the git command and only
+    /// reached this very client when it exited.
+    #[tokio::test]
+    async fn running_entry_reaches_issuing_client_mid_action() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+
+        // A pre-commit hook makes CommitAll genuinely slow through the
+        // normal dispatch path, without needing a network remote.
+        let hooks = dir.path().join(".git").join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 3\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let url = format!("ws://{addr}/ws");
+        let mut ws = connect_with_retry(&url).await;
+        let _ = recv_state(&mut ws).await;
+
+        ws.send(Message::Text(r#"{"tab":0,"action":{"CommitAll":"slow"}}"#.into()))
+            .await
+            .unwrap();
+
+        // Well inside the hook sleep the placeholder must already be here.
+        // The ceiling tolerates scheduler jitter under suite-wide load; a
+        // longer wait would also pass on the broken code once the action
+        // finished, which is why it must stay below the sleep.
+        tokio::time::timeout(std::time::Duration::from_millis(1500), async {
+            recv_state_until(&mut ws, |s| {
+                s.tabs[0]
+                    .log
+                    .iter()
+                    .any(|e| e.status == LogStatus::Running && e.output.is_empty())
+            })
+            .await
+        })
+        .await
+        .expect("running entry never reached the issuing client mid-action");
+
+        // The command then completes normally and seals the transcript.
+        let finished = recv_state_until(&mut ws, |s| {
+            s.tabs[0]
+                .log
+                .iter()
+                .any(|e| e.status == LogStatus::Success && e.command.contains("commit"))
+        })
+        .await;
+        assert!(finished.tabs[0]
+            .log
+            .iter()
+            .all(|e| e.status != LogStatus::Running));
     }
 }

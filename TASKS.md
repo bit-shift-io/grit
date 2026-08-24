@@ -117,5 +117,8 @@
 - [x] Tests: `streaming_progress_receives_live_output` (push-to-bare emits ≥1 non-empty snapshot while transcript stays intact); existing callers pass `None` (1-2 files)
 - [x] Docs: ARCHITECTURE.md registry section notes the streaming channel; TASKS.md Phase 15 recorded (2 files)
 - [x] Full verification: `cargo check`, `cargo check --features desktop`, `cargo test` all green (125 tests)
+- [x] Realtime fixes after manual testing: `--progress` forced on push/pull/fetch argv (git suppresses progress meters on pipes); stream readers switched from line reads to fixed-size chunks with `\r`→`\n` normalization so `\r`-redrawn progress meters stream live instead of arriving as one blob at exit; preview test expectations updated (1 file)
+- [x] Live-delivery fix: `handle_websocket` awaited dispatch inline in the per-connection select loop, so a client's own slow command blocked draining `broadcast_rx` and every streaming frame arrived at exit. Inbound actions now run on a spawned sequential worker (per-client ordering preserved) while the loop forwards broadcasts; worker drains its queue on disconnect so transcripts still land (1 file: `src/server/websocket.rs`)
+- [x] Regression test `running_entry_reaches_issuing_client_mid_action`: sleeping `pre-commit` hook + CommitAll over WS; the `Running` placeholder must reach the issuing connection well inside the hook sleep, then be sealed by the final transcript (126 tests total) (1 file)
 
 

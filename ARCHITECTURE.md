@@ -130,6 +130,10 @@ ids come from one monotonic allocator and are never reused within a session.
     revises the in-flight `running` entry in place (throttled snapshots,
     150 ms floor) so clients watch slow commands execute, and the final
     transcript still replaces the placeholder via `finish_log_entry`.
+    Delivery stays live because each WebSocket connection dispatches
+    inbound actions on a dedicated sequential worker — the connection
+    loop never blocks on a running git command and keeps forwarding
+    broadcast frames (including to the client that issued the action).
 * **`WebTab`** = `{ id, name, repo_path, state: RepoState, log: Vec<LogEntry> }`
   — the wire format for both WS broadcasts and desktop sync messages.
 * **`WebState.active` is daemon-side truth**: the web client reconciles its
