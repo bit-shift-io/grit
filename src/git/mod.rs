@@ -334,15 +334,13 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
             vec![
                 seq(&["add", "-A"]),
                 seq(&["commit", "-m", m]),
-                seq(&["push", "--progress"]),
+                seq(&["push"]),
             ]
         }
         GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"])],
-        // `--progress` forces git's progress meters on: they are suppressed
-        // when output is piped, which would hide live feedback entirely.
-        GitAction::Push => vec![seq(&["push", "--progress"])],
-        GitAction::Pull => vec![seq(&["pull", "--progress"])],
-        GitAction::Fetch => vec![seq(&["fetch", "--progress"])],
+        GitAction::Push => vec![seq(&["push"])],
+        GitAction::Pull => vec![seq(&["pull"])],
+        GitAction::Fetch => vec![seq(&["fetch"])],
         GitAction::CheckoutBranch(b) => vec![seq(&["checkout", b])],
         GitAction::Revert(h) => vec![seq(&["revert", "--no-edit", h])],
         GitAction::CreateBranch(n, f) => vec![seq(&["checkout", "-b", n, f])],
@@ -1250,7 +1248,7 @@ mod tests {
     fn placeholder_command_previews_real_invocations() {
         assert_eq!(
             placeholder_command(&GitAction::Pull),
-            "git pull --progress"
+            "git pull"
         );
         // Previews render exactly like real transcript lines: raw
         // space-joined argv, no added quoting.
@@ -1265,7 +1263,7 @@ mod tests {
     fn multi_command_actions_preview_the_full_chain() {
         assert_eq!(
             placeholder_command(&GitAction::CommitAllPush("done".to_string())),
-            "git add -A && git commit -m done && git push --progress"
+            "git add -A && git commit -m done && git push"
         );
         assert_eq!(
             placeholder_command(&GitAction::CommitAll("wip message".to_string())),
