@@ -267,6 +267,29 @@ impl TabRegistry {
         });
     }
 
+    /// Revises the output of the in-flight `running` entry `seq` in place
+    /// and re-broadcasts, giving clients streaming feedback while a slow
+    /// command executes. Unknown tabs/seqs and already-finished entries are
+    /// ignored; the authoritative transcript still arrives via
+    /// [`Self::finish_log_entry`].
+    pub fn update_log_output(&self, tab_id: usize, seq: u64, output: String) {
+        self.modify(|current| {
+            let Some(tab) = current.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                return false;
+            };
+            match tab.log.iter_mut().find(|e| e.seq == seq) {
+                Some(entry) if entry.status == crate::git::types::LogStatus::Running => {
+                    if entry.output == output {
+                        return false;
+                    }
+                    entry.output = output;
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
     fn alloc_log_seq(&self) -> u64 {
         self.next_log_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -479,6 +502,46 @@ mod tests {
     fn start_log_entry_for_unknown_tab_returns_none() {
         let registry = TabRegistry::new();
         assert_eq!(registry.start_log_entry(42, "git pull".to_string()), None);
+    }
+
+    #[test]
+    fn update_log_output_revises_only_running_entries() {
+        use crate::git::types::LogStatus;
+
+        let registry =
+            TabRegistry::with_single_tab(4, "r".to_string(), PathBuf::from("/repo/r"));
+        let seq = registry.start_log_entry(4, "git push".to_string()).unwrap();
+
+        registry.update_log_output(4, seq, "Enumerating objects...\n".to_string());
+        let log = &registry.snapshot().tabs[0].log;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].output, "Enumerating objects...\n");
+        assert_eq!(log[0].status, LogStatus::Running);
+
+        // Identical snapshots must not churn the revision counter.
+        let before = registry.revision();
+        registry.update_log_output(4, seq, "Enumerating objects...\n".to_string());
+        assert_eq!(registry.revision(), before);
+
+        // Finishing seals the entry: later updates for that seq are no-ops.
+        let done = crate::git::types::LogEntry {
+            seq: 0,
+            command: "git push".to_string(),
+            output: "done".to_string(),
+            status: LogStatus::Success,
+            started_ms: 0,
+            duration_ms: 5,
+        };
+        registry.finish_log_entry(4, seq, vec![done]);
+        let before = registry.revision();
+        registry.update_log_output(4, seq, "stale".to_string());
+        assert_eq!(registry.revision(), before);
+
+        // Unknown tab or seq likewise change nothing.
+        let before = registry.revision();
+        registry.update_log_output(99, seq, "x".to_string());
+        registry.update_log_output(4, u64::MAX, "x".to_string());
+        assert_eq!(registry.revision(), before);
     }
 
     #[test]

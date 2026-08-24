@@ -25,7 +25,10 @@ all contained in one self-contained executable.
   an Actions dropdown; picking one launches it in a new terminal window
   (interactive menu scripts work; window stays open showing exit status),
   fire-and-forget (spawn + drop, no process tracking)
-- Nuke button: reset the working tree to the remote — runs `git fetch origin` + `git reset --hard origin/<branch>` + `git clean -fdx` in place (no delete, no re-clone)
+- Reclone button: delete the repo directory and `git clone` it back from
+  `origin` (two-press confirm) — recovers from upstream-side changes like a
+  renamed default branch, but discards local branches, stashes, and unpushed
+  work; requires an `origin` remote
 - Open tabs persist across restarts via a shared config file
   (`$XDG_CONFIG_HOME/bitshift/grit/config.json`)
 - Connect-mode: if a Grit daemon is already running on `--port` (e.g. a

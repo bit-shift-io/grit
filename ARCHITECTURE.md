@@ -94,7 +94,7 @@ ids come from one monotonic allocator and are never reused within a session.
 * **`types.rs`**: strictly typed models — `GitStatus`, `FileChange`, `FilePair`,
   `CommitInfo`, `CommitSummary`, `RepoState`, and the `GitAction` enum
   (`Stage`, `Unstage`, `Commit`, `Push`, `Pull`, `CheckoutBranch`, `Revert`,
-  `Nuke`, ...).
+  `Reclone`, ...).
 * **`mod.rs`**: invokes the local `git` CLI via `std::process::Command`
   (`get_repository_status`, `get_file_diff`, `get_file_pair`, `get_commit_summary`,
   `execute_action`), wrapping stderr into structured `GitError`s.
@@ -107,9 +107,12 @@ ids come from one monotonic allocator and are never reused within a session.
   the refresh loop. Watching itself is server-owned only: a single persistent
   `watch_reconciler` task (`src/server/mod.rs`) keeps exactly one recursive
   root watcher alive per unique canonical repository path among the open
-  tabs, spawning and retiring them as tabs are opened or closed through any
-  client (each new watch is followed by a refresh kick). The desktop
-  GUI subscribes to sync broadcasts instead of the filesystem.
+   tabs, spawning and retiring them as tabs are opened or closed through any
+   client (each new watch is followed by a refresh kick). A successful Reclone
+   sends its repo path over a reset channel so the reconciler drops the stale
+   watch (the delete/re-clone cycle invalidated it) and respawns one on the
+   fresh directory. The desktop GUI subscribes to sync broadcasts instead of
+   the filesystem.
 
 ### 3.3 Tab Registry & Shared Persistence (`src/server/registry.rs`, `src/shared_config.rs`)
 * **`TabRegistry`** holds `WebState { active, tabs: Vec<WebTab> }` behind a
@@ -123,6 +126,10 @@ ids come from one monotonic allocator and are never reused within a session.
     after each refresh and skips the broadcast when nothing changed.
   * `next_log_seq` — monotonic sequencer giving every log entry a stable
     order across clients (`append_log`/`finish_log_entry`).
+  * Live streaming: actions run with piped output; `update_log_output`
+    revises the in-flight `running` entry in place (throttled snapshots,
+    150 ms floor) so clients watch slow commands execute, and the final
+    transcript still replaces the placeholder via `finish_log_entry`.
 * **`WebTab`** = `{ id, name, repo_path, state: RepoState, log: Vec<LogEntry> }`
   — the wire format for both WS broadcasts and desktop sync messages.
 * **`WebState.active` is daemon-side truth**: the web client reconciles its
@@ -167,12 +174,12 @@ ids come from one monotonic allocator and are never reused within a session.
   registry): unknown non-empty-path ids are adopted as local `RepoTab`s (and
   auto-selected, hiding any open add-form); missing ids are dropped; known ids merge
   server identity while preserving local UI fields (`commit_message`, `diff`,
-  `nuke_armed`, `error`).
+  `reclone_armed`, `error`).
 * Opening/closing repos calls the same shared ops as the web via `iced::Task`;
   errors surface in the form. Git actions stay local (disk operations).
 * Zero tabs ⇒ the Add Repository form is the active view ("+" button toggles it
   locally). No config is written by the GUI itself.
-* **`components/`**: `header.rs` (branch switcher, push/pull/fetch, nuke),
+* **`components/`**: `header.rs` (branch switcher, push/pull/fetch, reclone),
   `staging.rs`, `diff.rs`, `commit.rs`, `history.rs`, `actions.rs`.
 
 ### 3.6 Project Actions (`src/actions.rs`)

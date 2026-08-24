@@ -51,7 +51,7 @@ pub enum Message {
     Revert(String),
     ShowDiff(String),
     DiffLoaded(String, String),
-    NukePressed,
+    ReclonePressed,
     // Project actions: picking a script launches it immediately.
     /// Dropdown selection fires the launch (fire-and-forget).
     RunScriptSelected(crate::git::types::ScriptEntry),
@@ -73,7 +73,7 @@ pub struct RepoTab {
     repo_state: RepoState,
     commit_message: String,
     diff: Option<String>,
-    nuke_armed: bool,
+    reclone_armed: bool,
     error: Option<String>,
 }
 
@@ -159,7 +159,7 @@ impl GritApp {
                 repo_state: web.state.clone(),
                 commit_message: String::new(),
                 diff: None,
-                nuke_armed: false,
+                reclone_armed: false,
                 error: None,
             });
             newly_adopted = Some(web.id);
@@ -294,17 +294,17 @@ impl GritApp {
                 }
                 Task::none()
             }
-            Message::NukePressed => {
+            Message::ReclonePressed => {
                 let Some(tab) = self.active_repo_mut() else {
                     return Task::none();
                 };
-                if tab.nuke_armed {
-                    tab.nuke_armed = false;
+                if tab.reclone_armed {
+                    tab.reclone_armed = false;
                     let id = tab.id;
                     let repo_path = tab.repo_path.clone();
-                    run_action_on(id, repo_path, GitAction::Nuke)
+                    run_action_on(id, repo_path, GitAction::Reclone)
                 } else {
-                    tab.nuke_armed = true;
+                    tab.reclone_armed = true;
                     Task::none()
                 }
             }
@@ -339,7 +339,7 @@ impl GritApp {
             Message::TabStateUpdated(id, state) => {
                 if let Some(tab) = self.tabs.iter_mut().find(|r| r.id == id) {
                     tab.repo_state = state;
-                    tab.nuke_armed = false;
+                    tab.reclone_armed = false;
                     tab.error = None;
                 }
                 Task::none()
@@ -521,7 +521,7 @@ impl GritApp {
         let error_bar = error_bar(tab.error.as_ref());
 
         let mut view = column![
-            components::header::header(&tab.repo_state, tab.nuke_armed),
+            components::header::header(&tab.repo_state, tab.reclone_armed),
             error_bar,
             components::staging::staging(&tab.repo_state.changes),
             components::diff::diff(&tab.diff),
@@ -994,14 +994,14 @@ mod tests {
     }
 
     #[test]
-    fn nuke_requires_two_presses() {
+    fn reclone_requires_two_presses() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         seed_one(&mut app, dir.path());
-        let _ = app.update(Message::NukePressed);
-        assert!(app.active_repo().unwrap().nuke_armed);
-        let _ = app.update(Message::NukePressed);
-        assert!(!app.active_repo().unwrap().nuke_armed);
+        let _ = app.update(Message::ReclonePressed);
+        assert!(app.active_repo().unwrap().reclone_armed);
+        let _ = app.update(Message::ReclonePressed);
+        assert!(!app.active_repo().unwrap().reclone_armed);
     }
 
     fn script(name: &str) -> crate::git::types::ScriptEntry {
@@ -1038,14 +1038,14 @@ mod tests {
     }
 
     #[test]
-    fn state_update_disarms_nuke() {
+    fn state_update_disarms_reclone() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app_in(dir.path());
         seed_one(&mut app, dir.path());
-        let _ = app.update(Message::NukePressed);
-        assert!(app.active_repo().unwrap().nuke_armed);
+        let _ = app.update(Message::ReclonePressed);
+        assert!(app.active_repo().unwrap().reclone_armed);
         let _ = app.update(Message::TabStateUpdated(0, RepoState::default()));
-        assert!(!app.active_repo().unwrap().nuke_armed);
+        assert!(!app.active_repo().unwrap().reclone_armed);
     }
 
     #[test]

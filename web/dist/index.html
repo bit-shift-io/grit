@@ -16,10 +16,10 @@
         <button id="pull-btn" title="Fetch remote changes and merge them into the current branch">Pull</button>
         <button id="push-btn" title="Push local commits to the remote">Push</button>
         <button id="fetch-btn" title="Download remote changes without merging them">Fetch</button>
-        <button id="nuke-btn" class="danger" title="Discard all local changes and reset the repo to origin">Nuke</button>
+        <button id="reclone-btn" class="danger" title="Delete the repo directory and clone it fresh from origin — local branches, stashes, and unpushed work are lost">Reclone</button>
         <button id="remove-tab-btn" class="danger" title="Remove this tab from Grit (the repository on disk is kept)">Remove</button>
         <select id="script-select" title="Executables discovered in the repo root, scripts/, and tools/" style="display: none;"></select>
-        <button id="run-script-btn" title="Launch the selected script detached; Grit does not track it afterwards" style="display: none;">Run Script</button>
+        <button id="run-script-btn" title="Launch the selected script detached; Grit does not track it afterwards" style="display: none;">Run</button>
         <button id="clear-log-btn" type="button" title="Hide everything logged so far; new commands still appear">Clear Log</button>
       </div>
     </div>
@@ -56,7 +56,7 @@
       </div>
     </section>
     <section id="repo-view" class="section" style="display: none;">
-      <h2 class="section-title">Changes <span class="arrow">&#9662;</span></h2>
+      <h2 class="section-title"><span>Changes <span id="overview" class="muted"></span></span><span class="arrow">&#9662;</span></h2>
       <div class="section-body">
         <div class="commit-bar">
           <input id="commit-msg" type="text" placeholder="Commit message">
@@ -65,7 +65,6 @@
           <button id="commit-btn" title="Commit staged changes locally">Commit</button>
           <button id="discard-all-btn" class="danger" title="Discard all uncommitted changes">Discard All</button>
         </div>
-        <div id="overview" class="muted"></div>
         <div id="changes"></div>
       </div>
     </section>

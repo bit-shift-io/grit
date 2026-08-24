@@ -929,10 +929,10 @@ function renderSideBySide(original, current) {
 
 //#region Action wiring (buttons + delegated listeners)
 
-const nukeBtn = document.getElementById("nuke-btn");
-nukeBtn.onclick = () => {
-  if (confirm("Nuke this repo? All local changes will be discarded and the repo reset to origin.")) {
-    sendAction("Nuke");
+const recloneBtn = document.getElementById("reclone-btn");
+recloneBtn.onclick = () => {
+  if (confirm("Reclone this repo? The directory will be DELETED and cloned fresh from origin.\n\nAll local branches, stashes, tags, and unpushed commits will be lost.")) {
+    sendAction("Reclone");
   }
 };
 

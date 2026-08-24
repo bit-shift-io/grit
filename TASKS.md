@@ -97,4 +97,25 @@
 - [x] Named consts in `src/ui/state.rs`: mpsc `channel(100)` ×2, window size 960×680 (1 file)
 - [x] Named consts in `src/actions.rs`: `/proc` ancestor-walk cap `0..16`, ENOEXEC `raw_os_error() == Some(8)` (1 file)
 
+## Phase 14 — Reclone Action (Nuke Repurposed)
+
+- [x] Rename `GitAction::Nuke` → `GitAction::Reclone` in `src/git/types.rs`; update the JSON round-trip test (1 file)
+- [x] Replace `nuke_repo` with `reclone_repo` in `src/git/mod.rs`: capture `git remote get-url origin` first (refuse without a remote), require `.git` to exist, `remove_dir_all`, then `git clone <url> <path>`; log a synthetic `rm -rf` entry; update `placeholder_command`; tests: reclone adopts remote branch layout (stray branch/dirty/untracked all vanish) + refuses repos without origin, leaving them untouched (1 file)
+- [x] Watcher reset plumbing: `AppState.watcher_resets` channel; `boot()` hands the receiver to `watch_reconciler`, which drops the stale watch on reset so it respawns over the fresh clone; `dispatch_and_refresh` sends the reset after a successful Reclone (2 files: `src/server/mod.rs`, `src/server/websocket.rs`)
+- [x] Integration test `reclone_respawns_the_filesystem_watcher`: full daemon boot, watcher proven live pre-reclone, Reclone over WS, post-reclone filesystem change must still broadcast (1 file: `src/server/mod.rs`)
+- [x] Desktop UI renames: `Message::ReclonePressed`, `RepoTab.reclone_armed`, header button "Reclone"/"Confirm Reclone?" with `reclone_style` (2 files: `src/ui/state.rs`, `src/ui/components/header.rs`)
+- [x] Web UI: `#reclone-btn` in `web/dist/index.html` with destructive tooltip; `web/dist/app.js` confirm dialog spelling out data loss, sends `{ "Reclone": null }` over the wire (2 files)
+- [x] Docs: README Reclone wording (delete + fresh clone, data-loss caveat); ARCHITECTURE.md GitAction list, `reclone_armed` field, header description, and watch_reconciler reset-channel note (3 files)
+- [x] Full verification: `cargo check` and `cargo check --features desktop` zero warnings, `cargo test` green including 3 new reclone tests (no command)
+
+## Phase 15 — Live Streaming Log Output
+
+- [x] Changes-heading font fix: `#overview` moved into the section `<h2>` keeps its muted grey but must not inherit the heading's bold weight (`web/dist/style.css`: `.section-title .muted { font-weight: normal; }`) (1 file)
+- [x] Streaming git runner in `src/git/mod.rs`: `ProgressSink` type + thread-local installed by `execute_action_logged(..., progress)`; `run_streamed()` pipes stdout/stderr through per-stream reader threads appending to shared buffers, pushing combined-output snapshots on first content then at most every 150 ms (`STREAM_FLUSH_INTERVAL`); final transcript byte-shape unchanged vs the blocking path; plain `Command::output()` used when no sink is installed (1 file)
+- [x] Registry live-update API: `TabRegistry::update_log_output(tab_id, seq, output)` revises only `Running` entries, skips no-op snapshots, ignores unknown tab/seq, rides existing `modify()` broadcast path; unit test covers revise/no-op/sealed/unknown cases (1 file)
+- [x] Dispatcher wiring: `dispatch_and_refresh` builds the sink from the placeholder's seq and passes it into `execute_action_logged`; streaming snapshots now reach every client mid-command (1 file)
+- [x] Tests: `streaming_progress_receives_live_output` (push-to-bare emits ≥1 non-empty snapshot while transcript stays intact); existing callers pass `None` (1-2 files)
+- [x] Docs: ARCHITECTURE.md registry section notes the streaming channel; TASKS.md Phase 15 recorded (2 files)
+- [x] Full verification: `cargo check`, `cargo check --features desktop`, `cargo test` all green (125 tests)
+
 

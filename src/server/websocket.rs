@@ -185,14 +185,33 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
 
     // Broadcast a `running` entry up front so every client sees the command
     // was entered even while a slow pull/push is still in flight.
-    let placeholder = crate::git::placeholder_command(&msg.action);
+    let action = msg.action;
+    let placeholder = crate::git::placeholder_command(&action);
     let log_seq = app.registry.start_log_entry(tab_id, placeholder);
 
-    let result =
-        tokio::task::spawn_blocking(move || crate::git::execute_action_logged(&repo_path, msg.action))
-            .await;
+    // Reclone deletes and re-creates the repository directory, invalidating
+    // every registered filesystem watch; the daemon must respawn it.
+    let needs_watcher_reset = matches!(action, crate::git::types::GitAction::Reclone);
+    let reset_path = repo_path.clone();
+    // Live feedback: while the action runs, streaming snapshots revise the
+    // placeholder entry's output in place so clients watch progress.
+    let progress: Option<crate::git::ProgressSink> = log_seq.map(|seq| {
+        let app = app.clone();
+        let sink: crate::git::ProgressSink = std::sync::Arc::new(move |snapshot: String| {
+            app.registry.update_log_output(tab_id, seq, snapshot);
+        });
+        sink
+    });
+    let result = tokio::task::spawn_blocking(move || {
+        crate::git::execute_action_logged(&repo_path, action, progress)
+    })
+    .await;
     match &result {
-        Ok((Ok(()), _)) => {}
+        Ok((Ok(()), _)) => {
+            if needs_watcher_reset {
+                let _ = app.watcher_resets.send(reset_path);
+            }
+        }
         Ok((Err(e), _)) => tracing::error!("action failed: {e}"),
         Err(e) => tracing::error!("action task panicked: {e}"),
     }

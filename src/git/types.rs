@@ -170,7 +170,7 @@ pub enum GitAction {
     CreateTag(String, String),
     DeleteTag(String),
     DeleteBranch(String),
-    Nuke,
+    Reclone,
     NewTab(String),
     CloseTab,
     /// Launch a discovered executable by repo-relative path (fire-and-forget).
@@ -251,7 +251,7 @@ mod tests {
             GitAction::CreateTag("v1.0".to_string(), "deadbeef".to_string()),
             GitAction::DeleteTag("v1.0".to_string()),
             GitAction::DeleteBranch("feature".to_string()),
-            GitAction::Nuke,
+            GitAction::Reclone,
             GitAction::NewTab(r#"{"name":"new","path":""}"#.to_string()),
             GitAction::CloseTab,
             GitAction::RunScript("scripts/deploy.sh".to_string()),

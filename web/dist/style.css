@@ -12,6 +12,7 @@ body { margin: 0; padding: 1rem; }
   z-index: 10;
 }
 .muted { color: var(--muted, #888); }
+.section-title .muted { font-weight: normal; }
 
 .section { margin-top: 1rem; }
 .section-title {

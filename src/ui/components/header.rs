@@ -6,11 +6,11 @@ use iced::{Element, Length};
 use crate::git::types::RepoState;
 use crate::ui::state::Message;
 
-pub fn header(repo_state: &RepoState, nuke_armed: bool) -> Element<'_, Message> {
-    let nuke_label = if nuke_armed {
-        "Confirm Nuke?"
+pub fn header(repo_state: &RepoState, reclone_armed: bool) -> Element<'_, Message> {
+    let reclone_label = if reclone_armed {
+        "Confirm Reclone?"
     } else {
-        "Nuke"
+        "Reclone"
     };
     row![
         text("Grit").size(22),
@@ -21,14 +21,16 @@ pub fn header(repo_state: &RepoState, nuke_armed: bool) -> Element<'_, Message> 
         ),
         button("Push").on_press(Message::PushPressed),
         button("Pull").on_press(Message::PullPressed),
-        button(nuke_label).on_press(Message::NukePressed).style(nuke_style),
+        button(reclone_label)
+            .on_press(Message::ReclonePressed)
+            .style(reclone_style),
     ]
     .spacing(10)
     .width(Length::Fill)
     .into()
 }
 
-fn nuke_style(
+fn reclone_style(
     theme: &iced::Theme,
     status: iced::widget::button::Status,
 ) -> iced::widget::button::Style {

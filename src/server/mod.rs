@@ -32,12 +32,32 @@ const LISTEN_BACKLOG: u32 = 1024;
 pub struct AppState {
     pub registry: TabRegistry,
     pub broadcast: broadcast::Sender<WebState>,
+    /// Repo paths whose filesystem watchers must be dropped and respawned,
+    /// sent after a Reclone replaces the directory on disk. The receiving
+    /// end is owned by `watch_reconciler` when booted through [`boot`];
+    /// sending into a dropped receiver is a harmless no-op.
+    watcher_resets: mpsc::UnboundedSender<PathBuf>,
 }
 
 impl AppState {
+    /// Test constructor; watcher resets are a daemon concern and simply go
+    /// nowhere here. Production paths go through [`boot`] / `with_watcher_resets`.
+    #[cfg(any(test, feature = "desktop"))]
+    #[allow(dead_code)]
     pub fn new(registry: TabRegistry) -> Self {
+        Self::with_watcher_resets(registry, mpsc::unbounded_channel().0)
+    }
+
+    pub(crate) fn with_watcher_resets(
+        registry: TabRegistry,
+        watcher_resets: mpsc::UnboundedSender<PathBuf>,
+    ) -> Self {
         let (broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Self { registry, broadcast }
+        Self {
+            registry,
+            broadcast,
+            watcher_resets,
+        }
     }
 }
 
@@ -339,8 +359,14 @@ pub fn run_server(
 /// closed through any client (web UI, desktop GUI, or config restore).
 ///
 /// Watchers cannot be one-shot at boot: tabs opened later would otherwise
-/// never stream filesystem updates to connected clients.
-async fn watch_reconciler(app: AppState, refresh_tx: mpsc::UnboundedSender<()>) {
+/// never stream filesystem updates to connected clients. Reset requests
+/// (e.g. after Reclone deleted and re-created a repository) drop the old
+/// watcher so the next pass respawns one on the new directory inodes.
+async fn watch_reconciler(
+    app: AppState,
+    refresh_tx: mpsc::UnboundedSender<()>,
+    mut reset_rx: mpsc::UnboundedReceiver<PathBuf>,
+) {
     let mut watchers: std::collections::HashMap<PathBuf, notify::RecommendedWatcher> =
         std::collections::HashMap::new();
     let mut registry_rx = app.registry.subscribe();
@@ -384,15 +410,27 @@ async fn watch_reconciler(app: AppState, refresh_tx: mpsc::UnboundedSender<()>) 
             }
         }
 
-        if registry_rx.changed().await.is_err() {
-            break;
+        tokio::select! {
+            changed = registry_rx.changed() => {
+                if changed.is_err() {
+                    // Registry senders are gone; nothing can change anymore.
+                    break;
+                }
+            }
+            Some(reset) = reset_rx.recv() => {
+                let key = std::fs::canonicalize(&reset).unwrap_or(reset);
+                // Drop the stale watch; the loop above respawns it because
+                // the canonical path is still in `wanted`.
+                watchers.remove(&key);
+            }
         }
     }
 }
 
 /// Boots shared daemon infrastructure: app state, watchers, and initial refresh.
 pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<()>) {
-    let app = AppState::new(registry);
+    let (reset_tx, reset_rx) = mpsc::unbounded_channel::<PathBuf>();
+    let app = AppState::with_watcher_resets(registry, reset_tx);
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
 
     // Restore tabs from persistent storage only if registry is empty.
@@ -409,7 +447,7 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
 
     // One watcher per open repository, kept in sync with the registry for
     // the lifetime of the process.
-    tokio::spawn(watch_reconciler(app.clone(), refresh_tx.clone()));
+    tokio::spawn(watch_reconciler(app.clone(), refresh_tx.clone(), reset_rx));
 
     // Persist tabs on registry changes.
     let mut persist_rx = app.registry.subscribe();
@@ -509,7 +547,7 @@ mod tests {
     use super::*;
     use crate::server::registry::TabRegistry;
     use crate::test_support::{
-        app_for, connect_with_retry, init_repo, recv_state, recv_state_until,
+        app_for, commit_all, connect_with_retry, init_repo, recv_state, recv_state_until,
     };
 
     #[test]
@@ -1020,6 +1058,105 @@ mod tests {
                 }
                 Ok(None) => break,
                 _ => {}
+            }
+        }
+    }
+
+    /// Reclone deletes and re-creates the repository directory, so the
+    /// daemon must drop the stale watch and respawn one over the fresh
+    /// clone — otherwise the tab silently stops streaming updates.
+    #[tokio::test]
+    async fn reclone_respawns_the_filesystem_watcher() {
+        // Isolate config persistence so the test never touches the real
+        // user configuration file.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
+
+        // Bare origin seeded with one commit, then a working clone of it.
+        let origin = tempfile::tempdir().unwrap();
+        let bare = origin.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        let seed = tempfile::tempdir().unwrap();
+        init_repo(&seed.path().to_path_buf());
+        std::fs::write(seed.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(&seed.path().to_path_buf(), "seed");
+        std::process::Command::new("git")
+            .args(["push", "-q", bare.to_str().unwrap(), "main"])
+            .current_dir(seed.path())
+            .output()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path_string = dir.path().display().to_string();
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = TabRegistry::with_single_tab(0, "repo".to_string(), dir.path().to_path_buf());
+        let (app, refresh_rx) = boot(registry).await;
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        recv_state_until(&mut ws, |s| {
+            !s.tabs.is_empty() && s.tabs[0].state.current_branch == "main"
+        })
+        .await;
+
+        // Prove the original watcher is alive before pulling the ground out.
+        std::fs::write(dir.path().join("junk.txt"), "junk").unwrap();
+        recv_state_until(&mut ws, |s| {
+            !s.tabs.is_empty()
+                && s.tabs[0]
+                    .state
+                    .changes
+                    .iter()
+                    .any(|c| c.path == "junk.txt")
+        })
+        .await;
+
+        ws.send(Message::Text(r#"{"tab":0,"action":"Reclone"}"#.into()))
+            .await
+            .unwrap();
+
+        // The clean frame can only follow the delete + fresh clone; the
+        // pre-reclone dirty state above rules out a stale broadcast match.
+        recv_state_until(&mut ws, |s| {
+            !s.tabs.is_empty() && s.tabs[0].state.changes.is_empty()
+        })
+        .await;
+
+        // The decisive assertion: filesystem events must still arrive after
+        // the directory was replaced. Re-write until observed because the
+        // watcher respawn races the clone finishing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem change after Reclone was never broadcast: watcher was not respawned"
+            );
+            std::fs::write(dir.path().join("late.txt"), "data").unwrap();
+            let pred = |s: &WebState| {
+                s.tabs.iter().any(|t| {
+                    t.repo_path == repo_path_string
+                        && t.state.changes.iter().any(|c| c.path == "late.txt")
+                })
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                recv_state_until(&mut ws, pred),
+            )
+            .await
+            {
+                Ok(_) => break,
+                Err(_) => continue,
             }
         }
     }

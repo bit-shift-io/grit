@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitError {
@@ -114,13 +114,139 @@ fn git_command(repo_path: &Path) -> Command {
     cmd
 }
 
+/// Minimum interval between live progress snapshots pushed to the sink, so
+/// chatty commands (clone, push) cannot flood clients with broadcasts.
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Callback receiving a snapshot of a command's combined output while it
+/// runs. Installed by [`execute_action_logged`] and consumed by the daemon
+/// to revise the in-flight log entry in place.
+pub type ProgressSink = std::sync::Arc<dyn Fn(String) + Send + Sync>;
+
+thread_local! {
+    /// Set together with `RECORDING` by [`execute_action_logged`]; when
+    /// present, commands run through piped streaming and push throttled
+    /// output snapshots to the sink as they execute.
+    static PROGRESS: RefCell<Option<ProgressSink>> = const { RefCell::new(None) };
+}
+
+/// Joins both streams terminal-style for transcripts and live snapshots:
+/// stdout first, errors last, empty streams omitted.
+fn combine_streams(stdout: &str, stderr: &str) -> String {
+    let mut combined = String::new();
+    if !stdout.trim().is_empty() {
+        combined.push_str(stdout.trim_end());
+    }
+    if !stderr.trim().is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(stderr.trim_end());
+    }
+    combined
+}
+
+fn notify_progress(sink: &ProgressSink, snapshot: String) {
+    sink(truncate_output(snapshot));
+}
+
+/// Runs `cmd` with piped stdout/stderr, feeding throttled snapshots of the
+/// combined output to `sink` while it executes. Returns the full contents
+/// of each stream plus the exit success flag; the final transcript keeps
+/// the exact shape the blocking path produces.
+fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(String, String, bool)> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::sync::Mutex;
+
+    /// Appends one output line to its stream buffer and pushes a live
+    /// snapshot on first content, then at most once per flush interval.
+    fn flush_line(
+        buffers: &Mutex<(String, String, Option<Instant>)>,
+        is_stdout: bool,
+        line: String,
+        sink: &ProgressSink,
+    ) {
+        let mut guard = match buffers.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (stdout, stderr, last_flush) = &mut *guard;
+        if is_stdout {
+            stdout.push_str(&line);
+            stdout.push('\n');
+        } else {
+            stderr.push_str(&line);
+            stderr.push('\n');
+        }
+        let due = last_flush.map_or(true, |t| t.elapsed() >= STREAM_FLUSH_INTERVAL);
+        if due {
+            *last_flush = Some(Instant::now());
+            let snapshot = combine_streams(stdout, stderr);
+            drop(guard);
+            notify_progress(sink, snapshot);
+        }
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+
+    type Buffers = Mutex<(String, String, Option<Instant>)>;
+    let buffers: std::sync::Arc<Buffers> = std::sync::Arc::new(Mutex::default());
+
+    let stdout_pipe = child.stdout.take().expect("child stdout was piped");
+    let stderr_pipe = child.stderr.take().expect("child stderr was piped");
+    let out_reader = std::thread::spawn({
+        let buffers = std::sync::Arc::clone(&buffers);
+        let sink = std::sync::Arc::clone(sink);
+        move || {
+            for line in BufReader::new(stdout_pipe).lines().map_while(Result::ok) {
+                flush_line(&buffers, true, line, &sink);
+            }
+        }
+    });
+    let err_reader = std::thread::spawn({
+        let buffers = std::sync::Arc::clone(&buffers);
+        let sink = std::sync::Arc::clone(sink);
+        move || {
+            for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
+                flush_line(&buffers, false, line, &sink);
+            }
+        }
+    });
+
+    // Readers own their pipe handles; once both finish the child is done.
+    let _ = out_reader.join();
+    let _ = err_reader.join();
+    let status = child.wait()?;
+    let contents = std::sync::Arc::try_unwrap(buffers)
+        .ok()
+        .and_then(|mutex| mutex.into_inner().ok())
+        .unwrap_or_default();
+    let (stdout, stderr, _) = contents;
+    Ok((stdout, stderr, status.success()))
+}
+
 fn run(cmd: &mut Command) -> Result<String, GitError> {
     let command_line = describe_command(cmd);
     let started_ms = epoch_millis();
     let started = Instant::now();
 
-    let output = match cmd.output() {
-        Ok(output) => output,
+    let progress = PROGRESS.with(|p| p.borrow().clone());
+    // Captured (stdout, stderr, exit success); piped + streaming whenever
+    // a progress sink is installed, plain blocking capture otherwise.
+    let captured: std::io::Result<(String, String, bool)> = match progress.as_ref() {
+        Some(sink) => run_streamed(cmd, sink),
+        None => cmd.output().map(|o| {
+            (
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                o.status.success(),
+            )
+        }),
+    };
+    let (stdout, stderr, success) = match captured {
+        Ok(parts) => parts,
         Err(e) => {
             record_synthetic(
                 &command_line,
@@ -134,24 +260,12 @@ fn run(cmd: &mut Command) -> Result<String, GitError> {
             });
         }
     };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // Terminal-like transcript: both streams verbatim, errors last.
-    let mut combined = String::new();
-    if !stdout.trim().is_empty() {
-        combined.push_str(stdout.trim_end());
-    }
-    if !stderr.trim().is_empty() {
-        if !combined.is_empty() {
-            combined.push('\n');
-        }
-        combined.push_str(stderr.trim_end());
-    }
+    let combined = combine_streams(&stdout, &stderr);
 
-    let status = if output.status.success() {
+    let status = if success {
         LogStatus::Success
     } else {
         LogStatus::Failed
@@ -165,7 +279,7 @@ fn run(cmd: &mut Command) -> Result<String, GitError> {
         duration_ms,
     });
 
-    if output.status.success() {
+    if success {
         Ok(stdout)
     } else {
         Err(GitError {
@@ -180,8 +294,8 @@ fn run(cmd: &mut Command) -> Result<String, GitError> {
 /// of truth for both execution (`execute_action`) and its shell-style
 /// preview (`placeholder_command`), so they cannot drift apart.
 ///
-/// Returns `None` for actions with bespoke execution (Nuke's remote
-/// fallback, RunScript's terminal launch) or no server-side effect
+/// Returns `None` for actions with bespoke execution (Reclone's
+/// delete-and-clone flow, RunScript's terminal launch) or no server-side effect
 /// (NewTab/CloseTab).
 fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
     fn seq(items: &[&str]) -> Vec<String> {
@@ -206,7 +320,10 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::CreateTag(n, t) => vec![seq(&["tag", n, t])],
         GitAction::DeleteTag(n) => vec![seq(&["tag", "-d", n])],
         GitAction::DeleteBranch(n) => vec![seq(&["branch", "-d", n])],
-        GitAction::Nuke | GitAction::RunScript(_) | GitAction::NewTab(_) | GitAction::CloseTab => {
+        GitAction::Reclone
+            | GitAction::RunScript(_)
+            | GitAction::NewTab(_)
+            | GitAction::CloseTab => {
             return None;
         }
     };
@@ -229,8 +346,9 @@ pub fn placeholder_command(action: &GitAction) -> String {
             .join(" && ");
     }
     match action {
-        GitAction::Nuke => {
-            "git fetch origin && git reset --hard origin/<branch> && git clean -fdx".to_string()
+        GitAction::Reclone => {
+            "git remote get-url origin && rm -rf <repo> && git clone <origin-url> <repo>"
+                .to_string()
         }
         GitAction::RunScript(rel_path) => format!("./{rel_path}"),
         // Unreachable in practice: every other variant is table-backed
@@ -591,7 +709,7 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         return Ok(());
     }
     match action {
-        GitAction::Nuke => nuke_repo(repo_path)?,
+        GitAction::Reclone => reclone_repo(repo_path)?,
         GitAction::RunScript(rel_path) => {
             match crate::actions::launch(repo_path, &rel_path) {
                 Ok(()) => record_synthetic(
@@ -620,44 +738,64 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
 /// output. Returns the action result plus the transcript in execution
 /// order; entries are produced even when the action fails mid-way.
 /// Must be called from a single thread (it uses a thread-local buffer).
+///
+/// When `progress` is given, every command runs with piped streaming and
+/// pushes throttled snapshots of its combined output to the sink while it
+/// executes, giving clients live feedback for slow network operations.
 pub fn execute_action_logged(
     repo_path: &Path,
     action: GitAction,
+    progress: Option<ProgressSink>,
 ) -> (Result<(), GitError>, Vec<LogEntry>) {
     RECORDING.with(|r| r.set(true));
+    PROGRESS.with(|p| *p.borrow_mut() = progress);
     PENDING_LOG.with(|p| p.borrow_mut().clear());
     let result = execute_action(repo_path, action);
     let log = PENDING_LOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    PROGRESS.with(|p| *p.borrow_mut() = None);
     RECORDING.with(|r| r.set(false));
     (result, log)
 }
 
-fn nuke_repo(repo_path: &Path) -> Result<(), GitError> {
-    let branch = get_current_branch(repo_path)?;
-
-    let fetched = run(git_command(repo_path).args(["fetch", "origin"]));
-    match fetched {
-        Ok(_) => {
-            run(git_command(repo_path).args([
-                "reset",
-                "--hard",
-                &format!("origin/{branch}"),
-            ]))?;
-        }
-        Err(e) => {
-            let missing_remote = e.stderr.contains("does not appear to be a git repository")
-                || e.stderr.contains("Could not read from remote")
-                || e.stderr.contains("No such remote")
-                || e.stderr.contains("Could not resolve host");
-            if missing_remote {
-                run(git_command(repo_path).args(["reset", "--hard", "HEAD"]))?;
-            } else {
-                return Err(e);
-            }
-        }
+/// Deletes the repository directory and clones it back from `origin`.
+///
+/// The heavy-handed escape hatch for upstream-side surgery such as a
+/// renamed default branch: a fresh clone adopts the remote's new branch
+/// layout and tracking config wholesale. Safety rails:
+///
+/// * the origin URL is captured *before* anything is deleted, so a
+///   repository without an `origin` remote is never touched;
+/// * the path must contain `.git`, guarding against stale tab state.
+///
+/// Note this discards far more than a working-tree reset: local-only
+/// branches, stashes, unpushed commits, tags, and `.git/config` edits are
+/// all lost. Callers must restart any filesystem watcher afterwards — the
+/// delete/re-clone cycle invalidates every registered watch.
+fn reclone_repo(repo_path: &Path) -> Result<(), GitError> {
+    if !repo_path.join(".git").exists() {
+        return Err(GitError {
+            message: format!("not a git repository: {}", repo_path.display()),
+            stderr: String::new(),
+            stdout: String::new(),
+        });
     }
 
-    run(git_command(repo_path).args(["clean", "-fdx"]))?;
+    let url = run(git_command(repo_path).args(["remote", "get-url", "origin"]))?
+        .trim()
+        .to_string();
+
+    std::fs::remove_dir_all(repo_path).map_err(|e| GitError {
+        message: format!("failed to delete {}: {e}", repo_path.display()),
+        stderr: String::new(),
+        stdout: String::new(),
+    })?;
+    record_synthetic(
+        &format!("rm -rf {}", repo_path.display()),
+        "repository deleted for fresh clone",
+        LogStatus::Success,
+    );
+
+    run(Command::new("git").arg("clone").arg(&url).arg(repo_path))?;
     Ok(())
 }
 
@@ -963,8 +1101,11 @@ mod tests {
         fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
         commit_all(dir.path(), "initial");
 
-        let (result, log) =
-            execute_action_logged(dir.path(), GitAction::Stage("file.txt".to_string()));
+        let (result, log) = execute_action_logged(
+            dir.path(),
+            GitAction::Stage("file.txt".to_string()),
+            None,
+        );
         assert!(result.is_ok());
         assert_eq!(log.len(), 1, "got: {log:?}");
         assert_eq!(log[0].command, "git add -- file.txt");
@@ -978,8 +1119,11 @@ mod tests {
         fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
 
         // CommitAllPush runs add + commit (+ push); push fails with no remote.
-        let (result, log) =
-            execute_action_logged(dir.path(), GitAction::CommitAllPush("ship".to_string()));
+        let (result, log) = execute_action_logged(
+            dir.path(),
+            GitAction::CommitAllPush("ship".to_string()),
+            None,
+        );
         assert!(result.is_err());
         let commands: Vec<&str> = log.iter().map(|e| e.command.as_str()).collect();
         assert!(
@@ -1002,12 +1146,68 @@ mod tests {
     }
 
     #[test]
+    fn streaming_progress_receives_live_output() {
+        use std::sync::{Arc, Mutex};
+        // Bare origin so the push inside CommitAllPush succeeds and emits
+        // real stderr output ("Enumerating objects", "main -> main", ...).
+        let origin = tempfile::tempdir().unwrap();
+        let bare = origin.path().join("origin.git");
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+
+        let snapshots: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&snapshots);
+        let sink: ProgressSink = Arc::new(move |snapshot| {
+            collector.lock().unwrap().push(snapshot);
+        });
+
+        let (result, log) =
+            execute_action_logged(dir.path(), GitAction::CommitAllPush("ship".into()), Some(sink));
+        assert!(result.is_ok());
+
+        let got = snapshots.lock().unwrap();
+        assert!(
+            !got.is_empty(),
+            "streamed commands must push at least one live snapshot"
+        );
+        assert!(
+            got.iter().any(|s| !s.is_empty()),
+            "snapshots must carry command output: {got:?}"
+        );
+
+        // The authoritative transcript is unaffected by streaming.
+        assert_eq!(log.len(), 3, "add + commit + push: {log:?}");
+        assert!(log.iter().all(|e| e.status == LogStatus::Success));
+    }
+
+    #[test]
     fn failed_commit_log_carries_git_stderr() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
 
         let (_, log) =
-            execute_action_logged(dir.path(), GitAction::Commit("empty".to_string()));
+            execute_action_logged(dir.path(), GitAction::Commit("empty".to_string()), None);
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].status, LogStatus::Failed);
         assert!(
@@ -1348,52 +1548,70 @@ mod tests {
     }
 
     #[test]
-    fn nuke_discards_all_local_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
-        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
-        fs::write(dir.path().join("other.txt"), "other\n").unwrap();
-        commit_all(dir.path(), "initial");
-        fs::write(dir.path().join("file.txt"), "local edit\n").unwrap();
-        fs::write(dir.path().join("untracked.txt"), "junk\n").unwrap();
-        execute_action(dir.path(), GitAction::Stage("file.txt".to_string())).unwrap();
-
-        execute_action(dir.path(), GitAction::Nuke).unwrap();
-
-        let state = get_repository_status(dir.path()).unwrap();
-        assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
-        assert_eq!(fs::read_to_string(dir.path().join("file.txt")).unwrap(), "hello\n");
-        assert!(!dir.path().join("untracked.txt").exists());
-    }
-
-    #[test]
-    fn nuke_resets_to_remote_origin() {
+    fn reclone_adopts_remote_branch_layout() {
         let origin = tempfile::tempdir().unwrap();
-        init_repo(origin.path());
-        fs::write(origin.path().join("a.txt"), "v1\n").unwrap();
-        commit_all(origin.path(), "initial");
-        fs::write(origin.path().join("a.txt"), "v2\n").unwrap();
-        commit_all(origin.path(), "second");
+        let bare = origin.path().join("origin.git");
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+
+        let seed = tempfile::tempdir().unwrap();
+        init_repo(seed.path());
+        fs::write(seed.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(seed.path(), "seed");
+        OsCommand::new("git")
+            .args(["push", "-q", bare.to_str().unwrap(), "main"])
+            .current_dir(seed.path())
+            .output()
+            .unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         OsCommand::new("git")
-            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .args(["clone", "-q", bare.to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        // Local drift that must vanish: a stray branch, a dirty edit,
+        // and an untracked file.
+        OsCommand::new("git")
+            .args(["checkout", "-q", "-b", "stray-branch"])
             .current_dir(dir.path())
             .output()
             .unwrap();
         fs::write(dir.path().join("a.txt"), "local hack\n").unwrap();
-        fs::write(dir.path().join("local.txt"), "junk\n").unwrap();
-        execute_action(dir.path(), GitAction::Stage("a.txt".to_string())).unwrap();
+        fs::write(dir.path().join("junk.txt"), "junk\n").unwrap();
 
-        execute_action(dir.path(), GitAction::Nuke).unwrap();
+        execute_action(dir.path(), GitAction::Reclone).unwrap();
 
         let state = get_repository_status(dir.path()).unwrap();
         assert!(state.changes.is_empty(), "got changes: {:?}", state.changes);
+        assert_eq!(state.current_branch, "main");
+        assert_eq!(state.branches, vec!["main".to_string()]);
         assert_eq!(
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "v2\n",
-            "working tree should match remote HEAD"
+            "v1\n",
+            "working tree should match the fresh clone"
         );
-        assert!(!dir.path().join("local.txt").exists());
+        assert!(!dir.path().join("junk.txt").exists());
+    }
+
+    #[test]
+    fn reclone_refuses_repo_without_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("file.txt"), "precious\n").unwrap();
+        commit_all(dir.path(), "initial");
+
+        assert!(execute_action(dir.path(), GitAction::Reclone).is_err());
+
+        // Nothing may be deleted when no origin URL could be captured.
+        assert!(dir.path().join(".git").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "precious\n"
+        );
     }
 }
