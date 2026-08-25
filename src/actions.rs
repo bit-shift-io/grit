@@ -145,13 +145,10 @@ fn terminal_disabled() -> bool {
     std::env::var_os("GRIT_NO_TERMINAL").is_some()
 }
 
-/// Shell snippet that runs the script, reports its exit status, and keeps
-/// the window open until Enter — so errors and post-run output are visible.
+/// Shell snippet that runs the script.
 fn keep_open_payload(script: &Path) -> String {
     let script = script.display();
-    format!(
-        "\"{script}\"; status=$?; echo; echo \"[exit $status] Press Enter to close\"; read _"
-    )
+    format!("\"{script}\"")
 }
 
 /// Locates a program on `PATH` without shelling out.
@@ -473,7 +470,7 @@ fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Ch
     // Terminal.app starts in $HOME, so cd explicitly. Escape for the
     // AppleScript string literal.
     let inner = format!(
-        "cd '{}'; {}; status=$?; echo; echo \"[exit $status] Press Enter to close\"; read _",
+        "cd '{}'; {}",
         cwd.display(),
         script.display()
     );
@@ -490,9 +487,9 @@ fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Ch
 fn spawn_terminal(script: &Path, cwd: &Path) -> std::io::Result<std::process::Child> {
     use std::process::Command;
 
-    // `start` opens a new console window; `/K` keeps it open afterwards.
+    // `start` opens a new console window; `/C` closes it afterwards.
     Command::new("cmd")
-        .args(["/C", "start", "", "cmd", "/K"])
+        .args(["/C", "start", "", "cmd", "/C"])
         .arg(script)
         .current_dir(cwd)
         .spawn()
@@ -630,11 +627,9 @@ mod tests {
     }
 
     #[test]
-    fn keep_open_payload_reports_status_and_waits() {
+    fn keep_open_payload_runs_script() {
         let payload = keep_open_payload(Path::new("/repo/scripts/menu.sh"));
-        assert!(payload.contains("\"/repo/scripts/menu.sh\""));
-        assert!(payload.contains("status=$?"));
-        assert!(payload.ends_with("read _"));
+        assert_eq!(payload, "\"/repo/scripts/menu.sh\"");
     }
 
     #[cfg(unix)]
