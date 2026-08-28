@@ -337,7 +337,7 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
                 seq(&["push"]),
             ]
         }
-        GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"])],
+        GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"]), seq(&["clean", "-fd"])],
         GitAction::Push => vec![seq(&["push"])],
         GitAction::Pull => vec![seq(&["pull"])],
         GitAction::Fetch => vec![seq(&["fetch"])],
@@ -1040,11 +1040,8 @@ mod tests {
             fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "v1\n"
         );
-        assert!(dir.path().join("b.txt").exists(), "untracked kept");
-        assert!(state
-            .changes
-            .iter()
-            .all(|c| c.path == "b.txt"), "got: {:?}", state.changes);
+        assert!(!dir.path().join("b.txt").exists(), "untracked removed");
+        assert!(state.changes.is_empty(), "got: {:?}", state.changes);
     }
 
     #[test]
