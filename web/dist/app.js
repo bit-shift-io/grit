@@ -224,6 +224,8 @@ function handleStateMessage(event) {
   if (prev !== null && JSON.stringify(prev) === JSON.stringify(state)) {
     return;
   }
+  pairCache.clear();
+  commitCache.clear();
   updateUrlTab(activeTabId);
   render(state);
 };

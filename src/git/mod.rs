@@ -739,13 +739,8 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         GitAction::Reclone => reclone_repo(repo_path)?,
         GitAction::RunScript(rel_path) => {
             match crate::actions::launch(repo_path, &rel_path) {
-                Ok(()) => record_synthetic(
-                    &format!("./{rel_path}"),
-                    "launched in a separate terminal window",
-                    LogStatus::Success,
-                ),
+                Ok(()) => {}
                 Err(message) => {
-                    record_synthetic(&format!("./{rel_path}"), message.clone(), LogStatus::Failed);
                     return Err(GitError {
                         message,
                         stderr: String::new(),
