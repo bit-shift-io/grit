@@ -75,6 +75,7 @@ let browserDir = null;
 let browserParent = null;
 let browserSeeding = false;
 let historyQuery = "";
+let historySearchTimer = null;
 const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
@@ -301,21 +302,16 @@ function render(state) {
 
 const RECENT_COMMIT_COUNT = 4;
 
-function commitMatches(commit, needle) {
-  return (
-    commit.hash.toLowerCase().includes(needle) ||
-    commit.author.toLowerCase().includes(needle) ||
-    commit.message.toLowerCase().includes(needle)
-  );
-}
-
 function renderHistory(tab) {
   const historyEl = document.getElementById("history");
   historyEl.textContent = "";
 
   const needle = historyQuery.trim().toLowerCase();
+  // When a search query is active the server has already replaced
+  // tab.state.history with `git log --grep` results, so show all of them.
+  // Without a query the state holds the default recent-commit window.
   const commits = needle
-    ? tab.state.history.filter((c) => commitMatches(c, needle))
+    ? tab.state.history
     : tab.state.history.slice(0, RECENT_COMMIT_COUNT);
 
   if (commits.length === 0) {
@@ -1068,8 +1064,16 @@ document.getElementById("history").addEventListener("click", (event) => {
 
 document.getElementById("history-search").addEventListener("input", (event) => {
   historyQuery = event.target.value;
-  if (!lastState) return;
-  renderHistory(activeTab(lastState));
+  if (historySearchTimer !== null) clearTimeout(historySearchTimer);
+  const query = historyQuery.trim();
+  historySearchTimer = setTimeout(() => {
+    historySearchTimer = null;
+    if (lastState && activeTabId !== null) {
+      // An empty query restores the default history window; a non-empty
+      // one asks the daemon to run `git log --grep` over full history.
+      sendRaw(JSON.stringify({ tab: activeTabId, action: { SearchHistory: query } }));
+    }
+  }, query ? 300 : 150);
 });
 
 document.querySelectorAll(".section-title").forEach((title) => {

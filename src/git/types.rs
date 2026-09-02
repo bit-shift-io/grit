@@ -176,6 +176,8 @@ pub enum GitAction {
     CloseTab,
     /// Launch a discovered executable by repo-relative path (fire-and-forget).
     RunScript(String),
+    /// Server-side history search via `git log --grep`.
+    SearchHistory(String),
 }
 
 #[cfg(test)]
@@ -256,6 +258,7 @@ mod tests {
             GitAction::NewTab(r#"{"name":"new","path":""}"#.to_string()),
             GitAction::CloseTab,
             GitAction::RunScript("scripts/deploy.sh".to_string()),
+            GitAction::SearchHistory("embed".to_string()),
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();

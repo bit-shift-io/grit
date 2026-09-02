@@ -197,6 +197,31 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
         return;
     }
 
+    if let crate::git::types::GitAction::SearchHistory(query) = &msg.action {
+        let Some(tab_id) = msg.tab else {
+            tracing::debug!("SearchHistory ignored: no tab id");
+            return;
+        };
+        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
+            tracing::debug!("SearchHistory ignored: unknown tab {}", tab_id);
+            return;
+        };
+        let query = query.clone();
+        let results = tokio::task::spawn_blocking(move || {
+            crate::git::search_history(std::path::Path::new(&repo_path), &query)
+        })
+        .await;
+        match results {
+            Ok(Ok(commits)) => {
+                app.registry.update_tab_history(tab_id, commits);
+            }
+            Ok(Err(e)) => tracing::error!("search_history failed: {e}"),
+            Err(e) => tracing::error!("search_history task panicked: {e}"),
+        }
+        crate::server::refresh_tab(app, tab_id).await;
+        return;
+    }
+
     let Some(tab_id) = msg.tab else {
         tracing::debug!("ignoring action without a tab id");
         return;

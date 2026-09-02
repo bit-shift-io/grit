@@ -351,7 +351,8 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
             | GitAction::RunScript(_)
             | GitAction::NewTab(_)
             | GitAction::CloseTab
-            | GitAction::DiscardUntracked(_) => {
+            | GitAction::DiscardUntracked(_)
+            | GitAction::SearchHistory(_) => {
             return None;
         }
     };
@@ -502,6 +503,46 @@ fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
             "--format=%H%x09%an%x09%ct%x09%s",
             "-n",
             HISTORY_LIMIT,
+        ]),
+    ) {
+        Ok(output) => output,
+        Err(e) if e.stderr.contains("does not have any commits") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut history = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.splitn(4, '\t');
+        let hash = parts.next().unwrap_or_default().trim();
+        let author = parts.next().unwrap_or_default().trim();
+        let timestamp = parts.next().unwrap_or_default().trim();
+        let message = parts.next().unwrap_or_default();
+
+        if hash.is_empty() {
+            continue;
+        }
+
+        history.push(CommitInfo {
+            hash: hash.to_string(),
+            author: author.to_string(),
+            message: message.to_string(),
+            timestamp: parse_epoch(timestamp)?,
+        });
+    }
+    Ok(history)
+}
+
+const SEARCH_HISTORY_LIMIT: &str = "200";
+
+pub fn search_history(repo_path: &Path, query: &str) -> Result<Vec<CommitInfo>, GitError> {
+    let output = match run(
+        git_command(repo_path).args([
+            "log",
+            "--format=%H%x09%an%x09%ct%x09%s",
+            "--grep",
+            query,
+            "-n",
+            SEARCH_HISTORY_LIMIT,
         ]),
     ) {
         Ok(output) => output,
@@ -1669,5 +1710,45 @@ mod tests {
             fs::read_to_string(dir.path().join("file.txt")).unwrap(),
             "precious\n"
         );
+    }
+
+    #[test]
+    fn search_history_finds_commits_beyond_recent_window() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+
+        // Seed more than HISTORY_LIMIT commits so the offending one falls
+        // outside the default 50-commit history window.
+        for i in 0..60 {
+            fs::write(dir.path().join("f.txt"), format!("v{i}\n")).unwrap();
+            commit_all(dir.path(), &format!("commit number {i}"));
+        }
+
+        // The default window is capped at 50; confirm the oldest commits
+        // are simply absent from get_history().
+        let recent = get_history(dir.path()).unwrap();
+        assert_eq!(recent.len(), 50);
+        assert!(
+            recent.iter().all(|c| !c.message.contains("commit number 0")),
+            "oldest commit must fall outside the default window"
+        );
+
+        let matches = search_history(dir.path(), "embed").unwrap();
+        assert!(
+            matches.is_empty(),
+            "no commit mentions 'embed', got: {:?}",
+            matches
+        );
+
+        let found = search_history(dir.path(), "commit number 0").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].message, "commit number 0");
+    }
+
+    #[test]
+    fn search_history_handles_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        assert!(search_history(dir.path(), "anything").unwrap().is_empty());
     }
 }

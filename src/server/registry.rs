@@ -169,6 +169,19 @@ impl TabRegistry {
         });
     }
 
+    /// Replaces only the history of a single tab (used by SearchHistory).
+    pub fn update_tab_history(&self, id: usize, history: Vec<crate::git::types::CommitInfo>) {
+        self.modify(|current| {
+            match current.tabs.iter_mut().find(|t| t.id == id) {
+                Some(tab) => {
+                    tab.state.history = history;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+
     /// Removes one tab by id under the write lock, healing `active`.
     /// Returns the removed tab, or None when the id is unknown.
     pub fn remove_tab(&self, id: usize) -> Option<WebTab> {
