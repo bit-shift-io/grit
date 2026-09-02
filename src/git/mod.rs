@@ -350,7 +350,8 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::Reclone
             | GitAction::RunScript(_)
             | GitAction::NewTab(_)
-            | GitAction::CloseTab => {
+            | GitAction::CloseTab
+            | GitAction::DiscardUntracked(_) => {
             return None;
         }
     };
@@ -378,6 +379,7 @@ pub fn placeholder_command(action: &GitAction) -> String {
                 .to_string()
         }
         GitAction::RunScript(rel_path) => format!("./{rel_path}"),
+        GitAction::DiscardUntracked(p) => format!("rm -f -- {p}"),
         // Unreachable in practice: every other variant is table-backed
         // and handled above.
         _ => String::new(),
@@ -736,6 +738,14 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
         return Ok(());
     }
     match action {
+        GitAction::DiscardUntracked(p) => {
+            let target = repo_path.join(&p);
+            std::fs::remove_file(&target).map_err(|e| GitError {
+                message: format!("failed to remove {}: {e}", p),
+                stderr: String::new(),
+                stdout: String::new(),
+            })?;
+        }
         GitAction::Reclone => reclone_repo(repo_path)?,
         GitAction::RunScript(rel_path) => {
             match crate::actions::launch(repo_path, &rel_path) {
@@ -997,6 +1007,33 @@ mod tests {
         let state = get_repository_status(dir.path()).unwrap();
         assert!(
             !state.changes.iter().any(|c| c.path == "a.txt"),
+            "got: {:?}",
+            state.changes
+        );
+    }
+
+    #[test]
+    fn discard_untracked_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+
+        execute_action(
+            dir.path(),
+            GitAction::DiscardUntracked("untracked.txt".to_string()),
+        )
+        .unwrap();
+
+        assert!(!dir.path().join("untracked.txt").exists(), "file deleted");
+        let state = get_repository_status(dir.path()).unwrap();
+        assert!(
+            !state
+                .changes
+                .iter()
+                .any(|c| c.path == "untracked.txt"),
             "got: {:?}",
             state.changes
         );

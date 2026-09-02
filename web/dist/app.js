@@ -524,6 +524,7 @@ function appendChangeRow(container, change, tab) {
   const discard = document.createElement("button");
   discard.className = "action-btn discard-btn";
   discard.dataset.path = change.path;
+  discard.dataset.status = change.status;
   discard.dataset.action = "discard";
   discard.textContent = "×";
   discard.title = "Discard changes to this file";
@@ -1038,7 +1039,11 @@ document.getElementById("changes").addEventListener("click", (event) => {
       stepDiffBlock(actionBtn.closest(".change-head"), 1);
     } else if (actionBtn.dataset.action === "discard") {
       if (confirm(`Discard changes to ${path}?`)) {
-        sendAction({ Discard: path });
+        if (actionBtn.dataset.status === "Untracked") {
+          sendAction({ DiscardUntracked: path });
+        } else {
+          sendAction({ Discard: path });
+        }
       }
     } else if (actionBtn.dataset.staged === "true") {
       sendAction({ Unstage: path });

@@ -157,6 +157,7 @@ pub enum GitAction {
     Stage(String),
     Unstage(String),
     Discard(String),
+    DiscardUntracked(String),
     Commit(String),
     CommitAll(String),
     CommitAllPush(String),
