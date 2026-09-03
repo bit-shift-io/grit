@@ -340,7 +340,7 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::DiscardAll => vec![seq(&["reset", "--hard", "HEAD"]), seq(&["clean", "-fd"])],
         GitAction::Push => vec![seq(&["push"])],
         GitAction::Pull => vec![seq(&["pull"])],
-        GitAction::Fetch => vec![seq(&["fetch"])],
+        GitAction::Fetch => vec![seq(&["fetch", "--prune"])],
         GitAction::CheckoutBranch(b) => vec![seq(&["checkout", b])],
         GitAction::Revert(h) => vec![seq(&["revert", "--no-edit", h])],
         GitAction::CreateBranch(n, f) => vec![seq(&["checkout", "-b", n, f])],
@@ -390,12 +390,14 @@ pub fn placeholder_command(action: &GitAction) -> String {
 pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
     let current_branch = get_current_branch(repo_path)?;
     let branches = list_branches(repo_path)?;
+    let remote_branches = list_remote_branches(repo_path)?;
     let changes = list_changes(repo_path)?;
     let history = get_history(repo_path)?;
 
     Ok(RepoState {
         current_branch,
         branches,
+        remote_branches,
         changes,
         history,
         scripts: crate::actions::discover(repo_path),
@@ -403,8 +405,14 @@ pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
 }
 
 fn get_current_branch(repo_path: &Path) -> Result<String, GitError> {
-    let branch = run(git_command(repo_path).args(["symbolic-ref", "--short", "HEAD"]))?;
-    Ok(branch.trim().to_string())
+    match run(git_command(repo_path).args(["symbolic-ref", "--short", "HEAD"])) {
+        Ok(branch) => Ok(branch.trim().to_string()),
+        Err(_) => {
+            // Detached HEAD — fall back to short commit hash.
+            let hash = run(git_command(repo_path).args(["rev-parse", "--short", "HEAD"]))?;
+            Ok(format!("detached@{}", hash.trim()))
+        }
+    }
 }
 
 fn list_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
@@ -413,6 +421,19 @@ fn list_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
+        .collect())
+}
+
+fn list_remote_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
+    let output = match run(git_command(repo_path).args(["branch", "-r", "--format=%(refname:short)"])) {
+        Ok(output) => output,
+        Err(e) if e.stderr.contains("no remote configured") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(output
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
         .collect())
 }
 

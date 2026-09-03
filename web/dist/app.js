@@ -255,6 +255,7 @@ function render(state) {
   const historySection = document.getElementById("history-section");
   const logSection = document.getElementById("log-section");
   const actionsSection = document.getElementById("actions");
+  const branchesSection = document.getElementById("branches-section");
 
   if (showAddForm || state.tabs.length === 0) {
     updateUrlTab(null);
@@ -263,6 +264,7 @@ function render(state) {
     historySection.style.display = "none";
     logSection.style.display = "none";
     actionsSection.style.display = "none";
+    branchesSection.style.display = "none";
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
@@ -274,11 +276,13 @@ function render(state) {
   historySection.style.display = "block";
   logSection.style.display = "block";
   actionsSection.style.display = "block";
+  branchesSection.style.display = "block";
   document.title = `Grit | ${tab.name}`;
   document.getElementById("overview").textContent =
     `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;
 
   renderScriptRunner(tab);
+  renderBranches(tab);
   renderLog(tab);
 
   const changesEl = document.getElementById("changes");
@@ -363,6 +367,94 @@ function renderHistory(tab) {
   if (!commitStillOpen) {
     expandedCommitKey = null;
     expandedCommitEl = null;
+  }
+}
+
+//#endregion
+
+//#region Branches panel
+
+function renderBranches(tab) {
+  const branchListEl = document.getElementById("branch-list");
+  branchListEl.textContent = "";
+  const filter = (document.getElementById("branch-filter").value || "").trim().toLowerCase();
+  const branches = tab.state.branches || [];
+  const remoteBranches = tab.state.remote_branches || [];
+  const current = tab.state.current_branch || "";
+
+  document.getElementById("branch-subtitle").textContent = current;
+
+  const filteredLocal = filter
+    ? branches.filter((b) => b.toLowerCase().includes(filter))
+    : branches;
+  const filteredRemote = filter
+    ? remoteBranches.filter((b) => b.toLowerCase().includes(filter))
+    : remoteBranches;
+
+  if (filteredLocal.length === 0 && filteredRemote.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = (branches.length === 0 && remoteBranches.length === 0)
+      ? "No branches." : "No matching branches.";
+    branchListEl.appendChild(empty);
+    return;
+  }
+
+  function addBranchRow(branch, isRemote) {
+    const row = document.createElement("div");
+    row.className = "branch-row" + (branch === current ? " current" : "") + (isRemote ? " remote" : " local");
+
+    const name = document.createElement("span");
+    name.className = "branch-name";
+    name.textContent = branch;
+    row.appendChild(name);
+
+    // For a remote-tracking ref (origin/xyz) the checkout must use the short
+    // name so `git checkout xyz` DWIMs a local tracking branch instead of
+    // leaving HEAD detached.
+    const checkoutName = isRemote
+      ? branch.split("/").slice(1).join("/")
+      : branch;
+
+    if (branch === current || checkoutName === current) {
+      const label = document.createElement("span");
+      label.className = "branch-current-label";
+      label.textContent = "current";
+      row.appendChild(label);
+    } else {
+      const actions = document.createElement("div");
+      actions.className = "branch-actions";
+
+      const checkout = document.createElement("button");
+      checkout.className = "branch-action-btn";
+      checkout.dataset.branch = checkoutName;
+      checkout.dataset.action = "checkout";
+      checkout.textContent = "\u2192";
+      checkout.title = `Switch to ${branch}`;
+      actions.appendChild(checkout);
+
+      const del = document.createElement("button");
+      del.className = "branch-action-btn branch-delete";
+      del.dataset.branch = branch;
+      del.dataset.action = "delete";
+      del.textContent = "\u00d7";
+      del.title = `Delete branch ${branch}`;
+      actions.appendChild(del);
+
+      row.appendChild(actions);
+    }
+
+    branchListEl.appendChild(row);
+  }
+
+  for (const branch of filteredLocal) {
+    addBranchRow(branch, false);
+  }
+
+  if (filteredRemote.length > 0) {
+    for (const branch of filteredRemote) {
+      addBranchRow(branch, true);
+    }
   }
 }
 
@@ -1083,5 +1175,46 @@ document.querySelectorAll(".section-title").forEach((title) => {
     const arrow = title.querySelector(".arrow");
     arrow.innerHTML = section.classList.contains("collapsed") ? "&#9652;" : "&#9662;";
   };
+});
+
+document.getElementById("branch-list").addEventListener("click", (event) => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const actionBtn = event.target.closest(".branch-action-btn");
+  if (actionBtn) {
+    const branch = actionBtn.dataset.branch;
+    if (actionBtn.dataset.action === "delete") {
+      if (confirm(`Delete branch "${branch}"?`)) {
+        sendAction({ DeleteBranch: branch });
+      }
+    } else if (actionBtn.dataset.action === "checkout") {
+      sendAction({ CheckoutBranch: branch });
+    }
+  }
+});
+
+document.getElementById("create-branch-btn").onclick = () => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const name = document.getElementById("branch-filter").value.trim();
+  if (!name) return;
+  const hash = tab.state.history && tab.state.history.length > 0
+    ? tab.state.history[0].hash
+    : null;
+  if (hash) {
+    sendAction({ CreateBranch: [name, hash] });
+  } else {
+    sendAction({ CreateBranch: [name, "HEAD"] });
+  }
+  document.getElementById("branch-filter").value = "";
+  renderBranches(tab);
+};
+
+document.getElementById("branch-filter").addEventListener("input", () => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (tab) renderBranches(tab);
 });
 //#endregion

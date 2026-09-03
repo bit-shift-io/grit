@@ -334,6 +334,7 @@ mod tests {
             state: RepoState {
                 current_branch: "main".to_string(),
                 branches: vec!["main".to_string()],
+                remote_branches: vec![],
                 changes: vec![],
                 history: vec![],
                 scripts: vec![],
@@ -382,6 +383,7 @@ mod tests {
         let fresh = RepoState {
             current_branch: "dev".to_string(),
             branches: vec!["dev".to_string()],
+            remote_branches: vec![],
             changes: vec![],
             history: vec![],
             scripts: vec![],
@@ -608,6 +610,7 @@ mod tests {
         let fresh = RepoState {
             current_branch: "dev".to_string(),
             branches: vec!["dev".to_string()],
+            remote_branches: vec![],
             changes: vec![],
             history: vec![],
             scripts: vec![],

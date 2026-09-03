@@ -60,6 +60,20 @@ pub struct CommitInfo {
     pub timestamp: i64,
 }
 
+/// One entry in the stash reflog, e.g. `stash@{0}`. `files` lists the paths
+/// captured by the stash, reusing the same per-file stat shape as commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashEntry {
+    /// Reflog name, e.g. `stash@{0}`.
+    pub id: String,
+    /// Branch the stash was created on, e.g. `main`.
+    pub branch: String,
+    /// Short user-provided message (may be empty).
+    pub message: String,
+    pub timestamp: i64,
+    pub files: Vec<FileStat>,
+}
+
 /// An executable script discovered in a repository (root, `scripts/`,
 /// or `tools/`). `rel_path` is repo-relative and is what gets launched.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,8 +92,12 @@ impl std::fmt::Display for ScriptEntry {
 pub struct RepoState {
     pub current_branch: String,
     pub branches: Vec<String>,
+    #[serde(default)]
+    pub remote_branches: Vec<String>,
     pub changes: Vec<FileChange>,
     pub history: Vec<CommitInfo>,
+    #[serde(default)]
+    pub stashes: Vec<StashEntry>,
     #[serde(default)]
     pub scripts: Vec<ScriptEntry>,
 }
@@ -189,6 +207,7 @@ mod tests {
         let state = RepoState {
             current_branch: "main".to_string(),
             branches: vec!["main".to_string(), "dev".to_string()],
+            remote_branches: vec!["origin/main".to_string(), "origin/feature".to_string()],
             changes: vec![FileChange {
                 path: "src/main.rs".to_string(),
                 status: GitStatus::Modified,

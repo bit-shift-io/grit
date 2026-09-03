@@ -68,15 +68,25 @@
         <div id="changes"></div>
       </div>
     </section>
-    <section id="history-section" class="section" style="display: none;">
-      <h2 class="section-title">History <span class="arrow">&#9662;</span></h2>
+    <section id="branches-section" class="section collapsed" style="display: none;">
+      <h2 class="section-title"><span>Branches <span id="branch-subtitle" class="muted"></span></span><span class="arrow">&#9652;</span></h2>
+      <div class="section-body">
+        <div class="branch-toolbar">
+          <input id="branch-filter" type="text" placeholder="New branch name or search">
+          <button id="create-branch-btn" title="Create a branch from HEAD with this name">+ Branch</button>
+        </div>
+        <div id="branch-list"></div>
+      </div>
+    </section>
+    <section id="history-section" class="section collapsed" style="display: none;">
+      <h2 class="section-title">History <span class="arrow">&#9652;</span></h2>
       <div class="section-body">
         <input id="history-search" type="text" placeholder="Search full history (hash, author, message)">
         <div id="history"></div>
       </div>
     </section>
-    <section id="log-section" class="section" style="display: none;">
-      <h2 class="section-title">Log <span class="arrow">&#9662;</span></h2>
+    <section id="log-section" class="section collapsed" style="display: none;">
+      <h2 class="section-title">Log <span class="arrow">&#9652;</span></h2>
       <div class="section-body">
         <div id="log"></div>
       </div>
