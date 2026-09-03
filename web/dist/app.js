@@ -66,6 +66,7 @@ let expandedKey = null;
 let expandedDetailEl = null;
 let expandedCommitKey = null;
 let expandedCommitEl = null;
+let expandedStashKey = null;
 let awaitingNewTab = false;
 // Client-local view state: entries with seq <= this are hidden by "Clear Log".
 let clearedUpToSeq = 0;
@@ -256,6 +257,7 @@ function render(state) {
   const logSection = document.getElementById("log-section");
   const actionsSection = document.getElementById("actions");
   const branchesSection = document.getElementById("branches-section");
+  const stashesSection = document.getElementById("stashes-section");
 
   if (showAddForm || state.tabs.length === 0) {
     updateUrlTab(null);
@@ -265,6 +267,7 @@ function render(state) {
     logSection.style.display = "none";
     actionsSection.style.display = "none";
     branchesSection.style.display = "none";
+    stashesSection.style.display = "none";
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
@@ -277,12 +280,22 @@ function render(state) {
   logSection.style.display = "block";
   actionsSection.style.display = "block";
   branchesSection.style.display = "block";
+  stashesSection.style.display = "block";
   document.title = `Grit | ${tab.name}`;
-  document.getElementById("overview").textContent =
-    `${tab.state.current_branch} — ${tab.state.changes.length} change(s)`;
+  const overviewEl = document.getElementById("overview");
+  const count = tab.state.changes.length;
+  if (count === 0) {
+    overviewEl.style.display = "none";
+    overviewEl.textContent = "";
+  } else {
+    overviewEl.style.display = "";
+    overviewEl.textContent =
+      `${count} change${count === 1 ? "" : "s"}`;
+  }
 
   renderScriptRunner(tab);
   renderBranches(tab);
+  renderStashes(tab);
   renderLog(tab);
 
   const changesEl = document.getElementById("changes");
@@ -456,6 +469,107 @@ function renderBranches(tab) {
       addBranchRow(branch, true);
     }
   }
+}
+
+//#endregion
+
+//#region Stashes panel
+
+function renderStashes(tab) {
+  const listEl = document.getElementById("stash-list");
+  listEl.textContent = "";
+  const stashes = tab.state.stashes || [];
+  const subtitleEl = document.getElementById("stash-subtitle");
+  if (stashes.length === 0) {
+    subtitleEl.style.display = "none";
+    subtitleEl.textContent = "";
+  } else {
+    subtitleEl.style.display = "";
+    subtitleEl.textContent =
+      stashes.length === 1 ? "1 stash" : `${stashes.length} stashes`;
+  }
+
+  if (stashes.length === 0) {
+    return;
+  }
+
+  let stillOpen = false;
+  for (const stash of stashes) {
+    const key = `${tab.id}:${stash.id}`;
+    const row = document.createElement("div");
+    row.className = "stash-row";
+
+    const head = document.createElement("div");
+    head.className = "stash-head";
+    head.dataset.id = stash.id;
+
+    const meta = document.createElement("span");
+    meta.className = "stash-meta muted";
+    meta.textContent = `${stash.id} \u00b7 ${stash.branch}`;
+
+    const msg = document.createElement("span");
+    msg.className = "stash-msg";
+    msg.textContent = stash.message || "(no message)";
+
+    head.appendChild(meta);
+    head.appendChild(msg);
+
+    const actions = document.createElement("div");
+    actions.className = "stash-actions";
+    const expanded = expandedStashKey === key;
+    if (expanded) {
+      stillOpen = true;
+      actions.style.display = "block";
+      buildStashActions(actions, stash);
+    } else {
+      actions.style.display = "none";
+    }
+
+    row.appendChild(head);
+    row.appendChild(actions);
+    listEl.appendChild(row);
+  }
+  if (!stillOpen) {
+    expandedStashKey = null;
+  }
+}
+
+function buildStashActions(actionsEl, stash) {
+  actionsEl.textContent = "";
+  const fileList = document.createElement("div");
+  fileList.className = "stash-files";
+  if (stash.files && stash.files.length > 0) {
+    for (const file of stash.files) {
+      const row = document.createElement("div");
+      row.className = "stash-file";
+      const counts = lineCounts(file.insertions, file.deletions);
+      row.textContent = counts
+        ? `${file.status} ${file.path} ${counts}`
+        : `${file.status} ${file.path}`;
+      fileList.appendChild(row);
+    }
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = "No files in this stash.";
+    fileList.appendChild(empty);
+  }
+  actionsEl.appendChild(fileList);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "stash-btn-row";
+  const defs = [
+    { label: "Apply", run: () => sendAction({ StashApply: stash.id }) },
+    { label: "Pop", run: () => sendAction({ StashPop: stash.id }) },
+    { label: "Drop", run: () => sendAction({ StashDrop: stash.id }) },
+  ];
+  for (const def of defs) {
+    const btn = document.createElement("button");
+    btn.textContent = def.label;
+    btn.onclick = def.run;
+    btnRow.appendChild(btn);
+  }
+  actionsEl.appendChild(btnRow);
 }
 
 //#endregion
@@ -1217,4 +1331,29 @@ document.getElementById("branch-filter").addEventListener("input", () => {
   const tab = activeTab(lastState);
   if (tab) renderBranches(tab);
 });
+
+document.getElementById("stash-list").addEventListener("click", (event) => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const head = event.target.closest(".stash-head");
+  if (!head) return;
+  const key = `${tab.id}:${head.dataset.id}`;
+  if (expandedStashKey === key) {
+    expandedStashKey = null;
+    renderStashes(tab);
+  } else {
+    expandedStashKey = key;
+    renderStashes(tab);
+  }
+});
+
+document.getElementById("create-stash-btn").onclick = () => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const msg = document.getElementById("stash-input").value.trim();
+  sendAction({ StashPush: msg });
+  document.getElementById("stash-input").value = "";
+};
 //#endregion

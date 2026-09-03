@@ -291,6 +291,93 @@ body { margin: 0; padding: 1rem; }
 }
 #create-branch-btn:hover { background: var(--btn-hover, #ddd); }
 
+.stash-toolbar {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+#stash-input {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  background: var(--btn-bg, #eee);
+  color: inherit;
+  font: inherit;
+}
+#create-stash-btn {
+  flex-shrink: 0;
+  background: var(--btn-bg, #eee);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  white-space: nowrap;
+}
+#create-stash-btn:hover { background: var(--btn-hover, #ddd); }
+
+#stash-list {
+  max-height: 15rem;
+  overflow-y: auto;
+}
+.stash-row {
+  border-radius: 4px;
+}
+.stash-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.stash-head:hover { background: var(--row-hover, #ececec); }
+.stash-meta {
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+.stash-msg { flex: 1; overflow-wrap: anywhere; }
+.stash-actions {
+  padding: 0.25rem 0.5rem 0.5rem 0.5rem;
+  border-left: 3px solid var(--border, #ccc);
+  margin: 0 0.25rem;
+}
+.stash-files {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-bottom: 0.5rem;
+}
+.stash-file {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  padding: 0.1rem 0;
+}
+.stash-btn-row {
+  display: flex;
+  gap: 0.4rem;
+}
+.stash-btn-row button {
+  background: var(--btn-bg, #eee);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  padding: 0.25rem 0.7rem;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.stash-btn-row button:hover { background: var(--btn-hover, #ddd); }
+.stash-btn-row button:last-child:hover {
+  background: #b3261e;
+  color: #fff;
+  border-color: #b3261e;
+}
+
 #log {
   max-height: 18rem;
   overflow-y: auto;

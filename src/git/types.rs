@@ -189,6 +189,14 @@ pub enum GitAction {
     CreateTag(String, String),
     DeleteTag(String),
     DeleteBranch(String),
+    /// Stash the current working-tree changes under the given message.
+    StashPush(String),
+    /// Apply and keep the stash identified by `stash@{n}`.
+    StashApply(String),
+    /// Apply and drop the stash identified by `stash@{n}`.
+    StashPop(String),
+    /// Delete the stash identified by `stash@{n}`.
+    StashDrop(String),
     Reclone,
     NewTab(String),
     CloseTab,
@@ -219,6 +227,18 @@ mod tests {
                 message: "initial".to_string(),
                 timestamp: 1_600_000_000,
             }],
+            stashes: vec![StashEntry {
+                id: "stash@{0}".to_string(),
+                branch: "main".to_string(),
+                message: "wip".to_string(),
+                timestamp: 1_600_000_000,
+                files: vec![FileStat {
+                    status: "Modified".to_string(),
+                    path: "src/main.rs".to_string(),
+                    insertions: 1,
+                    deletions: 1,
+                }],
+            }],
             scripts: vec![ScriptEntry {
                 name: "build.sh".to_string(),
                 rel_path: "scripts/build.sh".to_string(),
@@ -228,6 +248,13 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let parsed: RepoState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, state);
+
+        // Payloads from older daemons lack `stashes`; it must default empty.
+        let older: RepoState = serde_json::from_str(
+            r#"{"current_branch":"main","branches":[],"changes":[],"history":[]}"#,
+        )
+        .unwrap();
+        assert!(older.stashes.is_empty());
     }
 
     #[test]

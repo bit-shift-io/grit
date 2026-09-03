@@ -3,7 +3,7 @@ pub mod watcher;
 
 pub use types::{
     CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, LogEntry,
-    LogStatus, RepoState,
+    LogStatus, RepoState, StashEntry,
 };
 
 use std::cell::{Cell, RefCell};
@@ -347,6 +347,10 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::CreateTag(n, t) => vec![seq(&["tag", n, t])],
         GitAction::DeleteTag(n) => vec![seq(&["tag", "-d", n])],
         GitAction::DeleteBranch(n) => vec![seq(&["branch", "-d", n])],
+        GitAction::StashPush(m) => vec![seq(&["stash", "push", "-m", m])],
+        GitAction::StashApply(id) => vec![seq(&["stash", "apply", id])],
+        GitAction::StashPop(id) => vec![seq(&["stash", "pop", id])],
+        GitAction::StashDrop(id) => vec![seq(&["stash", "drop", id])],
         GitAction::Reclone
             | GitAction::RunScript(_)
             | GitAction::NewTab(_)
@@ -391,6 +395,7 @@ pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
     let current_branch = get_current_branch(repo_path)?;
     let branches = list_branches(repo_path)?;
     let remote_branches = list_remote_branches(repo_path)?;
+    let stashes = list_stashes(repo_path)?;
     let changes = list_changes(repo_path)?;
     let history = get_history(repo_path)?;
 
@@ -398,6 +403,7 @@ pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
         current_branch,
         branches,
         remote_branches,
+        stashes,
         changes,
         history,
         scripts: crate::actions::discover(repo_path),
@@ -435,6 +441,72 @@ fn list_remote_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
         .collect())
+}
+
+fn list_stashes(repo_path: &Path) -> Result<Vec<StashEntry>, GitError> {
+    let output = match run(
+        git_command(repo_path).args(["stash", "list", "--format=%gd%x09%gs%x09%ct"]),
+    ) {
+        Ok(output) => output,
+        Err(e) if e.stderr.contains("ref 'refs/stash' does not exist")
+            || e.stderr.contains("No stash entries found") =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(e) => return Err(e),
+    };
+
+    let mut stashes = Vec::new();
+    for line in output.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let id = parts.next().unwrap_or_default().trim().to_string();
+        let msg_with_branch = parts.next().unwrap_or_default().trim().to_string();
+        let timestamp = parts.next().unwrap_or_default().trim();
+
+        if id.is_empty() {
+            continue;
+        }
+
+        let (branch, message) = split_stash_subject(&msg_with_branch);
+        let files = stash_files(repo_path, &id);
+
+        stashes.push(StashEntry {
+            id,
+            branch,
+            message,
+            timestamp: parse_epoch(timestamp).unwrap_or(0),
+            files,
+        });
+    }
+    Ok(stashes)
+}
+
+/// `git stash list` subject is `WIP on <branch>: <short message>`. Split the
+/// branch and message apart; both fall back to empty strings when absent.
+fn split_stash_subject(subject: &str) -> (String, String) {
+    if let Some(rest) = subject.strip_prefix("WIP on ") {
+        if let Some((b, m)) = rest.split_once(": ") {
+            return (b.to_string(), m.to_string());
+        }
+    }
+    // Non-WIP form (e.g. `On <branch>: <message>` for stash with message).
+    if let Some(rest) = subject.strip_prefix("On ") {
+        if let Some((b, m)) = rest.split_once(": ") {
+            return (b.to_string(), m.to_string());
+        }
+    }
+    (subject.to_string(), String::new())
+}
+
+/// Best-effort file list for a stash: `git stash show` with name+num stats.
+/// Falls back to an empty list on any git error so a single bad stash never
+/// fails an entire status refresh.
+fn stash_files(repo_path: &Path, id: &str) -> Vec<FileStat> {
+    let name_status =
+        run(git_command(repo_path).args(["stash", "show", "--name-status", id])).unwrap_or_default();
+    let numstat = run(git_command(repo_path).args(["stash", "show", "--numstat", id]))
+        .unwrap_or_default();
+    parse_commit_files(&name_status, &numstat)
 }
 
 fn list_changes(repo_path: &Path) -> Result<Vec<FileChange>, GitError> {
@@ -1772,5 +1844,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         assert!(search_history(dir.path(), "anything").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stash_push_populate_status_and_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+
+        assert!(get_repository_status(dir.path()).unwrap().stashes.is_empty());
+
+        execute_action(dir.path(), GitAction::StashPush("wip".to_string())).unwrap();
+
+        let state = get_repository_status(dir.path()).unwrap();
+        assert_eq!(state.stashes.len(), 1);
+        assert_eq!(state.stashes[0].id, "stash@{0}");
+        assert_eq!(state.stashes[0].message, "wip");
+        assert_eq!(state.stashes[0].branch, "main");
+        assert!(
+            state.stashes[0].files.iter().any(|f| f.path == "a.txt"),
+            "stash should capture a.txt, got: {:?}",
+            state.stashes[0].files
+        );
+
+        execute_action(dir.path(), GitAction::StashDrop("stash@{0}".to_string())).unwrap();
+        assert!(get_repository_status(dir.path()).unwrap().stashes.is_empty());
+    }
+
+    #[test]
+    fn stash_apply_restores_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
+
+        execute_action(dir.path(), GitAction::StashPush("keep".to_string())).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "v1\n"
+        );
+
+        execute_action(dir.path(), GitAction::StashApply("stash@{0}".to_string())).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "v2\n"
+        );
+        assert_eq!(get_repository_status(dir.path()).unwrap().stashes.len(), 1);
     }
 }
