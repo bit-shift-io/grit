@@ -218,7 +218,9 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
             Ok(Err(e)) => tracing::error!("search_history failed: {e}"),
             Err(e) => tracing::error!("search_history task panicked: {e}"),
         }
-        crate::server::refresh_tab(app, tab_id).await;
+        // update_tab_history already mutated the registry, which broadcasts a
+        // fresh frame. Do NOT refresh_tab here: get_repository_status resets
+        // history to the default window, clobbering the search results.
         return;
     }
 
