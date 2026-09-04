@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/files", get(files_handler))
         .route("/commit", get(commit_handler))
         .route("/browse", get(browse_handler))
+        .route("/filetree", get(filetree_handler))
+        .route("/filecontent", get(filecontent_handler))
+        .route("/filesearch", get(filesearch_handler))
+        .route("/apps", get(apps_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
@@ -86,6 +91,21 @@ pub fn build_router(state: AppState) -> Router {
 struct FilesQuery {
     tab: usize,
     path: String,
+}
+
+#[derive(Deserialize)]
+struct FileTreeQuery {
+    tab: usize,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct FileContentQuery {
+    tab: usize,
+    path: String,
+    #[serde(default)]
+    raw: bool,
 }
 
 /// Shared shape of the tab-scoped detail endpoints: resolve the tab's
@@ -160,6 +180,132 @@ async fn commit_handler(
             Json(crate::git::types::CommitSummary::error(message)),
         ),
     }
+}
+
+/// Lists the repository's tracked + untracked files as a flat tree.
+async fn filetree_handler(
+    State(app): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<FileTreeQuery>,
+) -> (StatusCode, Json<Vec<crate::git::types::FileTreeEntry>>) {
+    let dir = query.path;
+    match tab_scoped_git_call(&app, query.tab, "filetree", move |repo_path| {
+        crate::git::list_dir(&repo_path, &dir)
+    })
+    .await
+    {
+        Ok(entries) => (StatusCode::OK, Json(entries)),
+        Err((_status, message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(vec![crate::git::types::FileTreeEntry {
+                name: message,
+                path: String::new(),
+                is_dir: false,
+                depth: 0,
+            }]),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct FileSearchQuery {
+    tab: usize,
+    q: String,
+}
+
+async fn filesearch_handler(
+    State(app): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<FileSearchQuery>,
+) -> (StatusCode, Json<Vec<crate::git::types::FileTreeEntry>>) {
+    let q = query.q.clone();
+    match tab_scoped_git_call(&app, query.tab, "filesearch", move |repo_path| {
+        crate::git::search_files(&repo_path, &q, 200)
+    })
+    .await
+    {
+        Ok(entries) => (StatusCode::OK, Json(entries)),
+        Err((_status, message)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(vec![crate::git::types::FileTreeEntry {
+                name: message,
+                path: String::new(),
+                is_dir: false,
+                depth: 0,
+            }]),
+        ),
+    }
+}
+
+/// Returns a single file's preview content (text, image flag, binary flag),
+/// or the raw bytes when `raw=true` (used by the browser to render images).
+async fn filecontent_handler(
+    State(app): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<FileContentQuery>,
+) -> AxumResponse {
+    if query.raw {
+        let Some(repo_path) = app.registry.repo_path_for(query.tab) else {
+            return (
+                StatusCode::NOT_FOUND,
+                "no repository tabs open".to_string(),
+            )
+                .into_response();
+        };
+        let full = std::path::Path::new(&repo_path).join(&query.path);
+        match std::fs::read(&full) {
+            Ok(bytes) => {
+                let mime = infer_mime(&query.path);
+                ([(axum::http::header::CONTENT_TYPE, mime)], bytes)
+                    .into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to read {}: {e}", query.path),
+            )
+                .into_response(),
+        }
+    } else {
+        let path = query.path.clone();
+        let content = match tab_scoped_git_call(
+            &app,
+            query.tab,
+            "filecontent",
+            move |repo_path| {
+                Ok::<crate::git::types::FileContent, crate::git::GitError>(
+                    crate::git::get_file_content(&repo_path, &path),
+                )
+            },
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err((_status, message)) => crate::git::types::FileContent {
+                path: query.path,
+                size: 0,
+                is_binary: false,
+                is_image: false,
+                content: String::new(),
+                error: message,
+            },
+        };
+        Json(content).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct AppsQuery {
+    path: String,
+}
+
+async fn apps_handler(
+    axum::extract::Query(query): axum::extract::Query<AppsQuery>,
+) -> (StatusCode, Json<Vec<crate::git::AppEntry>>) {
+    let mime = crate::git::mime_for_path(&query.path);
+    let apps = crate::git::list_apps_for_mime(mime);
+    (StatusCode::OK, Json(apps))
+}
+
+/// Best-effort content type for a raw file response.
+fn infer_mime(path: &str) -> &'static str {
+    crate::git::mime_for_path(path)
 }
 
 /// Expands a leading `~` in a user-supplied path to the home directory.
@@ -1159,5 +1305,252 @@ mod tests {
                 Err(_) => continue,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn filetree_endpoint_lists_root_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/sub/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        // Root listing: only immediate children
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filetree?tab=0&path=")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<crate::git::types::FileTreeEntry> =
+            serde_json::from_slice(&bytes).unwrap();
+
+        let paths: Vec<(&str, bool)> = entries.iter().map(|e| (e.path.as_str(), e.is_dir)).collect();
+        assert!(paths.contains(&("Cargo.toml", false)), "got: {paths:?}");
+        assert!(paths.contains(&("src", true)), "got: {paths:?}");
+        assert_eq!(paths.len(), 2, "root should have exactly 2 entries, got: {paths:?}");
+    }
+
+    #[tokio::test]
+    async fn filetree_endpoint_lists_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/sub/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filetree?tab=0&path=src")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<crate::git::types::FileTreeEntry> =
+            serde_json::from_slice(&bytes).unwrap();
+
+        let paths: Vec<(&str, bool)> = entries.iter().map(|e| (e.path.as_str(), e.is_dir)).collect();
+        assert!(paths.contains(&("src/main.rs", false)), "got: {paths:?}");
+        assert!(paths.contains(&("src/sub", true)), "got: {paths:?}");
+        assert_eq!(paths.len(), 2, "src/ should have exactly 2 entries, got: {paths:?}");
+    }
+
+    #[tokio::test]
+    async fn filetree_endpoint_prevents_path_traversal_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filetree?tab=0&path=/etc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<crate::git::types::FileTreeEntry> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(entries.is_empty(), "absolute path should return empty");
+    }
+
+    #[tokio::test]
+    async fn filetree_endpoint_prevents_path_traversal_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filetree?tab=0&path=../etc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<crate::git::types::FileTreeEntry> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(entries.is_empty(), "parent traversal should return empty");
+    }
+
+    #[tokio::test]
+    async fn filecontent_endpoint_returns_text_and_flags_binary_images() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::write(dir.path().join("readme.txt"), "hello world\n").unwrap();
+        std::fs::write(dir.path().join("note.md"), "# Title\n").unwrap();
+        let _ = image_placeholder(&dir.path().join("pic.png"));
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let text = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/filecontent?tab=0&path=readme.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(text.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(text.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let tc: crate::git::types::FileContent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(tc.content, "hello world\n");
+        assert!(!tc.is_binary);
+        assert!(!tc.is_image);
+
+        let img = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filecontent?tab=0&path=pic.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(img.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let ic: crate::git::types::FileContent = serde_json::from_slice(&bytes).unwrap();
+        assert!(ic.is_image);
+        assert_eq!(ic.content, "");
+    }
+
+    #[tokio::test]
+    async fn filecontent_raw_serves_image_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        let file = dir.path().join("pic.png");
+        image_placeholder(&file).unwrap();
+        let expected = std::fs::read(&file).unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filecontent?tab=0&path=pic.png&raw=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "image/png"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn filesearch_endpoint_finds_files_across_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(&dir.path().to_path_buf());
+        std::fs::create_dir_all(dir.path().join("src/sub")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/sub/lib.rs"), "pub fn f() {}\n").unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Hello\n").unwrap();
+
+        let app = app_for(&dir.path().to_path_buf());
+        let router = build_router(app);
+
+        // Search for ".rs" — should find both main.rs and sub/lib.rs
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/filesearch?tab=0&q=.rs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let entries: Vec<crate::git::types::FileTreeEntry> =
+            serde_json::from_slice(&bytes).unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"src/main.rs"), "got: {paths:?}");
+        assert!(paths.contains(&"src/sub/lib.rs"), "got: {paths:?}");
+        assert!(!paths.contains(&"Cargo.toml"), "should not match .toml: {paths:?}");
+    }
+
+    /// Writes a minimal valid PNG (1x1) so an image path is recognized.
+    fn image_placeholder(path: &std::path::Path) -> std::io::Result<()> {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+            0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+            0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+            0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(path, PNG)
     }
 }

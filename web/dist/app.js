@@ -281,6 +281,7 @@ function render(state) {
   actionsSection.style.display = "block";
   branchesSection.style.display = "block";
   stashesSection.style.display = "block";
+  document.getElementById("files-section").style.display = "block";
   document.title = `Grit | ${tab.name}`;
   const overviewEl = document.getElementById("overview");
   const count = tab.state.changes.length;
@@ -297,6 +298,7 @@ function render(state) {
   renderBranches(tab);
   renderStashes(tab);
   renderLog(tab);
+  renderFileBrowser(tab);
 
   const changesEl = document.getElementById("changes");
   let stillOpen = false;
@@ -608,6 +610,386 @@ document.getElementById("run-script-btn").onclick = () => {
   if (!relPath) return;
   sendAction({ RunScript: relPath });
 };
+
+//#endregion
+
+//#region File browser
+
+let rootEntries = new Map();
+let expandedDirs = new Map();
+let dirChildren = new Map();
+let selectedFiles = new Map();
+let fileTreeLoading = new Map();
+
+async function fetchFileTree(tab) {
+  if (fileTreeLoading.get(tab.id)) return;
+  fileTreeLoading.set(tab.id, true);
+  try {
+    const response = await fetch(`/filetree?tab=${tab.id}&path=`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    rootEntries.set(tab.id, await response.json());
+    renderFileTree(tab);
+    const prevSelected = selectedFiles.get(tab.id);
+    if (prevSelected) {
+      selectFile(tab, prevSelected);
+    } else {
+      document.getElementById("preview-header").innerHTML = "";
+      document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+    }
+  } catch (err) {
+    console.error("Failed to load file tree:", err);
+  } finally {
+    fileTreeLoading.set(tab.id, false);
+  }
+}
+
+async function fetchDirChildren(tab, dirPath) {
+  const key = `${tab.id}:${dirPath}`;
+  if (dirChildren.has(key)) return dirChildren.get(key);
+  try {
+    const response = await fetch(`/filetree?tab=${tab.id}&path=${encodeURIComponent(dirPath)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const children = await response.json();
+    dirChildren.set(key, children);
+    return children;
+  } catch (err) {
+    console.error("Failed to load directory:", err);
+    return [];
+  }
+}
+
+let searchResults = new Map(); // tab.id → array of search results
+let searchTimer = null;
+
+async function fetchSearchResults(tab, query) {
+  try {
+    const response = await fetch(`/filesearch?tab=${tab.id}&q=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    searchResults.set(tab.id, await response.json());
+    renderFileTree(tab);
+  } catch (err) {
+    console.error("Search failed:", err);
+  }
+}
+
+function renderFileTree(tab) {
+  const container = document.getElementById("file-tree");
+  const subtitle = document.getElementById("files-subtitle");
+  container.textContent = "";
+
+  const filter = (document.getElementById("file-tree-filter").value || "").trim();
+  const query = filter.toLowerCase();
+  const selectedPath = selectedFiles.get(tab.id);
+
+  // Server-side search mode when filter has text
+  if (filter) {
+    const results = searchResults.get(tab.id);
+    if (results === undefined) {
+      // Show loading and fire search
+      const loading = document.createElement("div");
+      loading.className = "muted";
+      loading.textContent = "Searching\u2026";
+      container.appendChild(loading);
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => fetchSearchResults(tab, filter), 200);
+      return;
+    }
+    subtitle.textContent = results.length === 0
+      ? "No matches"
+      : `${results.length} match${results.length !== 1 ? "es" : ""}`;
+    for (const entry of results) {
+      const item = document.createElement("div");
+      item.className = "tree-item";
+      if (entry.path === selectedPath) item.classList.add("selected");
+      const icon = document.createElement("span");
+      icon.className = "icon";
+      icon.textContent = "\u25a1";
+      const name = document.createElement("span");
+      name.className = "tree-name";
+      name.textContent = entry.path;
+      item.appendChild(icon);
+      item.appendChild(name);
+      item.onclick = (e) => {
+        e.stopPropagation();
+        selectFile(tab, entry.path);
+      };
+      container.appendChild(item);
+    }
+    return;
+  }
+
+  // Normal tree mode
+  const roots = rootEntries.get(tab.id);
+  const expanded = expandedDirs.get(tab.id) || new Set();
+
+  if (!roots || roots.length === 0) {
+    subtitle.textContent = "";
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = "No files.";
+    container.appendChild(empty);
+    return;
+  }
+
+  const collectVisible = (entries, parentPath, depth) => {
+    const result = [];
+    const sorted = [...entries].sort((a, b) =>
+      a.is_dir !== b.is_dir
+        ? a.is_dir ? -1 : 1
+        : a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
+    );
+    for (const entry of sorted) {
+      result.push({ entry, depth });
+      if (entry.is_dir && expanded.has(entry.path)) {
+        const childKey = `${tab.id}:${entry.path}`;
+        const cached = dirChildren.get(childKey);
+        if (cached) {
+          result.push(...collectVisible(cached, entry.path, depth + 1));
+        }
+      }
+    }
+    return result;
+  };
+
+  const visible = collectVisible(roots, "", 0);
+  const totalVisible = visible.length;
+  subtitle.textContent = `${totalVisible} items`;
+
+  for (const { entry, depth } of visible) {
+    const item = document.createElement("div");
+    item.className = "tree-item" + (entry.is_dir ? " folder" : "");
+    if (entry.path === selectedPath) {
+      item.classList.add("selected");
+    }
+    item.style.paddingLeft = `${0.25 + depth * 1.1}rem`;
+
+    const icon = document.createElement("span");
+    icon.className = "icon";
+    if (entry.is_dir) {
+      const isOpen = expanded.has(entry.path);
+      icon.textContent = isOpen ? "\u25bc" : "\u25b6";
+      icon.classList.add("tree-arrow");
+    } else {
+      icon.textContent = "\u25a1";
+    }
+
+    const name = document.createElement("span");
+    name.className = "tree-name";
+    name.textContent = entry.name;
+
+    item.appendChild(icon);
+    item.appendChild(name);
+
+    if (entry.is_dir) {
+      item.onclick = (e) => {
+        e.stopPropagation();
+        toggleDir(tab, entry.path);
+      };
+    } else {
+      item.onclick = (e) => {
+        e.stopPropagation();
+        selectFile(tab, entry.path);
+      };
+    }
+
+    container.appendChild(item);
+  }
+}
+
+async function toggleDir(tab, dirPath) {
+  const expanded = expandedDirs.get(tab.id) || new Set();
+  if (expanded.has(dirPath)) {
+    expanded.delete(dirPath);
+    collapseDescendants(tab, dirPath);
+  } else {
+    expanded.add(dirPath);
+    if (!dirChildren.has(`${tab.id}:${dirPath}`)) {
+      const children = await fetchDirChildren(tab, dirPath);
+      dirChildren.set(`${tab.id}:${dirPath}`, children);
+    }
+  }
+  expandedDirs.set(tab.id, expanded);
+  renderFileTree(tab);
+}
+
+function collapseDescendants(tab, dirPath) {
+  const expanded = expandedDirs.get(tab.id);
+  if (!expanded) return;
+  const prefix = dirPath + "/";
+  for (const key of [...expanded]) {
+    if (key.startsWith(prefix)) {
+      expanded.delete(key);
+    }
+  }
+}
+
+async function selectFile(tab, path) {
+  selectedFiles.set(tab.id, path);
+  renderFileTree(tab);
+
+  const header = document.getElementById("preview-header");
+  const content = document.getElementById("preview-content");
+
+  header.innerHTML = `<span class="filename">${path}</span><div class="preview-actions"><div class="app-selector"><button id="open-external-btn" title="Open in default editor">Edit</button><button id="open-with-btn" title="Choose application">&#9662;</button></div><div class="file-actions-selector"><button id="file-actions-btn" title="File actions">&#9881;</button></div></div>`;
+  content.innerHTML = "<p class='muted'>Loading...</p>";
+
+  // Fetch apps in parallel with file content
+  const contentPromise = fetch(`/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}`)
+    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+  const appsPromise = fetch(`/apps?path=${encodeURIComponent(path)}`)
+    .then(r => { if (!r.ok) return []; return r.json(); })
+    .catch(() => []);
+
+  try {
+    const [data, apps] = await Promise.all([contentPromise, appsPromise]);
+
+    if (data.error) {
+      content.innerHTML = `<p class="preview-error">${data.error}</p>`;
+    } else if (data.is_binary) {
+      content.innerHTML = `<p class="preview-binary">Binary file (${data.size} bytes)</p>`;
+    } else if (data.is_image) {
+      content.innerHTML = `<img src="/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}&raw=true" alt="${path}">`;
+    } else {
+      content.textContent = data.content;
+    }
+
+    document.getElementById("open-external-btn").onclick = () => {
+      sendAction({ OpenExternal: path });
+    };
+
+    const openWithBtn = document.getElementById("open-with-btn");
+    if (apps.length === 0) {
+      openWithBtn.style.display = "none";
+    } else {
+      openWithBtn.onclick = () => {
+        const existing = document.querySelector(".app-dropdown");
+        if (existing) { existing.remove(); return; }
+        const dropdown = document.createElement("div");
+        dropdown.className = "app-dropdown";
+        for (const app of apps) {
+          const item = document.createElement("div");
+          item.className = "app-item";
+          item.textContent = app.name;
+          item.title = app.exec;
+          item.onclick = (e) => {
+            e.stopPropagation();
+            dropdown.remove();
+            sendAction({ OpenWith: [path, app.exec] });
+          };
+          dropdown.appendChild(item);
+        }
+        document.body.appendChild(dropdown);
+        const rect = openWithBtn.getBoundingClientRect();
+        dropdown.style.position = "fixed";
+        dropdown.style.top = (rect.bottom + 2) + "px";
+        dropdown.style.right = (window.innerWidth - rect.right) + "px";
+        // Close on scroll
+        const scrollParent = openWithBtn.closest(".section-body") || window;
+        function onScroll() { cleanup(); dropdown.remove(); }
+        scrollParent.addEventListener("scroll", onScroll, { passive: true });
+        if (scrollParent !== window) {
+          window.addEventListener("scroll", onScroll, { passive: true });
+        }
+        function cleanup() {
+          scrollParent.removeEventListener("scroll", onScroll);
+          window.removeEventListener("scroll", onScroll);
+        }
+        // Close on outside click
+        setTimeout(() => {
+          document.addEventListener("click", function closer() {
+            cleanup();
+            dropdown.remove();
+            document.removeEventListener("click", closer);
+          });
+        }, 0);
+      };
+    }
+
+    const fileActionsBtn = document.getElementById("file-actions-btn");
+    fileActionsBtn.onclick = () => {
+      const existing = document.querySelector(".app-dropdown");
+      if (existing) { existing.remove(); return; }
+      const dropdown = document.createElement("div");
+      dropdown.className = "app-dropdown";
+      const renameItem = document.createElement("div");
+      renameItem.className = "app-item";
+      renameItem.textContent = "Rename";
+      renameItem.onclick = (e) => {
+        e.stopPropagation();
+        dropdown.remove();
+        const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+        const baseName = path.substring(path.lastIndexOf("/") + 1);
+        const newName = prompt("Rename to:", baseName);
+        if (newName && newName !== baseName) {
+          const newPath = dir ? dir + "/" + newName : newName;
+          sendAction({ RenameFile: [path, newPath] });
+        }
+      };
+      dropdown.appendChild(renameItem);
+      const deleteItem = document.createElement("div");
+      deleteItem.className = "app-item app-item-danger";
+      deleteItem.textContent = "Delete";
+      deleteItem.onclick = (e) => {
+        e.stopPropagation();
+        dropdown.remove();
+        if (confirm("Delete " + path + "?")) {
+          sendAction({ DeleteFile: path });
+          selectedFiles.delete(tab.id);
+          document.getElementById("preview-header").innerHTML = "";
+          document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+        }
+      };
+      dropdown.appendChild(deleteItem);
+      document.body.appendChild(dropdown);
+      const rect = fileActionsBtn.getBoundingClientRect();
+      dropdown.style.position = "fixed";
+      dropdown.style.top = (rect.bottom + 2) + "px";
+      dropdown.style.right = (window.innerWidth - rect.right) + "px";
+      const scrollParent = fileActionsBtn.closest(".section-body") || window;
+      function onScroll() { cleanup(); dropdown.remove(); }
+      scrollParent.addEventListener("scroll", onScroll, { passive: true });
+      if (scrollParent !== window) {
+        window.addEventListener("scroll", onScroll, { passive: true });
+      }
+      function cleanup() {
+        scrollParent.removeEventListener("scroll", onScroll);
+        window.removeEventListener("scroll", onScroll);
+      }
+      setTimeout(() => {
+        document.addEventListener("click", function closer() {
+          cleanup();
+          dropdown.remove();
+          document.removeEventListener("click", closer);
+        });
+      }, 0);
+    };
+  } catch (err) {
+    content.innerHTML = `<p class="preview-error">Failed to load: ${err}</p>`;
+  }
+}
+
+function renderFileBrowser(tab) {
+  const section = document.getElementById("files-section");
+  section.style.display = "block";
+
+  // Clear filter when switching tabs
+  const filter = document.getElementById("file-tree-filter");
+  if (filter) filter.value = "";
+
+  if (rootEntries.get(tab.id) === undefined && !fileTreeLoading.get(tab.id)) {
+    fetchFileTree(tab);
+  } else {
+    renderFileTree(tab);
+    // Re-show previously selected file for this tab, or clear preview
+    const prevSelected = selectedFiles.get(tab.id);
+    if (prevSelected) {
+      selectFile(tab, prevSelected);
+    } else {
+      document.getElementById("preview-header").innerHTML = "";
+      document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+    }
+  }
+}
 
 //#endregion
 
@@ -1330,6 +1712,18 @@ document.getElementById("branch-filter").addEventListener("input", () => {
   if (!lastState) return;
   const tab = activeTab(lastState);
   if (tab) renderBranches(tab);
+});
+
+document.getElementById("file-tree-filter").addEventListener("input", () => {
+  if (!lastState) return;
+  const tab = activeTab(lastState);
+  if (!tab) return;
+  const filter = (document.getElementById("file-tree-filter").value || "").trim();
+  if (!filter) {
+    searchResults.delete(tab.id);
+    clearTimeout(searchTimer);
+  }
+  renderFileTree(tab);
 });
 
 document.getElementById("stash-list").addEventListener("click", (event) => {

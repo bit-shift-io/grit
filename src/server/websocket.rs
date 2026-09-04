@@ -224,6 +224,95 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
         return;
     }
 
+    if let crate::git::types::GitAction::OpenExternal(path) = &msg.action {
+        let Some(tab_id) = msg.tab else {
+            tracing::debug!("OpenExternal ignored: no tab id");
+            return;
+        };
+        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
+            tracing::debug!("OpenExternal ignored: unknown tab {}", tab_id);
+            return;
+        };
+        let path = path.clone();
+        let repo_path = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file_path = std::path::Path::new(&repo_path).join(&path);
+            let editor_cfg = crate::shared_config::load_editor_config();
+            let editor = editor_cfg.for_path(&path);
+            let _ = std::process::Command::new(&editor)
+                .arg(&file_path)
+                .spawn();
+        }).await.ok();
+        return;
+    }
+
+    if let crate::git::types::GitAction::OpenWith(path, exec) = &msg.action {
+        let Some(tab_id) = msg.tab else {
+            tracing::debug!("OpenWith ignored: no tab id");
+            return;
+        };
+        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
+            tracing::debug!("OpenWith ignored: unknown tab {}", tab_id);
+            return;
+        };
+        let path = path.clone();
+        let exec = exec.clone();
+        let repo_path = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file_path = std::path::Path::new(&repo_path).join(&path);
+            // exec may contain field codes like %f — strip them for basic spawning
+            let cmd = exec.split_whitespace().next().unwrap_or(&exec);
+            let _ = std::process::Command::new(cmd)
+                .arg(&file_path)
+                .spawn();
+        }).await.ok();
+        return;
+    }
+
+    if let crate::git::types::GitAction::DeleteFile(path) = &msg.action {
+        let Some(tab_id) = msg.tab else {
+            tracing::debug!("DeleteFile ignored: no tab id");
+            return;
+        };
+        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
+            tracing::debug!("DeleteFile ignored: unknown tab {}", tab_id);
+            return;
+        };
+        let path = path.clone();
+        let repo_path = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let file_path = std::path::Path::new(&repo_path).join(&path);
+            if file_path.exists() {
+                let _ = std::fs::remove_file(&file_path);
+            }
+        }).await.ok();
+        crate::server::refresh_tab(&app, tab_id).await;
+        return;
+    }
+
+    if let crate::git::types::GitAction::RenameFile(old_path, new_path) = &msg.action {
+        let Some(tab_id) = msg.tab else {
+            tracing::debug!("RenameFile ignored: no tab id");
+            return;
+        };
+        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
+            tracing::debug!("RenameFile ignored: unknown tab {}", tab_id);
+            return;
+        };
+        let old_path = old_path.clone();
+        let new_path = new_path.clone();
+        let repo_path = repo_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let old = std::path::Path::new(&repo_path).join(&old_path);
+            let new = std::path::Path::new(&repo_path).join(&new_path);
+            if old.exists() {
+                let _ = std::fs::rename(&old, &new);
+            }
+        }).await.ok();
+        crate::server::refresh_tab(&app, tab_id).await;
+        return;
+    }
+
     let Some(tab_id) = msg.tab else {
         tracing::debug!("ignoring action without a tab id");
         return;

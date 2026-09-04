@@ -2,8 +2,8 @@ pub mod types;
 pub mod watcher;
 
 pub use types::{
-    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, LogEntry,
-    LogStatus, RepoState, StashEntry,
+    CommitInfo, CommitSummary, FileChange, FileContent, FilePair, FileStat, FileTreeEntry,
+    GitAction, GitStatus, LogEntry, LogStatus, RepoState, StashEntry,
 };
 
 use std::cell::{Cell, RefCell};
@@ -356,7 +356,11 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
             | GitAction::NewTab(_)
             | GitAction::CloseTab
             | GitAction::DiscardUntracked(_)
-            | GitAction::SearchHistory(_) => {
+            | GitAction::SearchHistory(_)
+            | GitAction::OpenExternal(_)
+            | GitAction::OpenWith(_, _)
+            | GitAction::DeleteFile(_)
+            | GitAction::RenameFile(_, _) => {
             return None;
         }
     };
@@ -740,6 +744,262 @@ pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError>
         }
     };
     Ok(FilePair { original, current })
+}
+
+/// Image extensions render inline in the preview pane.
+pub fn is_image_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" | "ico" | "avif"
+    )
+}
+
+/// Lists the immediate children of a directory inside the repository for the
+/// file browser. Empty `dir` means the repo root. `.git/` and common build/vendor
+/// directories (`target`, `node_modules`, `dist`, `build`, `.venv`, `.idea`,
+/// `.vscode`, `.DS_Store`) are skipped so navigation stays fast and focused on
+/// source. Directories are returned first, then files, each alphabetically.
+pub fn list_dir(repo_path: &Path, dir: &str) -> Result<Vec<FileTreeEntry>, GitError> {
+    let base = if dir.is_empty() {
+        repo_path.to_path_buf()
+    } else {
+        // Prevent path traversal outside the repository.
+        let normalized = std::path::Path::new(dir);
+        if normalized.is_absolute() || normalized.components().any(|c| c == std::path::Component::ParentDir) {
+            return Ok(Vec::new());
+        }
+        repo_path.join(normalized)
+    };
+
+    const SKIP: &[&str] = &[".git", "target", "node_modules", "dist", "build", ".venv", ".idea", ".vscode", ".DS_Store"];
+
+    let mut entries = Vec::new();
+    let read = match std::fs::read_dir(&base) {
+        Ok(r) => r,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    for item in read.flatten() {
+        let name = item.file_name().to_string_lossy().into_owned();
+        if SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        let rel = if dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{dir}/{name}")
+        };
+        match item.file_type() {
+            Ok(ft) if ft.is_dir() => entries.push(FileTreeEntry {
+                name,
+                path: rel,
+                is_dir: true,
+                depth: 0,
+            }),
+            Ok(ft) if ft.is_file() => entries.push(FileTreeEntry {
+                name,
+                path: rel,
+                is_dir: false,
+                depth: 0,
+            }),
+            _ => {}
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// Recursively searches the repository for files whose path contains `query`
+/// (case-insensitive substring match). Returns at most `limit` results.
+/// Skips the same directories as `list_dir`.
+pub fn search_files(repo_path: &Path, query: &str, limit: usize) -> Result<Vec<FileTreeEntry>, GitError> {
+    const SKIP: &[&str] = &[".git", "target", "node_modules", "dist", "build", ".venv", ".idea", ".vscode", ".DS_Store"];
+    let q = query.to_lowercase();
+    let mut results = Vec::new();
+    let mut stack = vec![String::new()]; // relative dir paths; "" = root
+    while let Some(dir) = stack.pop() {
+        let base = if dir.is_empty() {
+            repo_path.to_path_buf()
+        } else {
+            repo_path.join(&dir)
+        };
+        let read = match std::fs::read_dir(&base) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let mut children = Vec::new();
+        for item in read.flatten() {
+            let name = item.file_name().to_string_lossy().into_owned();
+            if SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let rel = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            match item.file_type() {
+                Ok(ft) if ft.is_dir() => children.push((name, rel, true)),
+                Ok(ft) if ft.is_file() => children.push((name, rel, false)),
+                _ => {}
+            }
+        }
+        // Directories first (so recursion explores tree depth-first), then files.
+        children.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
+        for (name, rel, is_dir) in children {
+            if is_dir {
+                stack.push(rel);
+            } else if rel.to_lowercase().contains(&q) {
+                results.push(FileTreeEntry { name, path: rel, is_dir: false, depth: 0 });
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+    }
+    // Sort by path for stable output.
+    results.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    Ok(results)
+}
+
+/// Returns the MIME type for a file path based on its extension.
+pub fn mime_for_path(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        // Images
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "tiff" | "tif" => "image/tiff",
+        "psd" => "image/vnd.adobe.photoshop",
+        // Text / code
+        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "hpp"
+        | "go" | "java" | "rb" | "php" | "sh" | "bash" | "zsh" | "fish"
+        | "vim" | "lua" | "r" | "swift" | "kt" | "cs" | "fs" | "hs"
+        | "ex" | "exs" | "erl" | "clj" | "lisp" | "el" | "jl"
+        | "toml" | "yaml" | "yml" | "json" | "jsonc" | "json5" | "xml"
+        | "html" | "htm" | "css" | "scss" | "less" | "sql" | "graphql"
+        | "proto" | "md" | "txt" | "csv" | "ini" | "cfg" | "conf"
+        | "env" | "gitignore" | "gitattributes" | "dockerignore"
+        | "nix" | "zig" | "cmake" => "text/plain",
+        "dockerfile" | "makefile" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// An entry returned by `list_apps_for_mime`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppEntry {
+    pub name: String,
+    pub exec: String,
+}
+
+/// Scans installed `.desktop` files for applications that can handle the
+/// given MIME type. Uses `freedesktop-desktop-entry` to iterate all known
+/// desktop entries. Returns at most 30 apps sorted by name.
+#[cfg(not(target_os = "macos"))]
+pub fn list_apps_for_mime(mime_type: &str) -> Vec<AppEntry> {
+    use freedesktop_desktop_entry::{default_paths, DesktopEntry, Iter};
+
+    let locales = freedesktop_desktop_entry::get_languages_from_env();
+    let mut seen_exec = std::collections::HashSet::new();
+    let mut apps = Vec::new();
+
+    for path in Iter::new(default_paths()) {
+        let Ok(entry) = DesktopEntry::from_path(path, Some(&locales)) else {
+            continue;
+        };
+        if entry.hidden() {
+            continue;
+        }
+        if entry.exec().is_none() {
+            continue;
+        }
+        if let Some(mimes) = entry.mime_type() {
+            if mimes.iter().any(|m| *m == mime_type) {
+                let name = entry
+                    .name(&locales)
+                    .unwrap_or_default()
+                    .to_string();
+                let exec = entry.exec().unwrap_or("").to_string();
+                if !name.is_empty() && !exec.is_empty() && seen_exec.insert(exec.clone()) {
+                    apps.push(AppEntry { name, exec });
+                }
+            }
+        }
+    }
+
+    apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    apps.truncate(30);
+    apps
+}
+
+#[cfg(target_os = "macos")]
+pub fn list_apps_for_mime(_mime_type: &str) -> Vec<AppEntry> {
+    Vec::new()
+}
+
+/// Reads a worktree file for the preview pane, detecting binary contents and
+/// image files. Errors are folded into the payload's `error` field so the
+/// handler can return a 200 with a graceful client-side message.
+pub fn get_file_content(repo_path: &Path, path: &str) -> FileContent {
+    let full = repo_path.join(path);
+    let meta = match std::fs::metadata(&full) {
+        Ok(m) => m,
+        Err(e) => {
+            return FileContent {
+                path: path.to_string(),
+                size: 0,
+                is_binary: false,
+                is_image: false,
+                content: String::new(),
+                error: format!("failed to read {path}: {e}"),
+            }
+        }
+    };
+    let bytes = match std::fs::read(&full) {
+        Ok(b) => b,
+        Err(e) => {
+            return FileContent {
+                path: path.to_string(),
+                size: 0,
+                is_binary: false,
+                is_image: false,
+                content: String::new(),
+                error: format!("failed to read {path}: {e}"),
+            }
+        }
+    };
+    let is_image = is_image_path(path);
+    let is_binary = !is_image && bytes.contains(&0u8);
+    let content = if is_binary || is_image {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    FileContent {
+        path: path.to_string(),
+        size: meta.len(),
+        is_binary,
+        is_image,
+        content,
+        error: String::new(),
+    }
 }
 
 /// Parses a `--shortstat` line like "3 files changed, 10 insertions(+),

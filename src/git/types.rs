@@ -108,6 +108,30 @@ pub struct FilePair {
     pub current: String,
 }
 
+/// One node in the repository file browser. The tree is returned flat with
+/// `depth` so the client can indent without building a nested structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileTreeEntry {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub depth: usize,
+}
+
+/// Payload for a single file's preview contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileContent {
+    pub path: String,
+    /// Raw byte count of the worktree file (used for binary sizing).
+    pub size: u64,
+    pub is_binary: bool,
+    pub is_image: bool,
+    /// UTF-8 text content; empty for binary/image files.
+    pub content: String,
+    /// Non-empty when the read fails so the client can surface it inline.
+    pub error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStat {
     pub status: String,
@@ -204,6 +228,14 @@ pub enum GitAction {
     RunScript(String),
     /// Server-side history search via `git log --grep`.
     SearchHistory(String),
+    /// Open file in external editor.
+    OpenExternal(String),
+    /// Open file with a specific application (path, exec command).
+    OpenWith(String, String),
+    /// Delete a file (repo-relative path).
+    DeleteFile(String),
+    /// Rename/move a file (old path, new path).
+    RenameFile(String, String),
 }
 
 #[cfg(test)]
