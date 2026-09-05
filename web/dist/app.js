@@ -11,6 +11,12 @@ const HISTORY_SEARCH_FILLED_MS = 300;
 const HISTORY_SEARCH_EMPTY_MS = 150;
 const BRANCH_FILTER_DEBOUNCE_MS = 150;
 const DROPDOWN_OFFSET_PX = 2;
+const KRUST_BASE = "http://localhost:3000";
+const KRUST_PROBE_MS = 5000;
+const KRUST_SESSIONS = {
+  "term-1": { iframe: "krust-1", sid: "grit-term-1" },
+  "term-2": { iframe: "krust-2", sid: "grit-term-2" },
+};
 
 let ws = null;
 let reconnectTimer = null;
@@ -89,6 +95,7 @@ let awaitingNewTab = false;
 let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
+let activeView = getInitialView();
 let browserDir = null;
 let browserParent = null;
 let browserSeeding = false;
@@ -280,6 +287,10 @@ function render(state) {
   const actionsSection = document.getElementById("actions");
   const branchesSection = document.getElementById("branches-section");
   const stashesSection = document.getElementById("stashes-section");
+  const filesSection = document.getElementById("files-section");
+  const dock = document.getElementById("dock");
+  const termView1 = document.getElementById("view-term-1");
+  const termView2 = document.getElementById("view-term-2");
 
   if (showAddForm || state.tabs.length === 0) {
     updateUrlTab(null);
@@ -290,21 +301,23 @@ function render(state) {
     actionsSection.style.display = "none";
     branchesSection.style.display = "none";
     stashesSection.style.display = "none";
+    filesSection.style.display = "none";
+    termView1.style.display = "none";
+    termView2.style.display = "none";
+    dock.style.display = "none";
+    document.body.classList.remove("view-dashboard", "view-files", "view-log", "view-term-1", "view-term-2");
+    updateDockBadges(null);
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
   }
   const tab = activeTab(state);
-  
+
   addRepoForm.style.display = "none";
-  repoView.style.display = "block";
-  historySection.style.display = "block";
-  logSection.style.display = "block";
-  actionsSection.style.display = "block";
-  branchesSection.style.display = "block";
-  stashesSection.style.display = "block";
-  document.getElementById("files-section").style.display = "block";
+  dock.style.display = "flex";
   document.title = `Grit | ${tab.name}`;
+  showView(activeView);
+  updateDockBadges(tab);
   const overviewEl = document.getElementById("overview");
   const count = tab.state.changes.length;
   if (count === 0) {
@@ -1001,7 +1014,7 @@ let lastFileBrowserTab = null;
 
 function renderFileBrowser(tab) {
   const section = document.getElementById("files-section");
-  section.style.display = "block";
+  section.style.display = activeView === "files" ? "block" : "none";
 
   // Clear the filter only when switching to a different tab
   const filter = document.getElementById("file-tree-filter");
@@ -1803,4 +1816,125 @@ document.getElementById("create-stash-btn").onclick = () => {
   sendAction({ StashPush: msg });
   document.getElementById("stash-input").value = "";
 };
+//#endregion
+
+//#region View dock (Dashboard / Files / Log / Terminals)
+
+function getInitialView() {
+  const v = new URL(window.location.href).searchParams.get("view");
+  return v === "files" || v === "log" || v === "term-1" || v === "term-2" ? v : "dashboard";
+}
+
+function showView(view) {
+  activeView = view;
+  updateUrlView(view);
+  const dashboard = view === "dashboard";
+  document.getElementById("actions").style.display = dashboard ? "block" : "none";
+  document.getElementById("repo-view").style.display = dashboard ? "block" : "none";
+  document.getElementById("branches-section").style.display = dashboard ? "block" : "none";
+  document.getElementById("stashes-section").style.display = dashboard ? "block" : "none";
+  document.getElementById("history-section").style.display = dashboard ? "block" : "none";
+  document.getElementById("files-section").style.display = view === "files" ? "block" : "none";
+  document.getElementById("log-section").style.display = view === "log" ? "block" : "none";
+  document.getElementById("view-term-1").style.display = view === "term-1" ? "block" : "none";
+  document.getElementById("view-term-2").style.display = view === "term-2" ? "block" : "none";
+  for (const v of ["dashboard", "files", "log", "term-1", "term-2"]) {
+    document.body.classList.toggle(`view-${v}`, v === view);
+  }
+  document.querySelectorAll(".dock-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+  const sess = KRUST_SESSIONS[view];
+  if (sess) {
+    ensureKrustFrame(sess);
+    const frame = document.getElementById(sess.iframe);
+    if (frame && frame.getAttribute("src")) {
+      try { frame.contentWindow.focus(); } catch (e) { /* cross-origin focus is best-effort */ }
+    }
+  }
+}
+
+function updateUrlView(view) {
+  const url = new URL(window.location.href);
+  if (view === "dashboard") {
+    url.searchParams.delete("view");
+  } else {
+    url.searchParams.set("view", view);
+  }
+  window.history.replaceState({}, "", url);
+}
+
+function setView(view) {
+  if (activeView === view) return;
+  showView(view);
+  if (lastState) render(lastState);
+}
+
+function updateDockBadges(tab) {
+  const dashBadge = document.getElementById("dock-count-dashboard");
+  const logBadge = document.getElementById("dock-count-log");
+  const nChanges = tab ? (tab.state ? tab.state.changes.length : 0) : 0;
+  const nFailed = tab ? ((tab.log || []).filter((e) => e.status === "failed").length) : 0;
+  dashBadge.textContent = nChanges > 0 ? String(nChanges) : "";
+  dashBadge.style.display = nChanges > 0 ? "" : "none";
+  logBadge.textContent = nFailed > 0 ? String(nFailed) : "";
+  logBadge.style.display = nFailed > 0 ? "" : "none";
+}
+
+document.getElementById("dock").addEventListener("click", (event) => {
+  const btn = event.target.closest(".dock-btn");
+  if (btn) setView(btn.dataset.view);
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const tag = event.target && event.target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  const key = event.key.toLowerCase();
+  if (key === "d") setView("dashboard");
+  else if (key === "f") setView("files");
+  else if (key === "l") setView("log");
+  else if (key === "1") setView("term-1");
+  else if (key === "2") setView("term-2");
+});
+
+//#region krust terminal integration
+
+let krustAvailable = false;
+
+function currentRepoPath() {
+  if (!lastState || lastState.tabs.length === 0) return "";
+  const tab = activeTab(lastState);
+  return (tab && tab.repo_path) ? tab.repo_path : "";
+}
+
+function ensureKrustFrame(sess) {
+  const frame = document.getElementById(sess.iframe);
+  if (!frame || frame.getAttribute("src")) return;
+  const dir = currentRepoPath();
+  frame.setAttribute("src", `${KRUST_BASE}/?s=${sess.sid}&dir=${encodeURIComponent(dir)}`);
+}
+
+async function probeKrust() {
+  let ok = false;
+  try {
+    const res = await fetch(`${KRUST_BASE}/`, { mode: "cors" });
+    ok = res.ok;
+  } catch (e) {
+    ok = false;
+  }
+  krustAvailable = ok;
+  document.querySelectorAll(".krust-btn").forEach((btn) => {
+    btn.style.display = ok ? "" : "none";
+  });
+  if (!ok && (activeView === "term-1" || activeView === "term-2")) {
+    setView("dashboard");
+  }
+}
+
+probeKrust();
+setInterval(probeKrust, KRUST_PROBE_MS);
+
+//#endregion
+
 //#endregion

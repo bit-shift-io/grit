@@ -1,5 +1,93 @@
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
 body { margin: 0; padding: 1rem; }
+.app-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+main { flex: 1; min-width: 0; }
+#dock {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  background: var(--dock-bg, rgba(224, 224, 224, 0.6));
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 0.75rem;
+  position: sticky;
+  top: 1rem;
+  flex-shrink: 0;
+}
+#dock .dock-btn {
+  position: relative;
+  width: 2.4rem;
+  height: 2.4rem;
+  border: none;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#dock .dock-btn:hover { background: var(--section-hover, #d0d0d0); }
+#dock .dock-btn.active { background: var(--btn-hover, #ddd); }
+#dock .dock-btn.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: 60%;
+  width: 3px;
+  border-radius: 2px;
+  background: rgba(46, 125, 50, 0.85);
+}
+.dock-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  transform: translate(30%, -30%);
+  min-width: 1.1rem;
+  height: 1.1rem;
+  line-height: 1.1rem;
+  padding: 0 0.25rem;
+  border-radius: 0.6rem;
+  background: #b3261e;
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-align: center;
+  box-sizing: border-box;
+}
+#dock .dock-btn .dock-badge-krust {
+  background: rgba(46, 125, 50, 0.85);
+}
+.term-view { padding: 0; }
+.krust-frame {
+  display: block;
+  width: 100%;
+  height: calc(100vh - 5rem);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 0.5rem;
+  background: #2b2b2b;
+}
+body.view-files #files-section .file-browser {
+  height: calc(100vh - 5rem);
+  grid-template-rows: minmax(20rem, 1fr);
+}
+body.view-log #log {
+  max-height: calc(100vh - 11rem);
+}
+.file-tree-status {
+  padding: 0.2rem 0.6rem;
+  border-top: 1px solid var(--btn-border, #ccc);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
 #conn-status {
   position: fixed;
   left: 0;
@@ -444,6 +532,7 @@ body { margin: 0; padding: 1rem; }
     --log-rule: rgba(128, 128, 128, 0.2);
     --log-prompt: #7ec8a2;
     --log-failed: #ff8a80;
+    --dock-bg: rgba(42, 42, 42, 0.7);
   }
 }
 .commit-row { padding: 0; }

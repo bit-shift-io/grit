@@ -9,7 +9,16 @@
 </head>
 <body>
   <nav id="tabs"></nav>
-  <section id="actions" class="section" style="display: none;">
+  <div class="app-layout">
+    <nav id="dock" aria-label="View">
+      <button class="dock-btn" data-view="dashboard" title="Dashboard (D)">D<span class="dock-badge" id="dock-count-dashboard"></span></button>
+      <button class="dock-btn" data-view="files" title="Files (F)">F</button>
+      <button class="dock-btn" data-view="log" title="Log (L)">L<span class="dock-badge" id="dock-count-log"></span></button>
+      <button class="dock-btn krust-btn" data-view="term-1" title="Terminal 1 (1)" style="display: none;">T<span class="dock-badge dock-badge-krust">1</span></button>
+      <button class="dock-btn krust-btn" data-view="term-2" title="Terminal 2 (2)" style="display: none;">T<span class="dock-badge dock-badge-krust">2</span></button>
+    </nav>
+    <main>
+      <section id="actions" class="section" style="display: none;">
     <h2 class="section-title">Actions <span class="arrow">&#9662;</span></h2>
     <div class="section-body">
       <div class="action-row">
@@ -24,8 +33,7 @@
       </div>
     </div>
   </section>
-  <main>
-    <section id="add-repo-form" class="section" style="display: none;">
+  <section id="add-repo-form" class="section" style="display: none;">
       <h2 class="section-title">Add Repository <span class="arrow">&#9662;</span></h2>
       <div class="section-body">
         <div class="form-group">
@@ -68,19 +76,17 @@
         <div id="changes"></div>
       </div>
     </section>
-    <section id="files-section" class="section collapsed" style="display: none;">
-      <h2 class="section-title"><span>Files <span id="files-subtitle" class="muted"></span></span><span class="arrow">&#9652;</span></h2>
-      <div class="section-body">
-        <div class="file-browser">
-          <div class="file-tree-pane">
-            <input id="file-tree-filter" type="text" placeholder="Filter files...">
-            <div class="file-tree" id="file-tree"></div>
-          </div>
-          <div class="file-preview">
-            <div class="preview-header" id="preview-header"></div>
-            <div class="preview-content" id="preview-content">
-              <p class="muted">Select a file to preview</p>
-            </div>
+    <section id="files-section" style="display: none;">
+      <div class="file-browser">
+        <div class="file-tree-pane">
+          <input id="file-tree-filter" type="text" placeholder="Filter files...">
+          <div class="file-tree" id="file-tree"></div>
+          <div class="file-tree-status muted" id="files-subtitle"></div>
+        </div>
+        <div class="file-preview">
+          <div class="preview-header" id="preview-header"></div>
+          <div class="preview-content" id="preview-content">
+            <p class="muted">Select a file to preview</p>
           </div>
         </div>
       </div>
@@ -118,7 +124,14 @@
         <div id="log"></div>
       </div>
     </section>
+    <section id="view-term-1" class="term-view" style="display: none;">
+      <iframe id="krust-1" class="krust-frame" title="Terminal 1" allow="clipboard-read; clipboard-write"></iframe>
+    </section>
+    <section id="view-term-2" class="term-view" style="display: none;">
+      <iframe id="krust-2" class="krust-frame" title="Terminal 2" allow="clipboard-read; clipboard-write"></iframe>
+    </section>
   </main>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>
