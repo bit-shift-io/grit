@@ -176,6 +176,97 @@ async fn push_state(
     sender.send(Message::Text(text.into())).await.is_ok()
 }
 
+/// Resolves the owning tab for a tab-scoped action, returning the tab id and
+/// repository path. Returns None when the message carries no tab id or the tab
+/// is unknown; per-action labels keep the debug logs readable.
+fn resolve_tab_repo(
+    registry: &crate::server::registry::TabRegistry,
+    tab: Option<usize>,
+    action: &str,
+) -> Option<(usize, std::path::PathBuf)> {
+    let tab_id = match tab {
+        Some(id) => id,
+        None => {
+            tracing::debug!("{action} ignored: no tab id");
+            return None;
+        }
+    };
+    let repo_path = match registry.repo_path_for(tab_id) {
+        Some(path) => path,
+        None => {
+            tracing::debug!("{action} ignored: unknown tab {}", tab_id);
+            return None;
+        }
+    };
+    Some((tab_id, repo_path))
+}
+
+/// Tokenizes a command string into argv the way a POSIX shell does:
+/// whitespace separates words, single quotes group literally, double quotes
+/// group with backslash escapes, and a backslash escapes the next character
+/// outside quotes. Returns None when quotes are unbalanced.
+fn split_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    current.push(c);
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    current.push(chars.next()?);
+                } else {
+                    current.push(c);
+                }
+            }
+            Some(_) => unreachable!("only single or double quotes are ever tracked"),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '\\' => current.push(chars.next()?),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        words.push(std::mem::take(&mut current));
+                    }
+                }
+                c => current.push(c),
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Some(words)
+}
+
+/// Expands an OpenWith command line into a full argv: shell-style word
+/// splitting with `%f`/`%F` field codes replaced by `target`. None when the
+/// command is empty or contains unbalanced quotes.
+fn expand_command(exec: &str, target: &std::path::Path) -> Option<Vec<String>> {
+    let words = split_shell_words(exec)?;
+    if words.is_empty() {
+        return None;
+    }
+    let target = target.display().to_string();
+    Some(
+        words
+            .into_iter()
+            .map(|w| w.replace("%f", &target).replace("%F", &target))
+            .collect(),
+    )
+}
+
 async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     if matches!(msg.action, crate::git::types::GitAction::CloseTab) {
         let Some(target_id) = msg.tab else {
@@ -198,12 +289,9 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     if let crate::git::types::GitAction::SearchHistory(query) = &msg.action {
-        let Some(tab_id) = msg.tab else {
-            tracing::debug!("SearchHistory ignored: no tab id");
-            return;
-        };
-        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
-            tracing::debug!("SearchHistory ignored: unknown tab {}", tab_id);
+        let Some((tab_id, repo_path)) =
+            resolve_tab_repo(&app.registry, msg.tab, "SearchHistory")
+        else {
             return;
         };
         let query = query.clone();
@@ -225,16 +313,12 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     if let crate::git::types::GitAction::OpenExternal(path) = &msg.action {
-        let Some(tab_id) = msg.tab else {
-            tracing::debug!("OpenExternal ignored: no tab id");
-            return;
-        };
-        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
-            tracing::debug!("OpenExternal ignored: unknown tab {}", tab_id);
+        let Some((_tab_id, repo_path)) =
+            resolve_tab_repo(&app.registry, msg.tab, "OpenExternal")
+        else {
             return;
         };
         let path = path.clone();
-        let repo_path = repo_path.clone();
         tokio::task::spawn_blocking(move || {
             let file_path = std::path::Path::new(&repo_path).join(&path);
             let editor_cfg = crate::shared_config::load_editor_config();
@@ -247,39 +331,33 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     if let crate::git::types::GitAction::OpenWith(path, exec) = &msg.action {
-        let Some(tab_id) = msg.tab else {
-            tracing::debug!("OpenWith ignored: no tab id");
-            return;
-        };
-        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
-            tracing::debug!("OpenWith ignored: unknown tab {}", tab_id);
+        let Some((_tab_id, repo_path)) =
+            resolve_tab_repo(&app.registry, msg.tab, "OpenWith")
+        else {
             return;
         };
         let path = path.clone();
         let exec = exec.clone();
-        let repo_path = repo_path.clone();
         tokio::task::spawn_blocking(move || {
             let file_path = std::path::Path::new(&repo_path).join(&path);
-            // exec may contain field codes like %f — strip them for basic spawning
-            let cmd = exec.split_whitespace().next().unwrap_or(&exec);
-            let _ = std::process::Command::new(cmd)
-                .arg(&file_path)
-                .spawn();
-        }).await.ok();
+            let Some(argv) = expand_command(&exec, &file_path) else {
+                tracing::debug!("OpenWith skipped: unparsable exec {exec:?}");
+                return;
+            };
+            let _ = std::process::Command::new(&argv[0]).args(&argv[1..]).spawn();
+        })
+        .await
+        .ok();
         return;
     }
 
     if let crate::git::types::GitAction::DeleteFile(path) = &msg.action {
-        let Some(tab_id) = msg.tab else {
-            tracing::debug!("DeleteFile ignored: no tab id");
-            return;
-        };
-        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
-            tracing::debug!("DeleteFile ignored: unknown tab {}", tab_id);
+        let Some((tab_id, repo_path)) =
+            resolve_tab_repo(&app.registry, msg.tab, "DeleteFile")
+        else {
             return;
         };
         let path = path.clone();
-        let repo_path = repo_path.clone();
         tokio::task::spawn_blocking(move || {
             let file_path = std::path::Path::new(&repo_path).join(&path);
             if file_path.exists() {
@@ -291,17 +369,13 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     if let crate::git::types::GitAction::RenameFile(old_path, new_path) = &msg.action {
-        let Some(tab_id) = msg.tab else {
-            tracing::debug!("RenameFile ignored: no tab id");
-            return;
-        };
-        let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
-            tracing::debug!("RenameFile ignored: unknown tab {}", tab_id);
+        let Some((tab_id, repo_path)) =
+            resolve_tab_repo(&app.registry, msg.tab, "RenameFile")
+        else {
             return;
         };
         let old_path = old_path.clone();
         let new_path = new_path.clone();
-        let repo_path = repo_path.clone();
         tokio::task::spawn_blocking(move || {
             let old = std::path::Path::new(&repo_path).join(&old_path);
             let new = std::path::Path::new(&repo_path).join(&new_path);
@@ -405,6 +479,35 @@ mod tests {
         let msg: super::ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg.tab, None);
         assert!(matches!(msg.action, GitAction::NewTab(p) if p == payload));
+    }
+
+    #[test]
+    fn resolve_tab_repo_finds_only_known_tabs() {
+        let registry = TabRegistry::with_single_tab(0, "repo".into(), "/tmp/x".into());
+        assert!(super::resolve_tab_repo(&registry, None, "OpenExternal").is_none());
+        assert!(super::resolve_tab_repo(&registry, Some(99), "OpenExternal").is_none());
+        assert_eq!(
+            super::resolve_tab_repo(&registry, Some(0), "OpenExternal"),
+            Some((0, std::path::PathBuf::from("/tmp/x")))
+        );
+    }
+
+    #[test]
+    fn open_with_expands_field_codes_and_quotes() {
+        let path = std::path::Path::new("/tmp/repo/notes.txt");
+        let argv = super::expand_command("my-ed \"%f\" -n", path).unwrap();
+        assert_eq!(argv, vec!["my-ed", "/tmp/repo/notes.txt", "-n"]);
+
+        let argv = super::expand_command("'echo hi'", path).unwrap();
+        assert_eq!(argv, vec!["echo hi"]);
+
+        let argv = super::expand_command("code --reuse-window %F", path).unwrap();
+        assert_eq!(argv, vec!["code", "--reuse-window", "/tmp/repo/notes.txt"]);
+
+        let argv = super::expand_command("cat %f", path).unwrap();
+        assert_eq!(argv, vec!["cat", "/tmp/repo/notes.txt"]);
+
+        assert!(super::expand_command("code \"%f", path).is_none());
     }
 
     #[tokio::test]

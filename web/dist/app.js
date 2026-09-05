@@ -1,6 +1,20 @@
+// ======================================
+// Constants & Connection
+// ======================================
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 5000;
+const SCROLL_HIT_SLACK_PX = 48;
+const DIFF_MARKER_RATIO = 0.35;
+const LCS_DIFF_CELL_CAP = 4000000;
+const FILE_SEARCH_DEBOUNCE_MS = 200;
+const HISTORY_SEARCH_FILLED_MS = 300;
+const HISTORY_SEARCH_EMPTY_MS = 150;
+const BRANCH_FILTER_DEBOUNCE_MS = 150;
+const DROPDOWN_OFFSET_PX = 2;
+
 let ws = null;
 let reconnectTimer = null;
-let reconnectDelayMs = 500;
+let reconnectDelayMs = RECONNECT_BASE_MS;
 
 function scheduleReconnect(delay) {
   if (reconnectTimer !== null) return;
@@ -14,14 +28,14 @@ function openSocket() {
   const socket = new WebSocket(`ws://${location.host}/ws`);
   ws = socket;
   socket.onopen = () => {
-    reconnectDelayMs = 500;
+    reconnectDelayMs = RECONNECT_BASE_MS;
     setConnStatus(true);
   };
   socket.onmessage = handleStateMessage;
   socket.onclose = () => {
     if (ws === socket) setConnStatus(false);
     scheduleReconnect(reconnectDelayMs);
-    reconnectDelayMs = Math.min(reconnectDelayMs * 2, 5000);
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
   };
 }
 
@@ -60,6 +74,9 @@ window.addEventListener("pageshow", (event) => {
 
 openSocket();
 
+// ======================================
+// Global UI State
+// ======================================
 let activeTabId = null;
 let lastState = null;
 let expandedKey = null;
@@ -89,6 +106,9 @@ function getTabNameFromPath(path) {
   return name.replace(/-/g, " ");
 }
 
+// ======================================
+// Add Repo Form
+// ======================================
 function setupAddRepoForm(tab) {
   const nameInput = document.getElementById("new-repo-name");
   const pathInput = document.getElementById("new-repo-path");
@@ -104,7 +124,6 @@ function setupAddRepoForm(tab) {
     document.getElementById("folder-browser").style.display = "block";
   }
 
-  const browserEl = document.getElementById("folder-browser");
   const browserCurrent = document.getElementById("browser-current");
   const browserEntries = document.getElementById("browser-entries");
   const upBtn = document.getElementById("browser-up-btn");
@@ -198,6 +217,9 @@ function setupAddRepoForm(tab) {
   };
 }
 
+// ======================================
+// WebSocket Message Handling & Render
+// ======================================
 function handleStateMessage(event) {
   const state = JSON.parse(event.data);
   // Invariant: exactly one active view at all times — a real tab whenever
@@ -321,6 +343,9 @@ function render(state) {
 
 const RECENT_COMMIT_COUNT = 4;
 
+// ======================================
+// History List
+// ======================================
 function renderHistory(tab) {
   const historyEl = document.getElementById("history");
   historyEl.textContent = "";
@@ -389,6 +414,9 @@ function renderHistory(tab) {
 
 //#region Branches panel
 
+// ======================================
+// Branches
+// ======================================
 function renderBranches(tab) {
   const branchListEl = document.getElementById("branch-list");
   branchListEl.textContent = "";
@@ -477,6 +505,9 @@ function renderBranches(tab) {
 
 //#region Stashes panel
 
+// ======================================
+// Stashes
+// ======================================
 function renderStashes(tab) {
   const listEl = document.getElementById("stash-list");
   listEl.textContent = "";
@@ -578,6 +609,9 @@ function buildStashActions(actionsEl, stash) {
 
 //#region Script runner (Project Actions)
 
+// ======================================
+// Script Runner
+// ======================================
 function renderScriptRunner(tab) {
   const scripts = tab.state.scripts || [];
   const select = document.getElementById("script-select");
@@ -615,6 +649,9 @@ document.getElementById("run-script-btn").onclick = () => {
 
 //#region File browser
 
+// ======================================
+// File Tree
+// ======================================
 let rootEntries = new Map();
 let expandedDirs = new Map();
 let dirChildren = new Map();
@@ -633,8 +670,7 @@ async function fetchFileTree(tab) {
     if (prevSelected) {
       selectFile(tab, prevSelected);
     } else {
-      document.getElementById("preview-header").innerHTML = "";
-      document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+      resetPreview();
     }
   } catch (err) {
     console.error("Failed to load file tree:", err);
@@ -691,7 +727,7 @@ function renderFileTree(tab) {
       loading.textContent = "Searching\u2026";
       container.appendChild(loading);
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => fetchSearchResults(tab, filter), 200);
+      searchTimer = setTimeout(() => fetchSearchResults(tab, filter), FILE_SEARCH_DEBOUNCE_MS);
       return;
     }
     subtitle.textContent = results.length === 0
@@ -768,7 +804,6 @@ function renderFileTree(tab) {
     if (entry.is_dir) {
       const isOpen = expanded.has(entry.path);
       icon.textContent = isOpen ? "\u25bc" : "\u25b6";
-      icon.classList.add("tree-arrow");
     } else {
       icon.textContent = "\u25a1";
     }
@@ -803,10 +838,7 @@ async function toggleDir(tab, dirPath) {
     collapseDescendants(tab, dirPath);
   } else {
     expanded.add(dirPath);
-    if (!dirChildren.has(`${tab.id}:${dirPath}`)) {
-      const children = await fetchDirChildren(tab, dirPath);
-      dirChildren.set(`${tab.id}:${dirPath}`, children);
-    }
+    await fetchDirChildren(tab, dirPath);
   }
   expandedDirs.set(tab.id, expanded);
   renderFileTree(tab);
@@ -823,6 +855,54 @@ function collapseDescendants(tab, dirPath) {
   }
 }
 
+// Dropdown positioned at the anchor, removed on scroll/outside click.
+// ======================================
+// File Preview & UI Utilities
+// ======================================
+function showDropdown(anchor, fill) {
+  const existing = document.querySelector(".app-dropdown");
+  if (existing) { existing.remove(); return; }
+  const dropdown = document.createElement("div");
+  dropdown.className = "app-dropdown";
+  fill(dropdown);
+  document.body.appendChild(dropdown);
+  const rect = anchor.getBoundingClientRect();
+  dropdown.style.position = "fixed";
+  dropdown.style.top = (rect.bottom + DROPDOWN_OFFSET_PX) + "px";
+  dropdown.style.right = (window.innerWidth - rect.right) + "px";
+  const scrollParent = anchor.closest(".section-body") || window;
+  function onScroll() { cleanup(); dropdown.remove(); }
+  scrollParent.addEventListener("scroll", onScroll, { passive: true });
+  if (scrollParent !== window) {
+    window.addEventListener("scroll", onScroll, { passive: true });
+  }
+  function cleanup() {
+    scrollParent.removeEventListener("scroll", onScroll);
+    window.removeEventListener("scroll", onScroll);
+  }
+  setTimeout(() => {
+    document.addEventListener("click", function closer() {
+      cleanup();
+      dropdown.remove();
+      document.removeEventListener("click", closer);
+    });
+  }, 0);
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function resetPreview() {
+  document.getElementById("preview-header").innerHTML = "";
+  document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+}
+
 async function selectFile(tab, path) {
   selectedFiles.set(tab.id, path);
   renderFileTree(tab);
@@ -830,7 +910,7 @@ async function selectFile(tab, path) {
   const header = document.getElementById("preview-header");
   const content = document.getElementById("preview-content");
 
-  header.innerHTML = `<span class="filename">${path}</span><div class="preview-actions"><div class="app-selector"><button id="open-external-btn" title="Open in default editor">Edit</button><button id="open-with-btn" title="Choose application">&#9662;</button></div><div class="file-actions-selector"><button id="file-actions-btn" title="File actions">&#9881;</button></div></div>`;
+  header.innerHTML = `<span class="filename">${escapeHtml(path)}</span><div class="preview-actions"><div class="app-selector"><button id="open-external-btn" title="Open in default editor">Edit</button><button id="open-with-btn" title="Choose application">&#9662;</button></div><div class="file-actions-selector"><button id="file-actions-btn" title="File actions">&#9881;</button></div></div>`;
   content.innerHTML = "<p class='muted'>Loading...</p>";
 
   // Fetch apps in parallel with file content
@@ -844,11 +924,11 @@ async function selectFile(tab, path) {
     const [data, apps] = await Promise.all([contentPromise, appsPromise]);
 
     if (data.error) {
-      content.innerHTML = `<p class="preview-error">${data.error}</p>`;
+      content.innerHTML = `<p class="preview-error">${escapeHtml(data.error)}</p>`;
     } else if (data.is_binary) {
       content.innerHTML = `<p class="preview-binary">Binary file (${data.size} bytes)</p>`;
     } else if (data.is_image) {
-      content.innerHTML = `<img src="/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}&raw=true" alt="${path}">`;
+      content.innerHTML = `<img src="/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}&raw=true" alt="${escapeHtml(path)}">`;
     } else {
       content.textContent = data.content;
     }
@@ -862,119 +942,73 @@ async function selectFile(tab, path) {
       openWithBtn.style.display = "none";
     } else {
       openWithBtn.onclick = () => {
-        const existing = document.querySelector(".app-dropdown");
-        if (existing) { existing.remove(); return; }
-        const dropdown = document.createElement("div");
-        dropdown.className = "app-dropdown";
-        for (const app of apps) {
-          const item = document.createElement("div");
-          item.className = "app-item";
-          item.textContent = app.name;
-          item.title = app.exec;
-          item.onclick = (e) => {
-            e.stopPropagation();
-            dropdown.remove();
-            sendAction({ OpenWith: [path, app.exec] });
-          };
-          dropdown.appendChild(item);
-        }
-        document.body.appendChild(dropdown);
-        const rect = openWithBtn.getBoundingClientRect();
-        dropdown.style.position = "fixed";
-        dropdown.style.top = (rect.bottom + 2) + "px";
-        dropdown.style.right = (window.innerWidth - rect.right) + "px";
-        // Close on scroll
-        const scrollParent = openWithBtn.closest(".section-body") || window;
-        function onScroll() { cleanup(); dropdown.remove(); }
-        scrollParent.addEventListener("scroll", onScroll, { passive: true });
-        if (scrollParent !== window) {
-          window.addEventListener("scroll", onScroll, { passive: true });
-        }
-        function cleanup() {
-          scrollParent.removeEventListener("scroll", onScroll);
-          window.removeEventListener("scroll", onScroll);
-        }
-        // Close on outside click
-        setTimeout(() => {
-          document.addEventListener("click", function closer() {
-            cleanup();
-            dropdown.remove();
-            document.removeEventListener("click", closer);
-          });
-        }, 0);
+        showDropdown(openWithBtn, (dropdown) => {
+          for (const app of apps) {
+            const item = document.createElement("div");
+            item.className = "app-item";
+            item.textContent = app.name;
+            item.title = app.exec;
+            item.onclick = (e) => {
+              e.stopPropagation();
+              dropdown.remove();
+              sendAction({ OpenWith: [path, app.exec] });
+            };
+            dropdown.appendChild(item);
+          }
+        });
       };
     }
 
     const fileActionsBtn = document.getElementById("file-actions-btn");
     fileActionsBtn.onclick = () => {
-      const existing = document.querySelector(".app-dropdown");
-      if (existing) { existing.remove(); return; }
-      const dropdown = document.createElement("div");
-      dropdown.className = "app-dropdown";
-      const renameItem = document.createElement("div");
-      renameItem.className = "app-item";
-      renameItem.textContent = "Rename";
-      renameItem.onclick = (e) => {
-        e.stopPropagation();
-        dropdown.remove();
-        const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
-        const baseName = path.substring(path.lastIndexOf("/") + 1);
-        const newName = prompt("Rename to:", baseName);
-        if (newName && newName !== baseName) {
-          const newPath = dir ? dir + "/" + newName : newName;
-          sendAction({ RenameFile: [path, newPath] });
-        }
-      };
-      dropdown.appendChild(renameItem);
-      const deleteItem = document.createElement("div");
-      deleteItem.className = "app-item app-item-danger";
-      deleteItem.textContent = "Delete";
-      deleteItem.onclick = (e) => {
-        e.stopPropagation();
-        dropdown.remove();
-        if (confirm("Delete " + path + "?")) {
-          sendAction({ DeleteFile: path });
-          selectedFiles.delete(tab.id);
-          document.getElementById("preview-header").innerHTML = "";
-          document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
-        }
-      };
-      dropdown.appendChild(deleteItem);
-      document.body.appendChild(dropdown);
-      const rect = fileActionsBtn.getBoundingClientRect();
-      dropdown.style.position = "fixed";
-      dropdown.style.top = (rect.bottom + 2) + "px";
-      dropdown.style.right = (window.innerWidth - rect.right) + "px";
-      const scrollParent = fileActionsBtn.closest(".section-body") || window;
-      function onScroll() { cleanup(); dropdown.remove(); }
-      scrollParent.addEventListener("scroll", onScroll, { passive: true });
-      if (scrollParent !== window) {
-        window.addEventListener("scroll", onScroll, { passive: true });
-      }
-      function cleanup() {
-        scrollParent.removeEventListener("scroll", onScroll);
-        window.removeEventListener("scroll", onScroll);
-      }
-      setTimeout(() => {
-        document.addEventListener("click", function closer() {
-          cleanup();
+      showDropdown(fileActionsBtn, (dropdown) => {
+        const renameItem = document.createElement("div");
+        renameItem.className = "app-item";
+        renameItem.textContent = "Rename";
+        renameItem.onclick = (e) => {
+          e.stopPropagation();
           dropdown.remove();
-          document.removeEventListener("click", closer);
-        });
-      }, 0);
+          const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
+          const baseName = path.substring(path.lastIndexOf("/") + 1);
+          const newName = prompt("Rename to:", baseName);
+          if (newName && newName !== baseName) {
+            const newPath = dir ? dir + "/" + newName : newName;
+            sendAction({ RenameFile: [path, newPath] });
+          }
+        };
+        dropdown.appendChild(renameItem);
+        const deleteItem = document.createElement("div");
+        deleteItem.className = "app-item app-item-danger";
+        deleteItem.textContent = "Delete";
+        deleteItem.onclick = (e) => {
+          e.stopPropagation();
+          dropdown.remove();
+          if (confirm("Delete " + path + "?")) {
+            sendAction({ DeleteFile: path });
+            selectedFiles.delete(tab.id);
+            resetPreview();
+          }
+        };
+        dropdown.appendChild(deleteItem);
+      });
     };
   } catch (err) {
-    content.innerHTML = `<p class="preview-error">Failed to load: ${err}</p>`;
+    content.innerHTML = `<p class="preview-error">Failed to load: ${escapeHtml(err)}</p>`;
   }
 }
+
+let lastFileBrowserTab = null;
 
 function renderFileBrowser(tab) {
   const section = document.getElementById("files-section");
   section.style.display = "block";
 
-  // Clear filter when switching tabs
+  // Clear the filter only when switching to a different tab
   const filter = document.getElementById("file-tree-filter");
-  if (filter) filter.value = "";
+  if (filter && lastFileBrowserTab !== tab.id) {
+    filter.value = "";
+    lastFileBrowserTab = tab.id;
+  }
 
   if (rootEntries.get(tab.id) === undefined && !fileTreeLoading.get(tab.id)) {
     fetchFileTree(tab);
@@ -985,8 +1019,7 @@ function renderFileBrowser(tab) {
     if (prevSelected) {
       selectFile(tab, prevSelected);
     } else {
-      document.getElementById("preview-header").innerHTML = "";
-      document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
+      resetPreview();
     }
   }
 }
@@ -995,11 +1028,14 @@ function renderFileBrowser(tab) {
 
 //#region Command log (terminal-style transcript per tab)
 
+// ======================================
+// Log
+// ======================================
 function renderLog(tab) {
   const logEl = document.getElementById("log");
   // Stick to the bottom while streaming, unless the user scrolled up.
   const nearBottom =
-    logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 48;
+    logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < SCROLL_HIT_SLACK_PX;
 
   const entries = (tab.log || []).filter((e) => e.seq > clearedUpToSeq);
   if (entries.length === 0) {
@@ -1059,6 +1095,9 @@ document.getElementById("clear-log-btn").onclick = () => {
 
 //#region Changes + commit rendering
 
+// ======================================
+// Staging & Commit Summary
+// ======================================
 function appendChangeRow(container, change, tab) {
   const key = `${tab.id}:${change.path}`;
   const row = document.createElement("div");
@@ -1280,6 +1319,9 @@ function renderCommitSummary(summary) {
 
 //#region Tab bar, sorting, URL deep-linking
 
+// ======================================
+// Tab Bar
+// ======================================
 function renderTabBar(state) {
   const tabsEl = document.getElementById("tabs");
   tabsEl.textContent = "";
@@ -1336,6 +1378,9 @@ function getInitialTabId(state) {
   return byIndex ? byIndex.id : null;
 }
 
+// ======================================
+// Diff View
+// ======================================
 async function toggleDiff(detailEl, tab, path) {
   const key = `${tab.id}:${path}`;
   if (expandedKey === key) {
@@ -1386,7 +1431,7 @@ function stepDiffBlock(headEl, delta) {
   if (!detail || detail.style.display === "none") return;
   const blocks = detail.querySelectorAll("tbody.diff-block");
   if (blocks.length === 0) return;
-  const marker = detail.getBoundingClientRect().top + detail.clientHeight * 0.35;
+  const marker = detail.getBoundingClientRect().top + detail.clientHeight * DIFF_MARKER_RATIO;
   let index = 0;
   for (let i = 0; i < blocks.length; i++) {
     if (blocks[i].getBoundingClientRect().top <= marker) index = i;
@@ -1447,7 +1492,7 @@ function alignLines(a, b) {
   const m = bl.length;
 
   let dp = null;
-  if (n * m <= 4000000) {
+  if (n * m <= LCS_DIFF_CELL_CAP) {
     dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
     for (let i = n - 1; i >= 0; i--) {
       for (let j = m - 1; j >= 0; j--) {
@@ -1549,6 +1594,9 @@ function renderSideBySide(original, current) {
 
 //#region Action wiring (buttons + delegated listeners)
 
+// ======================================
+// Button Wiring & Event Listeners
+// ======================================
 const recloneBtn = document.getElementById("reclone-btn");
 recloneBtn.onclick = () => {
   if (confirm("Reclone this repo? The directory will be DELETED and cloned fresh from origin.\n\nAll local branches, stashes, tags, and unpushed commits will be lost.")) {
@@ -1580,12 +1628,12 @@ document.getElementById("stage-commit-push-btn").onclick = () => {
 };
 document.getElementById("commit-btn").onclick = () => {
   if (!commitMsg.value.trim()) return;
-  sendAction({ CommitAll: commitMsg.value.trim() });
+  sendAction({ Commit: commitMsg.value.trim() });
   commitMsg.value = "";
 };
 document.getElementById("commit-push-btn").onclick = () => {
   if (!commitMsg.value.trim()) return;
-  sendAction({ CommitAllPush: commitMsg.value.trim() });
+  sendAction({ CommitPush: commitMsg.value.trim() });
   commitMsg.value = "";
 };
 document.getElementById("discard-all-btn").onclick = () => {
@@ -1661,7 +1709,7 @@ document.getElementById("history-search").addEventListener("input", (event) => {
       // one asks the daemon to run `git log --grep` over full history.
       sendRaw(JSON.stringify({ tab: activeTabId, action: { SearchHistory: query } }));
     }
-  }, query ? 300 : 150);
+  }, query ? HISTORY_SEARCH_FILLED_MS : HISTORY_SEARCH_EMPTY_MS);
 });
 
 document.querySelectorAll(".section-title").forEach((title) => {
@@ -1708,10 +1756,15 @@ document.getElementById("create-branch-btn").onclick = () => {
   renderBranches(tab);
 };
 
+let branchFilterTimer = null;
 document.getElementById("branch-filter").addEventListener("input", () => {
-  if (!lastState) return;
-  const tab = activeTab(lastState);
-  if (tab) renderBranches(tab);
+  if (branchFilterTimer !== null) clearTimeout(branchFilterTimer);
+  branchFilterTimer = setTimeout(() => {
+    branchFilterTimer = null;
+    if (!lastState) return;
+    const tab = activeTab(lastState);
+    if (tab) renderBranches(tab);
+  }, BRANCH_FILTER_DEBOUNCE_MS);
 });
 
 document.getElementById("file-tree-filter").addEventListener("input", () => {

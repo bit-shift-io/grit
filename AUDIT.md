@@ -1,113 +1,84 @@
 # Codebase Audit Summary
 
-**Audit Target:** `/home/bronson/Projects/grit`
-**Date:** 2026-08-23
+**Audit Target:** `grit` (`/home/bronson/Projects/grit`)
+**Date:** 2026-09-05
 
 ---
 
 ## Executive Summary
 
-Grit is a healthy, well-structured Rust workspace with zero TODO debt, zero debug leftovers, no orphan files, and no `#[allow(dead_code)]` crutches. The primary risks are one latent functional bug (remote-mode tab close is silently dropped), significant documentation drift in `AGENTS.md`/`ARCHITECTURE.md`/`README.md` describing an older startup flow and port default, and moderate copy-paste duplication concentrated in test helpers and a few handler pairs. One compiler warning exists (unused test variable).
+Grit is in healthy shape: both the web-only default build and the `desktop` feature build pass `cargo check` with **zero warnings**, all 2026-08-23 findings have been resolved, and tests are rich and well-organized. The one functional risk is in the web UI — three commit buttons collapse into effectively two behaviors, and neither of the two "staged" buttons actually commits only staged changes (both run `git add -A`), with no staged-only wire action existing in the `GitAction` enum. Secondary risks are moderate duplication (SKIP/ext lists, file-op handlers, frontend dropdown/preview helpers), a handful of robustness nits (silent `unwrap_or_default` paths, an unguarded raw file read), and one orphaned document (`CONTEXT.md`) that is a glossary for an unrelated game project.
 
 ## Key Metrics
 
-- **Unused/Orphan Files:** 0
-- **Dead Functions/Exports:** 2 (inert `ENABLED` kill-switch const; unreachable duplicate onclick assignment in app.js)
-- **Dead CSS Selectors:** 1 group (`.browser-actions`)
+- **Unused/Orphan Files:** 1 (`CONTEXT.md` — unrelated game glossary)
+- **Dead Functions/Exports:** 0
 - **Commented-Out Code / Debug Logs:** 0
 - **Open TODOs/FIXMEs:** 0
-- **Compiler Warnings:** 1 (unused variable `initial`, src/server/websocket.rs:850, test code)
+- **Compiler Warnings:** 0 (both `cargo check` and `cargo check --features desktop`)
 
 ---
 
 ## Findings & Recommendations
 
-### 1. Latent Bug (found during audit)
+### 1. Unused Files & Dead Code
 
 | File Path | Type | Details | Recommended Action |
 | :--- | :--- | :--- | :--- |
-| `src/ui/state.rs:198-203` | Functional Bug | Remote/connect-mode `CloseTab` extracts `let id = tab.id;` then calls `Self::remote_op(port, None, GitAction::CloseTab)`. Daemon requires the id (`websocket.rs:157-164`: "CloseTab ignored: no tab id provided"), so clicking a tab × in remote mode silently does nothing. Test `remote_mode_close_tab_waits_for_server_echo` only asserts local state. | Pass `Some(id)`; add server-side assertion test |
+| `CONTEXT.md` | Orphan File | 33KB glossary of terms for an unrelated 2D platformer game (kill zone, drawbridge, GameAPI, NPC cage objectives…) — zero relation to Grit | Remove or move out of the repo |
+| `src/shared_config.rs:227` | Dead Code | `let active = if tabs.is_empty() { 0 } else { 0 };` — both branches yield `0`, variable value never varies | Replace with plain `let active = 0;` |
+| `web/dist/index.html:79` | Dead DOM id | `id="file-preview"` never referenced by id in `app.js` (only descendants `preview-header`/`preview-content` are used) | Remove the id or query it deliberately |
+| `web/dist/app.js:107` | Dead Local | `browserEl` declared but never used | Remove |
+| `src/ui/state.rs:567-570` | Dead Branch | `tab_button_style` `hovered` branch sets `palette.background` identical to the non-hovered else branch | Collapse to a single branch |
+| `web/dist/app.js:771` | Dead Class | `tree-arrow` class added to DOM but no CSS rule exists; JS also renders `.log-entry.success` with no matching rule | Remove dead class or add the intended styles |
 
-### 2. Unused Files & Dead Code
-
-| File Path | Type | Details | Recommended Action |
-| :--- | :--- | :--- | :--- |
-| `web/dist/style.css:411,421` | Dead CSS | `.browser-actions button` (+ `:hover`) — class referenced nowhere in index.html/app.js | Delete |
-| `web/dist/app.js:963-969` | Dead JS | `commit-push-btn.onclick` assigned twice; first handler (Commit + Push) overwritten by `{CommitAllPush}` at 975-979; ragged indent 957-974 suggests merge leftover | Remove first assignment, fix indentation |
-| `web/dist/app.js:1045` | Formatting | Fused `});//#endregion` on one line | Split into two lines |
-| `src/actions.rs:18` | Inert API | `pub const ENABLED: bool = true` unreferenced kill-switch; branches at :31,:106 unreachable-in-practice | Remove or wire up |
-| `src/server/mod.rs:35` | Inert Field | `HealthResponse.status` always `"ok"` | Drop field or report real status |
-| `registry.rs:28` (`WebState.active`) | Dual Source of Truth | Maintained Rust-side (open_repo_tab/remove_tab/health_handler) but desktop `apply_sync` ignores it — two competing "selected tab" notions | Document or unify |
-
-### 3. Code Structure & Complexity Smells
+### 2. Code Structure & Complexity Smells
 
 | File Path | Issue | Context / Severity | Suggested Refactor |
 | :--- | :--- | :--- | :--- |
-| `src/ui/state.rs:176-434` | High Complexity | `GritApp::update` = 259 lines, ~30 match arms, deepest chains 4 levels (OpenNewRepo 244-286, CloseTab 194-221, WebTabsSync 415-431) | Extract per-arm handlers |
-| `src/git/mod.rs:393-492` | High Complexity | `get_commit_summary` = 100 lines, 5-level nesting at 417-436 | Extract stat-parsing helpers |
-| `src/actions.rs:352-443` | Long Function | `spawn_terminal` non-macOS branch = 92 lines | Extract probe-list builder |
-| `src/git/mod.rs:494-581` + `168-191` | Manual Sync Hazard | `execute_action` (19 arms) mirrored 1:1 by `placeholder_command` (19 trivial arms) | Generate placeholder from action enum or merge |
-| `src/server/websocket.rs:123-153`, `mod.rs:320-342` | Nesting Depth 4 | `handle_websocket`, `sync_loop` | Early-return guards |
+| `src/git/mod.rs:779` + `826` | Duplication | `SKIP` const duplicated verbatim across `list_dir` and `search_files` | Hoist to one shared const |
+| `src/git/mod.rs` (`mime_for_path`, `is_image_path`) vs `src/shared_config.rs:55-68` | Duplication | Extension/MIME classification lists maintained in two modules | Unify in a single home (e.g. `shared_config`) |
+| `src/server/websocket.rs:227-314` | Duplication | Four near-identical file-op handlers (`OpenExternal`, `OpenWith`, `DeleteFile`, `RenameFile`) share the same tab-lookup + response pattern | Extract a shared file-op helper |
+| `src/server/websocket.rs` (`OpenWith`) | Robustness | `exec.split_whitespace().next()` destroys `%f`-style field codes and splits quoted paths incorrectly | Use a shell-aware word splitter that preserves placeholders |
+| `src/server/mod.rs` (`filecontent` raw) | Security Nit | `raw=true` does `std::fs::read` on the joined path with no containment/traversal guard (only the tab's `repo_path_for` check) | Reuse `git/mod.rs::list_dir`-style component guard before reading |
+| `src/git/mod.rs` (`get_file_pair`) | Robustness | `original` built with `unwrap_or_default()` — a failed `git show HEAD:path` silently becomes empty content; function never returns `Err` in practice | Propagate real `Err` so the UI can distinguish "untracked" from "read failure" |
+| `src/git/mod.rs` (`get_commit_summary`, `stash_files`) | Robustness | Multiple `git show` calls each `unwrap_or_default()`; failures are silently flattened | Aggregate and surface failures |
+| `web/dist/app.js:864-905` vs `909-965` | Duplication | Two dropdown builders share a ~44-line identical tail (positioning, scroll listeners, outside-click closer) | Extract a `showDropdown` helper |
+| `web/dist/app.js:636-637` / `938-939` / `988-989` | Duplication | Preview-reset boilerplate (`innerHTML=""` + muted placeholder) repeated three times | Extract `resetPreview()` |
+| `web/dist/app.js:808` | Dead Code | `toggleDir` re-caches `dirChildren` already cached by `fetchFileTree` at 653 | Drop the redundant re-assignment |
+| `web/dist/app.js:1711-1715` | Consistency | Branch filter isn't debounced while file/history filters are | Debounce it |
+| `web/dist/app.js` (various) | Magic Numbers | Reconnect 500/5000ms, scroll 48px, diff marker 0.35, LCS DP cap 4000000, debounces 200/300/150ms, dropdown offset 2 | Name as constants at top of file |
 
-### 4. Duplication
+### 3. Comments & Technical Debt
 
-| Location | Details | Recommended Action |
-| :--- | :--- | :--- |
-| `git/mod.rs:64-69` vs `registry.rs:264-269` | `epoch_millis()` identical bodies | Share one helper |
-| Test helpers ×3 modules | `init_repo` triplicated (git/mod.rs:634, server/mod.rs:526, websocket.rs:249); `connect_with_retry`/`recv_state` duplicated server/mod.rs:552-594 vs websocket.rs:275-319 **with diverged constants** (40×50ms+5s vs 100×50ms+20s) | Move to shared test-support module |
-| `server/mod.rs:61-95` vs `103-152` | `files_handler` vs `commit_handler` same skeleton; zeroed `CommitSummary{}` fallback literal ×3 inside commit_handler (111-149) | Factor common handler shape |
-| `ui/state.rs:248-254` vs `websocket.rs:37-43` | Input validation duplicated verbatim incl. error strings | Single validator |
-| `git/mod.rs:230-264` | staged/unstaged parse loops near-duplicates | Parameterize |
-| `ui/state.rs:506-511` vs `568-573` | Error-bar widget dup incl. color literal `from_rgb(0.9, 0.25, 0.25)` | Extract widget fn |
-| `ui/state.rs` ×4 sites | remote-op dispatch pattern repeated (199-203, 259-268, 419-429, 441-444) | Helper method |
-| Active-index clamp ×3 | registry.rs:175-177, ui/state.rs:171-173, 215-217 | Shared fn on registry |
+| File Path | Type | Snippet / Context | Recommendation |
+| :--- | :--- | :--- | :--- |
+| `web/dist/app.js:975` | Stale Comment | `// Clear filter when switching tabs` — actually runs on every `renderFileBrowser` call | Fix comment or guard the reset |
+| `web/dist/app.js:833,847,851,967` | XSS/Self-XSS | Paths, `data.error`, and alt text inserted via unescaped `innerHTML` | Build DOM nodes / escape HTML entities; never inject user-controlled strings raw |
+| `ARCHITECTURE.md` §3.4 + Startup diagram | Doc Drift | Route list documents only `/health /ws /files /commit /browse /*` — missing newer `/filetree /filecontent /filesearch /apps` handlers | Add the four handlers to the routes section |
+| `ARCHITECTURE.md:122-125` | Doc Nit | References `Notes.md` (actual file is `NOTES.md`) | Fix casing |
+| `AGENTS.md` §2 | Doc Drift | Directory map omits `shared_config.rs`, `git/watcher.rs`, `server/registry.rs`, `server/websocket.rs`, `server/static_files.rs`, `ui/remote.rs`, `ui/components/*` | Extend the map |
+| `NOTES.md`, `TASKS.md` | Historical | File-browser feature notes; all TASKS.md phases `[x]`, all requirements shipped (incl. selectedFilePath + Edit button) | Mark clearly as historical, or archive |
 
-### 5. Robustness
+---
 
-| File Path | Issue | Recommendation |
-| :--- | :--- | :--- |
-| `src/server/registry.rs:98` | `write_lock.lock().unwrap()` panics on poisoned mutex (only bare unwrap in non-test code) | `unwrap_or_else(\|p\| p.into_inner())` |
-| `src/git/mod.rs:386-391` | `get_file_pair` declares `Result` but `.unwrap_or_default()` twice — never errs; failed reads silently become empty file content | Return Err on failed reads |
-| `src/git/mod.rs:324,401,472-473` | Timestamp parses silently fall back to epoch 0 | Surface parse failure |
+## Previously Reported — Now Resolved
 
-### 6. Conventions Verified Clean
+All findings from the 2026-08-23 audit are verified fixed:
 
-- **Mutex convention**: No violations — only std Mutex is intentional `TabRegistry.write_lock`; short sections, never across `.await`.
-- Zero `console.*`/`dbg!`/commented-out code; all 31 app.js top-level functions used; no unused pub items besides those listed above.
-
-### 7. Documentation Drift [HIGH]
-
-| File Path | Stale Claim | Reality |
-| :--- | :--- | :--- |
-| `AGENTS.md:17` | Headless runs `localhost:8080` | Default port is **5000** (`main.rs:20`); README/ARCHITECTURE already say 5000 |
-| `NOTES.md:29,50,146,150` | Port 8080 | Historical notes; clarify or annotate as historical |
-| `ARCHITECTURE.md:124-125` | `boot()` runs sync loop | False — boot returns `(AppState, refresh_rx)`; sync_loop spawned in `run_server` (mod.rs:352-357), wired by `run()` (497-498) |
-| `ARCHITECTURE.md:122-125,192-195` | Startup flow predates background initial refresh (mod.rs:444-455) — clients now connect before git scans finish | Update flow description |
-| `ARCHITECTURE.md:123` | "spawns per-tab .git watchers" | Single persistent `watch_reconciler`, one recursive repo-root watcher per unique path (mod.rs:366-414, watcher.rs:28-30) |
-| `ARCHITECTURE.md §3.3` | Registry described as watch + id allocator | Missing: `write_lock`, `revision: AtomicU64` (drives stale-frame suppression in sync_loop), `next_log_seq`; `WebTab` wire type includes `log: Vec<LogEntry>` |
-| `ARCHITECTURE.md §3.1/§4` | GUI always launches without `--headless` | Undocumented `display_available()` fallback switches to headless daemon when DISPLAY/WAYLAND_DISPLAY unset (main.rs:36-43,82-86); `create_listener` SO_REUSEADDR also undocumented |
-| `README.md:28` | "Nuke … re-clone the repository" | Inaccurate — runs fetch origin + reset --hard origin/<branch> + clean -fdx **in place** (git/mod.rs:187,558+) |
-| `AGENTS.md §2` | Directory map incomplete | Missing shared_config.rs, server/registry.rs, actions.rs, ui/remote.rs, ui/components/{actions,diff}.rs; watcher described as `.git/`-only but watches repo root recursively |
-
-### 8. Magic Numbers
-
-| Location | Value | Suggestion |
-| :--- | :--- | :--- |
-| git/mod.rs:299-300 | History depth `"n", "50"` inline | Named const |
-| server/mod.rs:28 | `broadcast::channel(128)` | Named const |
-| server/mod.rs:470,479 | Daemon probe 500ms ×2 | Named const |
-| server/mod.rs:509 | `listen(1024)` backlog | Named const |
-| ui/state.rs:609,635 | mpsc `channel(100)` ×2 | Named const |
-| ui/state.rs:760 | Window 960×680 | Named consts |
-| actions.rs:239 | /proc walk cap `0..16` | Named const |
-| actions.rs:176 | `raw_os_error() == Some(8)` (ENOEXEC) | Named constant |
+- **Web commit buttons** (`app.js:1576-1590`): were mislabeled — `commit-btn` staged everything (`CommitAll`) and `commit-push-btn` duplicated `stage-commit-push-btn`. Fixed 2026-09-05: new `CommitPush` action (commit staged + push) added end-to-end, `commit-btn` now sends staged-only `Commit`, `commit-push-btn` sends `CommitPush`.
+- **CloseTab remote bug**: `ui/state.rs` now sends `close_tab_payload(Some(id))`; daemon requires the id; tests cover both directions.
+- `ENABLED` kill-switch const removed from `actions.rs`; `.browser-actions` dead CSS removed; duplicate `commit-push-btn.onclick` assignment removed.
+- Test helpers consolidated into `src/test_support.rs` with unified retry constants (100×50ms + 20s receive); `init_repo`/`connect_with_retry`/`recv_state` no longer triplicated.
+- Single `epoch_millis`; poison-tolerant `TabRegistry.write_lock`; `HealthResponse` dropped the static `status` field in favor of real `tab_count`/`current_branch`/`change_count`.
+- Docs reconciled: README Reclone description, ARCHITECTURE startup/boot/sync_loop/watch_reconciler descriptions, port 5000.
 
 ---
 
 ## Top Priority Action Plan
 
-1. **[High]** Fix remote-mode `CloseTab` bug: pass `Some(id)` in `src/ui/state.rs:203`; extend the existing remote-mode test to assert the daemon receives the id.
-2. **[High]** Reconcile docs with reality: AGENTS.md port + directory map; ARCHITECTURE.md boot/sync_loop split, background refresh, watch_reconciler, registry fields (write_lock/revision/next_log_seq), WebTab.log, headless-display fallback, create_listener/SO_REUSEADDR; README.md Nuke wording.
-3. **[Medium]** Poison-tolerant `write_lock` in registry.rs; dedupe test helpers into one module (reconciling diverged retry/timeout constants).
-4. **[Medium]** Extract shared validation + error-bar widget; parameterize staged/unstaged parsing.
-5. **[Low]** Delete dead CSS `.browser-actions`, duplicate commit-push-btn.onclick, fix fused endregion line, resolve unused `initial` warning, name the magic numbers.
+1. **[High]** Guard the raw `filecontent` read against path traversal; de-duplicate the SKIP const and the MIME/extension lists.
+2. **[Medium]** Make silent failure paths loud: `get_file_pair` original, `get_commit_summary`, `stash_files` — return structured `GitError` instead of `unwrap_or_default()`.
+3. **[Medium]** Surface-escape or DOM-build the four `innerHTML` injection points in `app.js`; extract the duplicated dropdown-builders and preview-reset helpers.
+4. **[Low]** Remove dead code: `shared_config.rs:227` dead conditional, `file-preview` id, `browserEl`, `tree-arrow`/`.log-entry.success` styling, `tab_button_style` dead branch, and fix the v-like stale comment / magic-number naming in the frontend.
+5. **[Low]** Delete or relocate `CONTEXT.md`; add the four missing routes to `ARCHITECTURE.md` and extend the `AGENTS.md` directory map.

@@ -52,7 +52,7 @@ impl EditorConfig {
     }
 }
 
-const TEXT_EXTS: &[&str] = &[
+pub(crate) const TEXT_EXTS: &[&str] = &[
     "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "go", "java",
     "rb", "php", "sh", "bash", "zsh", "fish", "vim", "lua", "r", "swift", "kt",
     "cs", "fs", "hs", "ex", "exs", "erl", "clj", "lisp", "el", "jl",
@@ -62,7 +62,7 @@ const TEXT_EXTS: &[&str] = &[
     "dockerfile", "makefile", "cmake", "nix", "zig",
 ];
 
-const IMAGE_EXTS: &[&str] = &[
+pub(crate) const IMAGE_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif", "tiff",
     "tif", "psd", "ai", "eps",
 ];
@@ -224,7 +224,7 @@ fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebSta
             log: Vec::new(),
         });
     }
-    let active = if tabs.is_empty() { 0 } else { 0 };
+    let active = 0;
     crate::server::registry::WebState { active, tabs }
 }
 

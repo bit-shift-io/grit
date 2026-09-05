@@ -157,13 +157,45 @@ mod tests {
             .await
             .expect("timed out waiting for debounced event")
             .expect("channel closed");
+        assert_eq!(first, ());
 
-        let _ = first;
-        assert!(true);
+        fs::write(dir.path().join("other.txt"), "second burst").unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for second debounced event")
+            .expect("channel closed");
+        assert_eq!(second, (), "debouncer must keep firing after the first event");
     }
 
-    #[test]
-    fn debounce_windows_are_160ms_apart() {
-        assert!(DEBOUNCE_MS >= 100);
+    #[tokio::test]
+    async fn rapid_burst_coalesces_into_single_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _watcher = spawn_watcher(dir.path().to_path_buf(), tx).unwrap();
+
+        for i in 0..25 {
+            fs::write(dir.path().join(format!("burst-{i}.txt")), "x").unwrap();
+        }
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for debounced event")
+            .expect("channel closed");
+        assert_eq!(first, ());
+
+        // A fresh raw event arriving after the burst could legitimately arm a
+        // second 200 ms window, so only assert that the debouncer never
+        // double-fires back-to-back (impossible within DEBOUNCE_MS=200).
+        let trailing = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        assert!(
+            trailing.is_err(),
+            "a burst written within one debounce window must yield a single refresh"
+        );
     }
 }

@@ -558,14 +558,11 @@ fn error_bar<'a>(error: Option<&'a String>) -> iced::widget::Text<'a> {
 fn tab_button_style(
     is_active: bool,
 ) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
-    move |theme, status| {
+    move |theme, _status| {
         let palette = theme.palette();
         let mut style = iced::widget::button::Style::default();
-        let hovered = matches!(status, iced::widget::button::Status::Hovered);
         style.background = Some(iced::Background::Color(if is_active {
             palette.primary
-        } else if hovered {
-            palette.background
         } else {
             palette.background
         }));

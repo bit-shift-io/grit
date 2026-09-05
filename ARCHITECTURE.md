@@ -36,7 +36,7 @@ ids come from one monotonic allocator and are never reused within a session.
 ├── Cargo.toml               # Project manifest and workspace settings
 ├── ARCHITECTURE.md          # System architecture, guidelines, and module breakdown
 ├── TASKS.md                 # Step-by-step roadmap for AI implementation
-├── Notes.md                 # Design notes and comparative stack evaluations
+├── NOTES.md                 # Design notes and comparative stack evaluations
 ├── web/                     # Web UI source files (embedded at build time)
 │   └── dist/                # Pre-built HTML/CSS/JS frontend assets
 └── src/
@@ -147,7 +147,9 @@ ids come from one monotonic allocator and are never reused within a session.
 ### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
 * **Routes**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
   `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
-  the add-repo form), `/*` embedded static assets.
+  the add-repo form), `/filetree?tab=&path=` (file browser listing), `/filecontent?tab=&path=&raw=`
+  (lazy preview content; `raw` serves literal file bytes), `/filesearch?tab=&q=` (case-insensitive
+  file name search), `/apps?path=` (external editor apps for a file), `/*` embedded static assets.
 * **`boot(registry)`**: restores tabs from config **only if the registry is empty**
   (then re-persists the healed state), spawns the `watch_reconciler`, and starts
   the persist task (writes config on every registry change). It then kicks off a
@@ -232,7 +234,8 @@ main.rs
               ├── boot(): restore-from-config-if-empty → watch_reconciler +
               │     persist task + background initial refresh (→ refresh_rx)
               └── run_server(): spawns sync_loop, then Axum routes
-                    (/health /ws /files /commit /browse /*)
+                    (/health /ws /files /commit /browse /filetree
+                     /filecontent /filesearch /apps /*)
       ELSE (GUI):
         ├── Probe GET /health on 127.0.0.1:<port>
         ├── Daemon found (Remote): Iced GUI as WS client of that daemon
@@ -332,4 +335,4 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
 | `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links, rendering |
 | `TASKS.md` | Original build roadmap (historical) |
-| `Notes.md` | Design rationale |
+| `NOTES.md` | Design rationale |
