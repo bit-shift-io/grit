@@ -36,6 +36,7 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
   * **`types.rs`**: Shared data models (`RepoState`, `FileChange`, `GitStatus`, `GitAction`) — single source of truth for both UI events and WebSocket JSON payloads.
   * **`mod.rs`**: Invokes local `git` CLI subcommands using `std::process::Command`.
   * **`watcher.rs`**: Watches the repository root recursively (a single recursive watch also covers `.git/`) using `notify` with a 200ms debouncer.
+* **`src/krust.rs`**: Best-effort auto-launcher for the `krust` web terminal daemon on startup. `krust_is_up()` TCP-probes `127.0.0.1:3000`; `find_krust_binary()` resolves `$KRUST_BIN` first, then scans `$PATH` for `krust`/`krust.exe`; `ensure_krust()` spawns it detached if it is down and available. Never fatal — missing binary just leaves the terminal dock buttons hidden.
 * **`src/server/`**: Embedded Axum web server subsystem.
   * **`mod.rs`**: Sets up HTTP endpoints, background refresh loops, and WebSocket routing.
   * **`websocket.rs`**: Processes inbound WebSocket actions and broadcasts state updates to connected clients.
@@ -45,7 +46,14 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
   * **`state.rs`**: Primary application state and message dispatch system.
   * **`remote.rs`**: Remote-mode client (HTTP/WS) used by the desktop GUI to talk to an external daemon and receive sync updates.
   * **`components/`**: View panels (`header.rs`, `staging.rs`, `commit.rs`, `history.rs`, `actions.rs`, `diff.rs`).
-* **`web/dist/`**: Pre-built static web assets embedded at compile time.
+* **`web/dist/`**: THE ONLY web UI source — hand-maintained `index.html` / `style.css` / `app.js` with no package.json or build step, embedded at compile time via `rust-embed`. Contains the left view dock (Dashboard/`F`/`L` + krust terminal views) and all client-side view routing (`activeView`, `showView()`, `?view=` deep-link). JS edits are reviewed manually — there is **no node/deno/bun** on the dev box for syntax checking; use the python3 brace/quote tokenizer (see §4).
+
+### krust (web terminal) integration — key facts
+* **What it is**: Grit embeds the external `krust` web-terminal daemon as two dock views (`term-1` / `term-2`), each an `<iframe>` pointing at `http://localhost:3000/?s=<session>&dir=<repo>` with the xterm terminal library. Requires krust (`~/Projects/krust`, port 3000, `KRUST_PORT` env override) to be installed and running; Grit auto-starts it if missing (see `src/krust.rs`), otherwise the `T` buttons stay hidden.
+* **Sessions are per-repo**: a session id is derived from the active repo path at first activation — `grit-{repoScope(repoPath)}-term-{n}` where `repoScope` is `<basename>-<hash36>` (or `root` when no repo). Switching active repos rebinds the frame to that repo's session and fires `GET /reset?session_id=<old>` to recycle the abandoned one.
+* **Reset**: the `Reset` overlay button on each terminal view calls krust's `GET /reset?session_id=<sid>` → kills the PTY child and drops the session, then reloads the iframe with a `&r=<ts>` cache-buster. krust must be built from `~/Projects/krust` HEAD (release binary at `~/Projects/krust/target/release/krust`) — the `/reset` endpoint and `?dir=` cwd support are recent additions, NOT in older installed copies.
+* **krust CORS**: krust serves `.layer(CorsLayer::permissive())`, so all fetch-based probes (`/`, `/reset`) and WebSocket upgrades work cross-origin from `localhost:5000`.
+* **Environment test hooks**: `KRUST_BIN` (binary override — wins over PATH), `KRUST_PORT` (krust bind port, default 3000). Grit constants: `KRUST_BASE`, `KRUST_PROBE_MS=5000` (probe cadence), `KRUST_SESSIONS` map in `app.js`.
 
 ---
 
@@ -64,3 +72,6 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
 * **Debounced FS Events**: File system notifications can fire rapidly during operations like `git checkout`. Always route file changes through the debouncer in `src/git/watcher.rs` to avoid event storms and UI re-render flashing.
 * **Error Propagation**: Return custom structured errors (`GitError`) from Git commands rather than panicking or unwrap calls, ensuring errors can be displayed gracefully in both GUI and Web interfaces.
 * **Incremental Edits**: Keep PRs or code updates focused. Ensure `cargo check` and `cargo test` pass cleanly after every modification.
+* **JS Syntax Checking**: `web/dist/app.js` has no bundler or linter and no node/deno/bun on the dev box. After meaningful JS edits, run a python3 tokenizer pass (script in `/tmp`) that balances `(){}[]`, checks quote/template-literal nesting (`'`/`"`/`` ` `` incl. `${}`), flags duplicate function definitions, and reports per-line numbers. Review large edits manually.
+* **Web Changes Need a Rebuild**: `web/dist/*` is embedded at compile time — the running `cargo run`/release binary serves the OLD assets until Grit is rebuilt and restarted. The same applies to krust client changes via `~/Projects/krust`.
+* **Don't Touch Running Daemons**: The user restarts krust/grit himself (usually from `~/.local/bin`). Never kill/replace/restart running instances unless explicitly asked; instead state what must be restarted to pick up new builds.

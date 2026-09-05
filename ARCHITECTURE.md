@@ -41,6 +41,7 @@ ids come from one monotonic allocator and are never reused within a session.
 │   └── dist/                # Pre-built HTML/CSS/JS frontend assets
 └── src/
     ├── main.rs              # Entrypoint parsing CLI args and routing execution mode
+    ├── krust.rs             # Best-effort auto-launch of the krust terminal daemon
     ├── shared_config.rs     # Shared persistence: config.json load/save/restore/prune
     ├── git/                 # Git Engine subsystem
     │   ├── mod.rs           # Git CLI command execution logic and status queries
@@ -215,10 +216,43 @@ ids come from one monotonic allocator and are never reused within a session.
 * **Wire format**: `GitAction::RunScript(rel_path)` executes via the normal
   action dispatch in both Embedded and Remote modes; picking a script in the
   dropdown launches it immediately (no confirmation step). The section is
-   hidden when no scripts exist. The web UI exposes the same launcher inside
-   its Actions section action row (`#script-select` + `#run-script-btn`,
-   inline with the other buttons), fed by
-   the identical `RepoState.scripts` payload.
+hidden when no scripts exist. The web UI exposes the same launcher inside
+    its Actions section action row (`#script-select` + `#run-script-btn`,
+    inline with the other buttons), fed by
+    the identical `RepoState.scripts` payload.
+
+### 3.7 Krust Terminal Dock (`src/krust.rs`, `web/dist`)
+* **What it is**: the web UI renders an embedded `krust` web-terminal daemon as
+  two dock views (`term-1` / `term-2`), each a full-height `<iframe>` at
+  `http://localhost:3000/?s=<session>&dir=<repo>` backed by an xterm.js client.
+  The krust server lives OUTSIDE this repo (`~/Projects/krust`); Grit only
+  auto-launches it and shells cross-origin against it.
+* **Auto-launch** (`src/krust.rs`, `ensure_krust()`): spawned from
+  `server::run` on a background Tokio task, best-effort and never fatal.
+  `krust_is_up()` TCP-probes `127.0.0.1:3000` (400 ms timeout); only when the
+  daemon is down does it resolve a binary — `$KRUST_BIN` wins over a `$PATH`
+  scan for `krust`/`krust.exe` — and `Command::spawn()` it detached. Tests
+  exercise the pure `finding_krust_binary(krust_bin, path_var)` helper (env
+  reads are injected) so they never touch the environment. Because tests call
+  `run_server` (never `server::run`), no test ever triggers a spawn.
+* **Per-repo sessions**: the frame src is built lazily on first view with a
+  session id computed from the ACTIVE repo path —
+  `grit-{repoScope(repoPath)}-term-{n}` where `repoScope` is
+  `<basename>-<hash36>` (or `root` when no repo). Repo switches rebind the
+  iframe to the new repo's session and fire-and-forget
+  `GET /reset?session_id=<old>` to kill the abandoned PTY. The `dir=` query
+  param makes each session start-shell inside that repo.
+* **Reset button**: each terminal view has a hover `Reset` overlay that calls
+  krust's `GET /reset?session_id=<sid>` (kills the PTY child + removes the
+  session) and reloads the iframe with a `&r=<ts>` cache-buster.
+* **Probing & availability**: `probeKrust()` (`KRUST_PROBE_MS=5000` cadence)
+  fetches krust's `/` with `mode:"cors"`; when down, the `T` dock buttons hide
+  and an active terminal view is force-switched back to the Dashboard.
+* **krust requirements**: built from `~/Projects/krust` HEAD — `/reset` and
+  `?dir=` are recent additions absent from older installs — and served with
+  `CorsLayer::permissive()` so all fetch probes, `/reset` calls, and WebSocket
+  upgrades work cross-origin from `localhost:5000`. `KRUST_PORT` (default
+  3000) overrides krust's bind port.
 
 
 ---
@@ -233,9 +267,10 @@ main.rs
         └── Spawn Tokio runtime → server::run(registry)
               ├── boot(): restore-from-config-if-empty → watch_reconciler +
               │     persist task + background initial refresh (→ refresh_rx)
-              └── run_server(): spawns sync_loop, then Axum routes
-                    (/health /ws /files /commit /browse /filetree
-                     /filecontent /filesearch /apps /*)
+              ├── run_server(): spawns sync_loop, then Axum routes
+              │     (/health /ws /files /commit /browse /filetree
+              │      /filecontent /filesearch /apps /*)
+              └── background task: krust::ensure_krust() (best-effort)
       ELSE (GUI):
         ├── Probe GET /health on 127.0.0.1:<port>
         ├── Daemon found (Remote): Iced GUI as WS client of that daemon
@@ -330,9 +365,10 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/server/mod.rs` | Router, `boot()`, sync loop, persist task, `/browse` `/files` `/commit` handlers |
 | `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
 | `src/server/static_files.rs` | rust-embed asset serving |
+| `src/krust.rs` | Best-effort krust terminal-daemon auto-launch (`ensure_krust`, `find_krust_binary`) |
 | `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
 | `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
-| `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links, rendering |
+| `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), view dock routing, krust terminal integration |
 | `TASKS.md` | Original build roadmap (historical) |
 | `NOTES.md` | Design rationale |

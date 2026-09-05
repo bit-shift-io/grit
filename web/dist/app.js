@@ -14,8 +14,8 @@ const DROPDOWN_OFFSET_PX = 2;
 const KRUST_BASE = "http://localhost:3000";
 const KRUST_PROBE_MS = 5000;
 const KRUST_SESSIONS = {
-  "term-1": { iframe: "krust-1", sid: "grit-term-1" },
-  "term-2": { iframe: "krust-2", sid: "grit-term-2" },
+  "term-1": { iframe: "krust-1", n: 1 },
+  "term-2": { iframe: "krust-2", n: 2 },
 };
 
 let ws = null;
@@ -1908,11 +1908,58 @@ function currentRepoPath() {
   return (tab && tab.repo_path) ? tab.repo_path : "";
 }
 
+function repoScope(path) {
+  if (!path) return "root";
+  const parts = path.replace(/\/+$/, "").split("/");
+  const base = parts[parts.length - 1].replace(/[^\w.-]/g, "_") || "repo";
+  let h = 0;
+  for (let i = 0; i < path.length; i++) {
+    h = ((h << 5) - h + path.charCodeAt(i)) | 0;
+  }
+  return base + "-" + Math.abs(h).toString(36);
+}
+
+function sessionIdFor(sess) {
+  return `grit-${repoScope(currentRepoPath())}-term-${sess.n}`;
+}
+
+function krustFrameSrc(sess, sid) {
+  return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}`;
+}
+
 function ensureKrustFrame(sess) {
   const frame = document.getElementById(sess.iframe);
-  if (!frame || frame.getAttribute("src")) return;
-  const dir = currentRepoPath();
-  frame.setAttribute("src", `${KRUST_BASE}/?s=${sess.sid}&dir=${encodeURIComponent(dir)}`);
+  if (!frame) return;
+  const sid = sessionIdFor(sess);
+  const current = frame.getAttribute("src");
+  if (current) {
+    const m = /[?&]s=([^&]+)/.exec(current);
+    if (m && m[1] === sid) return;
+    const oldSid = m ? m[1] : null;
+    if (oldSid && krustAvailable) {
+      try { fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(oldSid)}`, { mode: "cors" }); } catch (e) {}
+    }
+  }
+  frame.setAttribute("src", krustFrameSrc(sess, sid));
+}
+
+async function resetKrustSession(view) {
+  const sess = KRUST_SESSIONS[view];
+  if (!sess) return;
+  const frame = document.getElementById(sess.iframe);
+  if (frame && frame.getAttribute("src")) {
+    const m = /[?&]s=([^&]+)/.exec(frame.getAttribute("src"));
+    const sid = m ? m[1] : null;
+    if (krustAvailable && sid) {
+      try {
+        await fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(sid)}`, { mode: "cors" });
+      } catch (e) { /* krust went away mid-reset; reload below still recreates */ }
+    }
+    const cleaned = frame.getAttribute("src").replace(/&r=\d+/, "");
+    frame.setAttribute("src", cleaned + "&r=" + Date.now());
+  } else {
+    ensureKrustFrame(sess);
+  }
 }
 
 async function probeKrust() {
@@ -1934,6 +1981,14 @@ async function probeKrust() {
 
 probeKrust();
 setInterval(probeKrust, KRUST_PROBE_MS);
+
+document.querySelectorAll(".term-reset").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const section = btn.closest(".term-view");
+    if (!section) return;
+    resetKrustSession(section.id.replace("view-", ""));
+  });
+});
 
 //#endregion
 

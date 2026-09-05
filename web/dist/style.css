@@ -66,7 +66,26 @@ main { flex: 1; min-width: 0; }
 #dock .dock-btn .dock-badge-krust {
   background: rgba(46, 125, 50, 0.85);
 }
-.term-view { padding: 0; }
+.term-view { position: relative; padding: 0; }
+.term-reset {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 5;
+  font: inherit;
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 0.35rem;
+  background: var(--btn-bg, #e8e8e8);
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.35;
+  transition: opacity 0.15s;
+}
+.term-view:hover .term-reset { opacity: 1; }
+.term-reset:hover { background: var(--btn-hover, #ddd); }
 .krust-frame {
   display: block;
   width: 100%;
@@ -838,3 +857,19 @@ button.danger:hover { background: #d93a30; }
 .app-item:hover { background: var(--row-hover, #ececec); }
 .app-item-danger { color: #b3261e; }
 .app-item-danger:hover { background: #fdecea; }
+
+@media (max-width: 680px) {
+  .app-layout { gap: 0.35rem; }
+  #dock {
+    position: fixed;
+    left: 0;
+    top: 1rem;
+    z-index: 50;
+    transform: translateX(-52%);
+    transition: transform 0.18s ease;
+  }
+  #dock:hover,
+  #dock:focus-within {
+    transform: translateX(0);
+  }
+}

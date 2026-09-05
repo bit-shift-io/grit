@@ -327,6 +327,9 @@ pub async fn run(registry: TabRegistry, port: u16) {
     tracing::info!("Grit web daemon listening on http://127.0.0.1:{port}");
     let (app, refresh_rx) = boot(registry).await;
     let handle = run_server(listener, app, refresh_rx);
+    // Spin up krust (the web terminal our dock embeds) if it's installed but
+    // not already running — fire-and-forget, never fatal.
+    tokio::spawn(async move { crate::krust::ensure_krust().await });
     handle.await.ok();
 }
 
