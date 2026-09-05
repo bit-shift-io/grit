@@ -66,12 +66,20 @@ main { flex: 1; min-width: 0; }
 #dock .dock-btn .dock-badge-krust {
   background: rgba(46, 125, 50, 0.85);
 }
-.term-view { position: relative; padding: 0; }
+.term-view { padding: 0; }
+.term-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--btn-border, #ccc);
+  border-bottom: none;
+  border-radius: 0.5rem 0.5rem 0 0;
+  background: var(--section-bg, #f4f4f4);
+  font-size: 0.8rem;
+}
+.term-title { font-weight: 600; }
 .term-reset {
-  position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
-  z-index: 5;
   font: inherit;
   font-size: 0.7rem;
   line-height: 1;
@@ -81,17 +89,14 @@ main { flex: 1; min-width: 0; }
   background: var(--btn-bg, #e8e8e8);
   color: inherit;
   cursor: pointer;
-  opacity: 0.35;
-  transition: opacity 0.15s;
 }
-.term-view:hover .term-reset { opacity: 1; }
 .term-reset:hover { background: var(--btn-hover, #ddd); }
 .krust-frame {
   display: block;
   width: 100%;
   height: calc(100vh - 5rem);
   border: 1px solid var(--btn-border, #ccc);
-  border-radius: 0.5rem;
+  border-radius: 0 0 0.5rem 0.5rem;
   background: #2b2b2b;
 }
 body.view-files #files-section .file-browser {
@@ -872,4 +877,24 @@ button.danger:hover { background: #d93a30; }
   #dock:focus-within {
     transform: translateX(0);
   }
+}
+
+#krust-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 1rem;
+  transform: translateX(-50%) translateY(1rem);
+  z-index: 100;
+  background: rgba(40, 40, 40, 0.92);
+  color: #fff;
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.5rem;
+  font-size: 0.8rem;
+  opacity: 0;
+  transition: opacity 0.15s, transform 0.15s;
+  pointer-events: none;
+}
+#krust-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }

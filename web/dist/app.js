@@ -96,6 +96,8 @@ let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
 let activeView = getInitialView();
+let lastViewRepo = null;
+let skipViewPersist = false;
 let browserDir = null;
 let browserParent = null;
 let browserSeeding = false;
@@ -313,10 +315,29 @@ function render(state) {
   }
   const tab = activeTab(state);
 
+  const scope = repoScope(tab.repo_path || "");
+  if (lastViewRepo !== null && scope !== lastViewRepo) {
+    let stored = null;
+    try { stored = localStorage.getItem("grit:view:" + scope); } catch (e) {}
+    if (stored && stored !== activeView && ["dashboard", "files", "log", "term-1", "term-2"].indexOf(stored) !== -1) {
+      activeView = stored;
+    }
+  }
+  lastViewRepo = scope;
+
   addRepoForm.style.display = "none";
   dock.style.display = "flex";
   document.title = `Grit | ${tab.name}`;
   showView(activeView);
+  const t1 = document.getElementById("term-title-1");
+  const t2 = document.getElementById("term-title-2");
+  if (t1) t1.textContent = "Terminal 1" + (tab.name ? " \u2014 " + tab.name : "");
+  if (t2) t2.textContent = "Terminal 2" + (tab.name ? " \u2014 " + tab.name : "");
+  const kb1 = document.querySelector('.dock-btn[data-view="term-1"]');
+  const kb2 = document.querySelector('.dock-btn[data-view="term-2"]');
+  const repoLabel = tab.name || tab.repo_path || "";
+  if (kb1) kb1.title = "Terminal 1 \u2014 " + repoLabel + " (1)";
+  if (kb2) kb2.title = "Terminal 2 \u2014 " + repoLabel + " (2)";
   updateDockBadges(tab);
   const overviewEl = document.getElementById("overview");
   const count = tab.state.changes.length;
@@ -1866,6 +1887,9 @@ function updateUrlView(view) {
 
 function setView(view) {
   if (activeView === view) return;
+  if (!skipViewPersist) {
+    try { localStorage.setItem("grit:view:" + repoScope(currentRepoPath()), view); } catch (e) {}
+  }
   showView(view);
   if (lastState) render(lastState);
 }
@@ -1943,23 +1967,47 @@ function ensureKrustFrame(sess) {
   frame.setAttribute("src", krustFrameSrc(sess, sid));
 }
 
+function krustToast(msg) {
+  let t = document.getElementById("krust-toast");
+  if (!t) {
+    t = document.createElement("div");
+    t.id = "krust-toast";
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(krustToast.__t);
+  krustToast.__t = setTimeout(() => t.classList.remove("show"), 4000);
+}
+
 async function resetKrustSession(view) {
   const sess = KRUST_SESSIONS[view];
   if (!sess) return;
   const frame = document.getElementById(sess.iframe);
-  if (frame && frame.getAttribute("src")) {
-    const m = /[?&]s=([^&]+)/.exec(frame.getAttribute("src"));
-    const sid = m ? m[1] : null;
-    if (krustAvailable && sid) {
-      try {
-        await fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(sid)}`, { mode: "cors" });
-      } catch (e) { /* krust went away mid-reset; reload below still recreates */ }
-    }
-    const cleaned = frame.getAttribute("src").replace(/&r=\d+/, "");
-    frame.setAttribute("src", cleaned + "&r=" + Date.now());
-  } else {
+  const src = frame && frame.getAttribute("src");
+  if (!src) {
     ensureKrustFrame(sess);
+    return;
   }
+  const m = /[?&]s=([^&]+)/.exec(src);
+  const sid = m ? m[1] : null;
+  if (krustAvailable && sid) {
+    let res = null;
+    let body = null;
+    try {
+      res = await fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(sid)}`, { mode: "cors" });
+      body = await res.json();
+    } catch (e) { /* krust down mid-reset; reload below still reconnects */ }
+    if (res && !res.ok) {
+      krustToast("krust is too old for terminal Reset — rebuild it from ~/Projects/krust");
+      return;
+    }
+    if (body && body.ok === false) {
+      // session was already gone; the reload below creates a fresh one
+    }
+  }
+  const cleaned = src.replace(/&r=\d+/, "");
+  frame.setAttribute("src", cleaned + "&r=" + Date.now());
 }
 
 async function probeKrust() {
@@ -1975,7 +2023,9 @@ async function probeKrust() {
     btn.style.display = ok ? "" : "none";
   });
   if (!ok && (activeView === "term-1" || activeView === "term-2")) {
+    skipViewPersist = true;
     setView("dashboard");
+    skipViewPersist = false;
   }
 }
 

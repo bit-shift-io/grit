@@ -34,6 +34,32 @@ all contained in one self-contained executable.
 - Connect-mode: if a Grit daemon is already running on `--port` (e.g. a
   systemd service), the desktop app attaches to it as a client instead of
   starting its own server — one source of truth, no config races
+- Web view dock: switch between Dashboard, Files, and Log views with a left
+  dock (or the `D` / `F` / `L` keys); deep-link with `?view=files` etc.
+- Embedded terminals: two dock views (`1` / `2`) render per-repo shells via
+  the optional `krust` web-terminal daemon, which Grit auto-starts if it's
+  installed; each view has a hover `Reset` button for a fresh shell
+
+## Web UI
+
+The web UI at `http://localhost:5000` is a self-contained dashboard (no Node
+toolchain — plain HTML/CSS/JS embedded in the binary).
+
+- **Views**: `D`ashboard (status + actions + branches + stashes + history),
+  `F`iles browser, `L`og, and the two embedded terminals (`1`, `2`). Click a
+  dock button or press the key. The active view is remembered in the URL
+  (`?view=…`).
+- **Dash badge**: count of uncommitted changes.
+- **Log badge**: count of failed operations.
+- **Terminals**: each terminal opens a shell in the active repository. Sessions
+  are scoped per repository, so switching repos rebinds the terminal to that
+  repo's shell (abandoned shells are recycled automatically). Click `Reset`
+  over a terminal to kill its shell and start fresh. Terminals require a krust
+  build with the `/reset` endpoint and `?dir=` cwd support — recent additions,
+  **not present in older installed copies** — so rebuild from `~/Projects/krust`
+  HEAD. If krust isn't running, Grit tries to start it on port 3000 (`KRUST_BIN`
+  / `KRUST_PORT` override); if it can't be found the terminal dock buttons stay
+  hidden.
 
 ## Build
 
