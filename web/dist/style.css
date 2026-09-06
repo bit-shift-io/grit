@@ -76,9 +76,6 @@ main { flex: 1; min-width: 0; }
   border-radius: 0.5rem;
   background: #2b2b2b;
 }
-body.view-log #log {
-  max-height: calc(100vh - 11rem);
-}
 
 #conn-status {
   position: fixed;

@@ -307,7 +307,7 @@ function render(state) {
     termView1.style.display = "none";
     termView2.style.display = "none";
     dock.style.display = "none";
-    document.body.classList.remove("view-dashboard", "view-files", "view-log", "view-term-1", "view-term-2");
+    document.body.classList.remove("view-dashboard", "view-files", "view-term-1", "view-term-2");
     updateDockBadges(null);
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
@@ -319,7 +319,7 @@ function render(state) {
   if (lastViewRepo !== null && scope !== lastViewRepo) {
     let stored = null;
     try { stored = localStorage.getItem("grit:view:" + scope); } catch (e) {}
-    if (stored && stored !== activeView && ["dashboard", "files", "log", "term-1", "term-2"].indexOf(stored) !== -1) {
+    if (stored && stored !== activeView && ["dashboard", "files", "term-1", "term-2"].indexOf(stored) !== -1) {
       activeView = stored;
     }
   }
@@ -1493,7 +1493,7 @@ document.getElementById("create-stash-btn").onclick = () => {
 
 function getInitialView() {
   const v = new URL(window.location.href).searchParams.get("view");
-  return v === "files" || v === "log" || v === "term-1" || v === "term-2" ? v : "dashboard";
+  return v === "files" || v === "term-1" || v === "term-2" ? v : "dashboard";
 }
 
 function showView(view) {
@@ -1505,11 +1505,11 @@ function showView(view) {
   document.getElementById("branches-section").style.display = dashboard ? "block" : "none";
   document.getElementById("stashes-section").style.display = dashboard ? "block" : "none";
   document.getElementById("history-section").style.display = dashboard ? "block" : "none";
+  document.getElementById("log-section").style.display = dashboard ? "block" : "none";
   document.getElementById("files-section").style.display = view === "files" ? "block" : "none";
-  document.getElementById("log-section").style.display = view === "log" ? "block" : "none";
   document.getElementById("view-term-1").style.display = view === "term-1" ? "block" : "none";
   document.getElementById("view-term-2").style.display = view === "term-2" ? "block" : "none";
-  for (const v of ["dashboard", "files", "log", "term-1", "term-2"]) {
+  for (const v of ["dashboard", "files", "term-1", "term-2"]) {
     document.body.classList.toggle(`view-${v}`, v === view);
   }
   document.querySelectorAll(".dock-btn").forEach((btn) => {
@@ -1549,13 +1549,9 @@ function setView(view) {
 
 function updateDockBadges(tab) {
   const dashBadge = document.getElementById("dock-count-dashboard");
-  const logBadge = document.getElementById("dock-count-log");
   const nChanges = tab ? (tab.state ? tab.state.changes.length : 0) : 0;
-  const nFailed = tab ? ((tab.log || []).filter((e) => e.status === "failed").length) : 0;
   dashBadge.textContent = nChanges > 0 ? String(nChanges) : "";
   dashBadge.style.display = nChanges > 0 ? "" : "none";
-  logBadge.textContent = nFailed > 0 ? String(nFailed) : "";
-  logBadge.style.display = nFailed > 0 ? "" : "none";
 }
 
 document.getElementById("dock").addEventListener("click", (event) => {
@@ -1570,7 +1566,6 @@ document.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   if (key === "d") setView("dashboard");
   else if (key === "f") setView("files");
-  else if (key === "l") setView("log");
   else if (key === "1") setView("term-1");
   else if (key === "2") setView("term-2");
 });
