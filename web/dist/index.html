@@ -39,6 +39,16 @@
         <div class="form-group">
           <label for="new-repo-path">Directory</label>
           <input id="new-repo-path" type="text" placeholder="~/projects/my-repo">
+          <div id="folder-browser" class="folder-browser">
+            <div class="browser-bar">
+              <code id="browser-current"></code>
+              <span class="browser-nav">
+                <button id="browser-up-btn" type="button">Up</button>
+                <button id="browser-home-btn" type="button">Home</button>
+              </span>
+            </div>
+            <div id="browser-entries" class="browser-entries"></div>
+          </div>
         </div>
         <div class="form-group">
           <label for="new-repo-name">Name</label>
@@ -67,9 +77,6 @@
       </div>
     </section>
     <section id="files-section" class="term-view" style="display: none;">
-      <div class="term-header">
-        <span class="term-title" id="folio-title">Files</span>
-      </div>
       <iframe id="folio-frame" class="folio-frame" title="Files" allow="clipboard-read; clipboard-write"></iframe>
     </section>
     <section id="branches-section" class="section collapsed" style="display: none;">
@@ -106,17 +113,9 @@
       </div>
     </section>
     <section id="view-term-1" class="term-view" style="display: none;">
-      <div class="term-header">
-        <span class="term-title" id="term-title-1">Terminal 1</span>
-        <button class="term-reset" type="button" title="Reset terminal (fresh shell)">Reset</button>
-      </div>
       <iframe id="krust-1" class="krust-frame" title="Terminal 1" allow="clipboard-read; clipboard-write"></iframe>
     </section>
     <section id="view-term-2" class="term-view" style="display: none;">
-      <div class="term-header">
-        <span class="term-title" id="term-title-2">Terminal 2</span>
-        <button class="term-reset" type="button" title="Reset terminal (fresh shell)">Reset</button>
-      </div>
       <iframe id="krust-2" class="krust-frame" title="Terminal 2" allow="clipboard-read; clipboard-write"></iframe>
     </section>
   </main>

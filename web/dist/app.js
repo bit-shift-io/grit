@@ -90,6 +90,10 @@ let expandedCommitKey = null;
 let expandedCommitEl = null;
 let expandedStashKey = null;
 let awaitingNewTab = false;
+// Folder-browser picker state for the "+ new tab" form.
+let browserDir = null;
+let browserParent = null;
+let browserSeeding = false;
 // Client-local view state: entries with seq <= this are hidden by "Clear Log".
 let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
@@ -125,12 +129,70 @@ function setupAddRepoForm(tab) {
     pathInput.value = "";
     delete nameInput.dataset.userSet;
     errorEl.style.display = "none";
+    browserDir = null;
+    document.getElementById("folder-browser").style.display = "block";
   }
 
+  const browserCurrent = document.getElementById("browser-current");
+  const browserEntries = document.getElementById("browser-entries");
+  const upBtn = document.getElementById("browser-up-btn");
+  const homeBtn = document.getElementById("browser-home-btn");
   const openBtn = document.getElementById("open-repo-btn");
   const cancelBtn = document.getElementById("cancel-repo-btn");
 
   nameInput.oninput = () => { nameInput.dataset.userSet = "true"; };
+
+  // The path and name fields follow the browser's current folder so the
+  // user can just hit "Open Repository" without a separate select step.
+  function applyDir(dir) {
+    pathInput.value = dir;
+    if (!nameInput.dataset.userSet) {
+      nameInput.value = getTabNameFromPath(dir);
+    }
+  }
+
+  async function loadBrowser(path) {
+    try {
+      const url = path ? `/browse?path=${encodeURIComponent(path)}` : "/browse";
+      const response = await fetch(url);
+      const data = await response.json();
+      browserDir = data.current;
+      browserParent = data.parent;
+      browserCurrent.textContent = data.current;
+      upBtn.disabled = !data.parent;
+      applyDir(data.current);
+      browserEntries.textContent = "";
+      if (data.entries.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "browser-empty muted";
+        empty.textContent = "No subdirectories";
+        browserEntries.appendChild(empty);
+        return;
+      }
+      for (const entry of data.entries) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "browser-entry";
+        btn.textContent = `${entry.name}/`;
+        btn.title = entry.path;
+        btn.onclick = () => loadBrowser(entry.path);
+        browserEntries.appendChild(btn);
+      }
+    } catch (err) {
+      browserEntries.textContent = `Failed to list folders: ${err}`;
+    }
+  }
+
+  upBtn.onclick = () => { if (browserParent) loadBrowser(browserParent); };
+  homeBtn.onclick = () => loadBrowser("");
+
+  // The browser is always open: seed it once per form appearance.
+  if (!browserDir && !browserSeeding) {
+    browserSeeding = true;
+    loadBrowser(pathInput.value.trim()).finally(() => {
+      browserSeeding = false;
+    });
+  }
 
   pathInput.oninput = () => {
     if (!nameInput.dataset.userSet && pathInput.value) {
@@ -267,10 +329,6 @@ function render(state) {
   dock.style.display = "flex";
   document.title = `Grit | ${tab.name}`;
   showView(activeView);
-  const t1 = document.getElementById("term-title-1");
-  const t2 = document.getElementById("term-title-2");
-  if (t1) t1.textContent = "Terminal 1" + (tab.name ? " \u2014 " + tab.name : "");
-  if (t2) t2.textContent = "Terminal 2" + (tab.name ? " \u2014 " + tab.name : "");
   const kb1 = document.querySelector('.dock-btn[data-view="term-1"]');
   const kb2 = document.querySelector('.dock-btn[data-view="term-2"]');
   const repoLabel = tab.name || tab.repo_path || "";
@@ -633,11 +691,6 @@ function ensureFolioFrame() {
   const target = folioFrameSrc();
   if (frame.getAttribute("src") === target) return;
   frame.setAttribute("src", target);
-  const title = document.getElementById("folio-title");
-  if (title) {
-    const tab = lastState && lastState.tabs.length > 0 ? activeTab(lastState) : null;
-    title.textContent = "Files" + (tab && tab.name ? " \u2014 " + tab.name : "");
-  }
 }
 
 function renderFileBrowser(tab) {
@@ -1567,49 +1620,6 @@ function ensureKrustFrame(sess) {
   frame.setAttribute("src", krustFrameSrc(sess, sid));
 }
 
-function krustToast(msg) {
-  let t = document.getElementById("krust-toast");
-  if (!t) {
-    t = document.createElement("div");
-    t.id = "krust-toast";
-    document.body.appendChild(t);
-  }
-  t.textContent = msg;
-  t.classList.add("show");
-  clearTimeout(krustToast.__t);
-  krustToast.__t = setTimeout(() => t.classList.remove("show"), 4000);
-}
-
-async function resetKrustSession(view) {
-  const sess = KRUST_SESSIONS[view];
-  if (!sess) return;
-  const frame = document.getElementById(sess.iframe);
-  const src = frame && frame.getAttribute("src");
-  if (!src) {
-    ensureKrustFrame(sess);
-    return;
-  }
-  const m = /[?&]s=([^&]+)/.exec(src);
-  const sid = m ? m[1] : null;
-  if (krustAvailable && sid) {
-    let res = null;
-    let body = null;
-    try {
-      res = await fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(sid)}`, { mode: "cors" });
-      body = await res.json();
-    } catch (e) { /* krust down mid-reset; reload below still reconnects */ }
-    if (res && !res.ok) {
-      krustToast("krust is too old for terminal Reset — rebuild it from ~/Projects/krust");
-      return;
-    }
-    if (body && body.ok === false) {
-      // session was already gone; the reload below creates a fresh one
-    }
-  }
-  const cleaned = src.replace(/&r=\d+/, "");
-  frame.setAttribute("src", cleaned + "&r=" + Date.now());
-}
-
 async function probeKrust() {
   let ok = false;
   try {
@@ -1631,14 +1641,6 @@ async function probeKrust() {
 
 probeKrust();
 setInterval(probeKrust, KRUST_PROBE_MS);
-
-document.querySelectorAll(".term-reset").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    const section = btn.closest(".term-view");
-    if (!section) return;
-    resetKrustSession(section.id.replace("view-", ""));
-  });
-});
 
 //#endregion
 

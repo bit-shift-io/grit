@@ -67,6 +67,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ws", get(websocket::ws_handler))
         .route("/files", get(files_handler))
         .route("/commit", get(commit_handler))
+        .route("/browse", get(browse_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
