@@ -319,8 +319,10 @@ function render(state) {
   if (lastViewRepo !== null && scope !== lastViewRepo) {
     let stored = null;
     try { stored = localStorage.getItem("grit:view:" + scope); } catch (e) {}
-    if (stored && stored !== activeView && ["dashboard", "files", "term-1", "term-2"].indexOf(stored) !== -1) {
+    if (stored && ["dashboard", "files", "term-1", "term-2"].indexOf(stored) !== -1) {
       activeView = stored;
+    } else {
+      activeView = "dashboard";
     }
   }
   lastViewRepo = scope;
