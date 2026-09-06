@@ -1525,6 +1525,10 @@ function showView(view) {
   }
   if (view === "files") {
     ensureFolioFrame();
+    const frame = document.getElementById("folio-frame");
+    if (frame && frame.getAttribute("src")) {
+      try { frame.contentWindow.focus(); } catch (e) { /* cross-origin focus is best-effort */ }
+    }
   }
 }
 
