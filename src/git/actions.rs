@@ -46,11 +46,7 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
             | GitAction::NewTab(_)
             | GitAction::CloseTab
             | GitAction::DiscardUntracked(_)
-            | GitAction::SearchHistory(_)
-            | GitAction::OpenExternal(_)
-            | GitAction::OpenWith(_, _)
-            | GitAction::DeleteFile(_)
-            | GitAction::RenameFile(_, _) => {
+            | GitAction::SearchHistory(_) => {
             return None;
         }
     };
@@ -539,17 +535,13 @@ mod tests {
             (NewTab("x".into()), false),
             (CloseTab, false),
             (RunScript("tool.sh".into()), true),
-            // File ops + history search are handled bespoke in the WebSocket
-            // layer with no placeholder transcript entry today.
+            // History search is handled bespoke in the WebSocket layer with
+            // no placeholder transcript entry today.
             (SearchHistory("q".into()), false),
-            (OpenExternal("f".into()), false),
-            (OpenWith("code".into(), "%f".into()), false),
-            (DeleteFile("f".into()), false),
-            (RenameFile("a".into(), "b".into()), false),
         ];
         assert_eq!(
             cases.len(),
-            31,
+            27,
             "GitAction gained a variant; update this list and types.rs round-trip list"
         );
         for (action, previewable) in cases {

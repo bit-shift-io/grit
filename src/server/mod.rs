@@ -67,11 +67,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ws", get(websocket::ws_handler))
         .route("/files", get(files_handler))
         .route("/commit", get(commit_handler))
-        .route("/browse", get(browse_handler))
-        .route("/filetree", get(filetree_handler))
-        .route("/filecontent", get(filecontent_handler))
-        .route("/filesearch", get(filesearch_handler))
-        .route("/apps", get(apps_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
@@ -326,10 +321,22 @@ pub async fn run(registry: TabRegistry, port: u16) {
 
     tracing::info!("Grit web daemon listening on http://127.0.0.1:{port}");
     let (app, refresh_rx) = boot(registry).await;
+    // Files dock fallback root: the first open repository, else home.
+    let default_root = app
+        .registry
+        .snapshot()
+        .tabs
+        .first()
+        .map(|t| t.repo_path.clone())
+        .filter(|p| !p.is_empty());
     let handle = run_server(listener, app, refresh_rx);
-    // Spin up krust (the web terminal our dock embeds) if it's installed but
-    // not already running — fire-and-forget, never fatal.
-    tokio::spawn(async move { crate::krust::ensure_krust().await });
+    // Spin up folio (the file explorer our dock embeds) and krust (the web
+    // terminal) if they're installed but not already running — fire-and-forget,
+    // never fatal. Per-repo roots come from the iframe `?dir=` param.
+    tokio::spawn(async move {
+        crate::folio::ensure_folio(default_root.as_deref().map(std::path::Path::new)).await;
+        crate::krust::ensure_krust().await;
+    });
     handle.await.ok();
 }
 

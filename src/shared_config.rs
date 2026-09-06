@@ -7,66 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::types::RepoState;
 
-/// Configuration for external editors keyed by file extension.
-///
-/// `defaults()` resolves environment variables so callers get a ready-to-use
-/// map even when no config file exists yet:
-/// - Known text extensions → `$EDITOR` (falls back to `code`)
-/// - Known image extensions → `$IMG_EDITOR` (falls back to `xdg-open`)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EditorConfig {
-    /// Extension (without dot) → shell command.
-    #[serde(flatten)]
-    pub editors: std::collections::HashMap<String, String>,
-}
-
-impl EditorConfig {
-    pub fn defaults() -> Self {
-        let text_cmd = std::env::var("EDITOR")
-            .or_else(|_| std::env::var("VISUAL"))
-            .unwrap_or_else(|_| "code".to_string());
-        let img_cmd = std::env::var("IMG_EDITOR")
-            .unwrap_or_else(|_| "xdg-open".to_string());
-        let mut editors = std::collections::HashMap::new();
-        for ext in TEXT_EXTS {
-            editors.insert(ext.to_string(), text_cmd.clone());
-        }
-        for ext in IMAGE_EXTS {
-            editors.insert(ext.to_string(), img_cmd.clone());
-        }
-        EditorConfig { editors }
-    }
-
-    /// Look up the editor for a given file path by its extension.
-    pub fn for_path(&self, path: &str) -> String {
-        let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
-        self.editors
-            .get(&ext)
-            .cloned()
-            .unwrap_or_else(|| {
-                // Fallback: try $EDITOR, then $VISUAL, then "code"
-                std::env::var("EDITOR")
-                    .or_else(|_| std::env::var("VISUAL"))
-                    .unwrap_or_else(|_| "code".to_string())
-            })
-    }
-}
-
-pub(crate) const TEXT_EXTS: &[&str] = &[
-    "rs", "py", "js", "ts", "tsx", "jsx", "c", "cpp", "h", "hpp", "go", "java",
-    "rb", "php", "sh", "bash", "zsh", "fish", "vim", "lua", "r", "swift", "kt",
-    "cs", "fs", "hs", "ex", "exs", "erl", "clj", "lisp", "el", "jl",
-    "toml", "yaml", "yml", "json", "jsonc", "json5", "xml", "html", "htm",
-    "css", "scss", "less", "sql", "graphql", "proto", "md", "txt", "csv",
-    "ini", "cfg", "conf", "env", "gitignore", "gitattributes", "dockerignore",
-    "dockerfile", "makefile", "cmake", "nix", "zig",
-];
-
-pub(crate) const IMAGE_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif", "tiff",
-    "tif", "psd", "ai", "eps",
-];
-
 /// A saved tab configuration (shared by desktop and web).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedTab {
@@ -79,8 +19,6 @@ pub struct SavedTab {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GritConfig {
     pub tabs: Vec<SavedTab>,
-    #[serde(default)]
-    pub editors: Option<EditorConfig>,
 }
 
 /// Config folder: `$XDG_CONFIG_HOME/bitshift/grit`
@@ -124,21 +62,15 @@ pub fn load_tabs_from(path: &Path) -> Vec<SavedTab> {
 pub fn load_config() -> GritConfig {
     let path = match config_path() {
         Some(p) => p,
-        None => return GritConfig { tabs: Vec::new(), editors: None },
+        None => return GritConfig { tabs: Vec::new() },
     };
     match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             tracing::warn!("failed to parse config at {}: {e}", path.display());
-            GritConfig { tabs: Vec::new(), editors: None }
+            GritConfig { tabs: Vec::new() }
         }),
-        Err(_) => GritConfig { tabs: Vec::new(), editors: None },
+        Err(_) => GritConfig { tabs: Vec::new() },
     }
-}
-
-/// Returns the editor config, loading from file or falling back to defaults.
-pub fn load_editor_config() -> EditorConfig {
-    let cfg = load_config();
-    cfg.editors.unwrap_or_else(EditorConfig::defaults)
 }
 
 /// Persists the full config, creating parent directories as needed.
@@ -323,42 +255,6 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, serde_json::to_vec_pretty(tabs).unwrap()).unwrap();
-    }
-
-    #[test]
-    fn editor_config_defaults_populate_text_and_image_exts() {
-        let cfg = EditorConfig::defaults();
-        assert!(cfg.editors.contains_key("rs"));
-        assert!(cfg.editors.contains_key("py"));
-        assert!(cfg.editors.contains_key("png"));
-        assert!(cfg.editors.contains_key("jpg"));
-    }
-
-    #[test]
-    fn editor_config_for_path_returns_correct_editor() {
-        let mut editors = std::collections::HashMap::new();
-        editors.insert("rs".to_string(), "zed".to_string());
-        editors.insert("png".to_string(), "krita".to_string());
-        let cfg = EditorConfig { editors };
-        assert_eq!(cfg.for_path("src/main.rs"), "zed");
-        assert_eq!(cfg.for_path("image.png"), "krita");
-        // Unknown ext falls back to $EDITOR or "code"
-        let fallback = cfg.for_path("foo.xyz");
-        assert!(!fallback.is_empty());
-    }
-
-    #[test]
-    fn editor_config_round_trips_through_grit_config() {
-        let mut editors = std::collections::HashMap::new();
-        editors.insert("rs".to_string(), "zed".to_string());
-        let grit = GritConfig {
-            tabs: vec![],
-            editors: Some(EditorConfig { editors }),
-        };
-        let json = serde_json::to_vec(&grit).unwrap();
-        let loaded: GritConfig = serde_json::from_slice(&json).unwrap();
-        let ec = loaded.editors.unwrap();
-        assert_eq!(ec.for_path("main.rs"), "zed");
     }
 
     #[test]

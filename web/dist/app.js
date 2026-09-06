@@ -6,17 +6,16 @@ const RECONNECT_MAX_MS = 5000;
 const SCROLL_HIT_SLACK_PX = 48;
 const DIFF_MARKER_RATIO = 0.35;
 const LCS_DIFF_CELL_CAP = 4000000;
-const FILE_SEARCH_DEBOUNCE_MS = 200;
 const HISTORY_SEARCH_FILLED_MS = 300;
 const HISTORY_SEARCH_EMPTY_MS = 150;
 const BRANCH_FILTER_DEBOUNCE_MS = 150;
-const DROPDOWN_OFFSET_PX = 2;
 const KRUST_BASE = "http://localhost:3000";
 const KRUST_PROBE_MS = 5000;
 const KRUST_SESSIONS = {
   "term-1": { iframe: "krust-1", n: 1 },
   "term-2": { iframe: "krust-2", n: 2 },
 };
+const FOLIO_BASE = "http://localhost:4000";
 
 let ws = null;
 let reconnectTimer = null;
@@ -98,9 +97,6 @@ let showAddForm = false;
 let activeView = getInitialView();
 let lastViewRepo = null;
 let skipViewPersist = false;
-let browserDir = null;
-let browserParent = null;
-let browserSeeding = false;
 let historyQuery = "";
 let historySearchTimer = null;
 const knownTabIds = new Set();
@@ -129,70 +125,12 @@ function setupAddRepoForm(tab) {
     pathInput.value = "";
     delete nameInput.dataset.userSet;
     errorEl.style.display = "none";
-    browserDir = null;
-    document.getElementById("folder-browser").style.display = "block";
   }
 
-  const browserCurrent = document.getElementById("browser-current");
-  const browserEntries = document.getElementById("browser-entries");
-  const upBtn = document.getElementById("browser-up-btn");
-  const homeBtn = document.getElementById("browser-home-btn");
   const openBtn = document.getElementById("open-repo-btn");
   const cancelBtn = document.getElementById("cancel-repo-btn");
 
   nameInput.oninput = () => { nameInput.dataset.userSet = "true"; };
-
-  // The path and name fields follow the browser's current folder so the
-  // user can just hit "Open Repository" without a separate select step.
-  function applyDir(dir) {
-    pathInput.value = dir;
-    if (!nameInput.dataset.userSet) {
-      nameInput.value = getTabNameFromPath(dir);
-    }
-  }
-
-  async function loadBrowser(path) {
-    try {
-      const url = path ? `/browse?path=${encodeURIComponent(path)}` : "/browse";
-      const response = await fetch(url);
-      const data = await response.json();
-      browserDir = data.current;
-      browserParent = data.parent;
-      browserCurrent.textContent = data.current;
-      upBtn.disabled = !data.parent;
-      applyDir(data.current);
-      browserEntries.textContent = "";
-      if (data.entries.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "browser-empty muted";
-        empty.textContent = "No subdirectories";
-        browserEntries.appendChild(empty);
-        return;
-      }
-      for (const entry of data.entries) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "browser-entry";
-        btn.textContent = `${entry.name}/`;
-        btn.title = entry.path;
-        btn.onclick = () => loadBrowser(entry.path);
-        browserEntries.appendChild(btn);
-      }
-    } catch (err) {
-      browserEntries.textContent = `Failed to list folders: ${err}`;
-    }
-  }
-
-  upBtn.onclick = () => { if (browserParent) loadBrowser(browserParent); };
-  homeBtn.onclick = () => loadBrowser("");
-
-  // The browser is always open: seed it once per form appearance.
-  if (!browserDir && !browserSeeding) {
-    browserSeeding = true;
-    loadBrowser(pathInput.value.trim()).finally(() => {
-      browserSeeding = false;
-    });
-  }
 
   pathInput.oninput = () => {
     if (!nameInput.dataset.userSet && pathInput.value) {
@@ -681,382 +619,53 @@ document.getElementById("run-script-btn").onclick = () => {
 
 //#endregion
 
-//#region File browser
+//#region Folio file browser (embedded external file explorer)
 
-// ======================================
-// File Tree
-// ======================================
-let rootEntries = new Map();
-let expandedDirs = new Map();
-let dirChildren = new Map();
-let selectedFiles = new Map();
-let fileTreeLoading = new Map();
+let folioAvailable = false;
 
-async function fetchFileTree(tab) {
-  if (fileTreeLoading.get(tab.id)) return;
-  fileTreeLoading.set(tab.id, true);
-  try {
-    const response = await fetch(`/filetree?tab=${tab.id}&path=`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    rootEntries.set(tab.id, await response.json());
-    renderFileTree(tab);
-    const prevSelected = selectedFiles.get(tab.id);
-    if (prevSelected) {
-      selectFile(tab, prevSelected);
-    } else {
-      resetPreview();
-    }
-  } catch (err) {
-    console.error("Failed to load file tree:", err);
-  } finally {
-    fileTreeLoading.set(tab.id, false);
-  }
+function folioFrameSrc() {
+  return `${FOLIO_BASE}/?dir=${encodeURIComponent(currentRepoPath())}`;
 }
 
-async function fetchDirChildren(tab, dirPath) {
-  const key = `${tab.id}:${dirPath}`;
-  if (dirChildren.has(key)) return dirChildren.get(key);
-  try {
-    const response = await fetch(`/filetree?tab=${tab.id}&path=${encodeURIComponent(dirPath)}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const children = await response.json();
-    dirChildren.set(key, children);
-    return children;
-  } catch (err) {
-    console.error("Failed to load directory:", err);
-    return [];
+function ensureFolioFrame() {
+  const frame = document.getElementById("folio-frame");
+  if (!frame) return;
+  const target = folioFrameSrc();
+  if (frame.getAttribute("src") === target) return;
+  frame.setAttribute("src", target);
+  const title = document.getElementById("folio-title");
+  if (title) {
+    const tab = lastState && lastState.tabs.length > 0 ? activeTab(lastState) : null;
+    title.textContent = "Files" + (tab && tab.name ? " \u2014 " + tab.name : "");
   }
 }
-
-let searchResults = new Map(); // tab.id → array of search results
-let searchTimer = null;
-
-async function fetchSearchResults(tab, query) {
-  try {
-    const response = await fetch(`/filesearch?tab=${tab.id}&q=${encodeURIComponent(query)}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    searchResults.set(tab.id, await response.json());
-    renderFileTree(tab);
-  } catch (err) {
-    console.error("Search failed:", err);
-  }
-}
-
-function renderFileTree(tab) {
-  const container = document.getElementById("file-tree");
-  const subtitle = document.getElementById("files-subtitle");
-  container.textContent = "";
-
-  const filter = (document.getElementById("file-tree-filter").value || "").trim();
-  const query = filter.toLowerCase();
-  const selectedPath = selectedFiles.get(tab.id);
-
-  // Server-side search mode when filter has text
-  if (filter) {
-    const results = searchResults.get(tab.id);
-    if (results === undefined) {
-      // Show loading and fire search
-      const loading = document.createElement("div");
-      loading.className = "muted";
-      loading.textContent = "Searching\u2026";
-      container.appendChild(loading);
-      clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => fetchSearchResults(tab, filter), FILE_SEARCH_DEBOUNCE_MS);
-      return;
-    }
-    subtitle.textContent = results.length === 0
-      ? "No matches"
-      : `${results.length} match${results.length !== 1 ? "es" : ""}`;
-    for (const entry of results) {
-      const item = document.createElement("div");
-      item.className = "tree-item";
-      if (entry.path === selectedPath) item.classList.add("selected");
-      const icon = document.createElement("span");
-      icon.className = "icon";
-      icon.textContent = "\u25a1";
-      const name = document.createElement("span");
-      name.className = "tree-name";
-      name.textContent = entry.path;
-      item.appendChild(icon);
-      item.appendChild(name);
-      item.onclick = (e) => {
-        e.stopPropagation();
-        selectFile(tab, entry.path);
-      };
-      container.appendChild(item);
-    }
-    return;
-  }
-
-  // Normal tree mode
-  const roots = rootEntries.get(tab.id);
-  const expanded = expandedDirs.get(tab.id) || new Set();
-
-  if (!roots || roots.length === 0) {
-    subtitle.textContent = "";
-    const empty = document.createElement("div");
-    empty.className = "muted";
-    empty.textContent = "No files.";
-    container.appendChild(empty);
-    return;
-  }
-
-  const collectVisible = (entries, parentPath, depth) => {
-    const result = [];
-    const sorted = [...entries].sort((a, b) =>
-      a.is_dir !== b.is_dir
-        ? a.is_dir ? -1 : 1
-        : a.name.localeCompare(b.name, undefined, { sensitivity: "base" })
-    );
-    for (const entry of sorted) {
-      result.push({ entry, depth });
-      if (entry.is_dir && expanded.has(entry.path)) {
-        const childKey = `${tab.id}:${entry.path}`;
-        const cached = dirChildren.get(childKey);
-        if (cached) {
-          result.push(...collectVisible(cached, entry.path, depth + 1));
-        }
-      }
-    }
-    return result;
-  };
-
-  const visible = collectVisible(roots, "", 0);
-  const totalVisible = visible.length;
-  subtitle.textContent = `${totalVisible} items`;
-
-  for (const { entry, depth } of visible) {
-    const item = document.createElement("div");
-    item.className = "tree-item" + (entry.is_dir ? " folder" : "");
-    if (entry.path === selectedPath) {
-      item.classList.add("selected");
-    }
-    item.style.paddingLeft = `${0.25 + depth * 1.1}rem`;
-
-    const icon = document.createElement("span");
-    icon.className = "icon";
-    if (entry.is_dir) {
-      const isOpen = expanded.has(entry.path);
-      icon.textContent = isOpen ? "\u25bc" : "\u25b6";
-    } else {
-      icon.textContent = "\u25a1";
-    }
-
-    const name = document.createElement("span");
-    name.className = "tree-name";
-    name.textContent = entry.name;
-
-    item.appendChild(icon);
-    item.appendChild(name);
-
-    if (entry.is_dir) {
-      item.onclick = (e) => {
-        e.stopPropagation();
-        toggleDir(tab, entry.path);
-      };
-    } else {
-      item.onclick = (e) => {
-        e.stopPropagation();
-        selectFile(tab, entry.path);
-      };
-    }
-
-    container.appendChild(item);
-  }
-}
-
-async function toggleDir(tab, dirPath) {
-  const expanded = expandedDirs.get(tab.id) || new Set();
-  if (expanded.has(dirPath)) {
-    expanded.delete(dirPath);
-    collapseDescendants(tab, dirPath);
-  } else {
-    expanded.add(dirPath);
-    await fetchDirChildren(tab, dirPath);
-  }
-  expandedDirs.set(tab.id, expanded);
-  renderFileTree(tab);
-}
-
-function collapseDescendants(tab, dirPath) {
-  const expanded = expandedDirs.get(tab.id);
-  if (!expanded) return;
-  const prefix = dirPath + "/";
-  for (const key of [...expanded]) {
-    if (key.startsWith(prefix)) {
-      expanded.delete(key);
-    }
-  }
-}
-
-// Dropdown positioned at the anchor, removed on scroll/outside click.
-// ======================================
-// File Preview & UI Utilities
-// ======================================
-function showDropdown(anchor, fill) {
-  const existing = document.querySelector(".app-dropdown");
-  if (existing) { existing.remove(); return; }
-  const dropdown = document.createElement("div");
-  dropdown.className = "app-dropdown";
-  fill(dropdown);
-  document.body.appendChild(dropdown);
-  const rect = anchor.getBoundingClientRect();
-  dropdown.style.position = "fixed";
-  dropdown.style.top = (rect.bottom + DROPDOWN_OFFSET_PX) + "px";
-  dropdown.style.right = (window.innerWidth - rect.right) + "px";
-  const scrollParent = anchor.closest(".section-body") || window;
-  function onScroll() { cleanup(); dropdown.remove(); }
-  scrollParent.addEventListener("scroll", onScroll, { passive: true });
-  if (scrollParent !== window) {
-    window.addEventListener("scroll", onScroll, { passive: true });
-  }
-  function cleanup() {
-    scrollParent.removeEventListener("scroll", onScroll);
-    window.removeEventListener("scroll", onScroll);
-  }
-  setTimeout(() => {
-    document.addEventListener("click", function closer() {
-      cleanup();
-      dropdown.remove();
-      document.removeEventListener("click", closer);
-    });
-  }, 0);
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function resetPreview() {
-  document.getElementById("preview-header").innerHTML = "";
-  document.getElementById("preview-content").innerHTML = "<p class='muted'>Select a file to preview</p>";
-}
-
-async function selectFile(tab, path) {
-  selectedFiles.set(tab.id, path);
-  renderFileTree(tab);
-
-  const header = document.getElementById("preview-header");
-  const content = document.getElementById("preview-content");
-
-  header.innerHTML = `<span class="filename">${escapeHtml(path)}</span><div class="preview-actions"><div class="app-selector"><button id="open-external-btn" title="Open in default editor">Edit</button><button id="open-with-btn" title="Choose application">&#9662;</button></div><div class="file-actions-selector"><button id="file-actions-btn" title="File actions">&#9881;</button></div></div>`;
-  content.innerHTML = "<p class='muted'>Loading...</p>";
-
-  // Fetch apps in parallel with file content
-  const contentPromise = fetch(`/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}`)
-    .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-  const appsPromise = fetch(`/apps?path=${encodeURIComponent(path)}`)
-    .then(r => { if (!r.ok) return []; return r.json(); })
-    .catch(() => []);
-
-  try {
-    const [data, apps] = await Promise.all([contentPromise, appsPromise]);
-
-    if (data.error) {
-      content.innerHTML = `<p class="preview-error">${escapeHtml(data.error)}</p>`;
-    } else if (data.is_binary) {
-      content.innerHTML = `<p class="preview-binary">Binary file (${data.size} bytes)</p>`;
-    } else if (data.is_image) {
-      content.innerHTML = `<img src="/filecontent?tab=${tab.id}&path=${encodeURIComponent(path)}&raw=true" alt="${escapeHtml(path)}">`;
-    } else {
-      content.textContent = data.content;
-    }
-
-    document.getElementById("open-external-btn").onclick = () => {
-      sendAction({ OpenExternal: path });
-    };
-
-    const openWithBtn = document.getElementById("open-with-btn");
-    if (apps.length === 0) {
-      openWithBtn.style.display = "none";
-    } else {
-      openWithBtn.onclick = () => {
-        showDropdown(openWithBtn, (dropdown) => {
-          for (const app of apps) {
-            const item = document.createElement("div");
-            item.className = "app-item";
-            item.textContent = app.name;
-            item.title = app.exec;
-            item.onclick = (e) => {
-              e.stopPropagation();
-              dropdown.remove();
-              sendAction({ OpenWith: [path, app.exec] });
-            };
-            dropdown.appendChild(item);
-          }
-        });
-      };
-    }
-
-    const fileActionsBtn = document.getElementById("file-actions-btn");
-    fileActionsBtn.onclick = () => {
-      showDropdown(fileActionsBtn, (dropdown) => {
-        const renameItem = document.createElement("div");
-        renameItem.className = "app-item";
-        renameItem.textContent = "Rename";
-        renameItem.onclick = (e) => {
-          e.stopPropagation();
-          dropdown.remove();
-          const dir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : "";
-          const baseName = path.substring(path.lastIndexOf("/") + 1);
-          const newName = prompt("Rename to:", baseName);
-          if (newName && newName !== baseName) {
-            const newPath = dir ? dir + "/" + newName : newName;
-            sendAction({ RenameFile: [path, newPath] });
-          }
-        };
-        dropdown.appendChild(renameItem);
-        const deleteItem = document.createElement("div");
-        deleteItem.className = "app-item app-item-danger";
-        deleteItem.textContent = "Delete";
-        deleteItem.onclick = (e) => {
-          e.stopPropagation();
-          dropdown.remove();
-          if (confirm("Delete " + path + "?")) {
-            sendAction({ DeleteFile: path });
-            selectedFiles.delete(tab.id);
-            resetPreview();
-          }
-        };
-        dropdown.appendChild(deleteItem);
-      });
-    };
-  } catch (err) {
-    content.innerHTML = `<p class="preview-error">Failed to load: ${escapeHtml(err)}</p>`;
-  }
-}
-
-let lastFileBrowserTab = null;
 
 function renderFileBrowser(tab) {
   const section = document.getElementById("files-section");
   section.style.display = activeView === "files" ? "block" : "none";
+  ensureFolioFrame();
+}
 
-  // Clear the filter only when switching to a different tab
-  const filter = document.getElementById("file-tree-filter");
-  if (filter && lastFileBrowserTab !== tab.id) {
-    filter.value = "";
-    lastFileBrowserTab = tab.id;
+async function probeFolio() {
+  let ok = false;
+  try {
+    const res = await fetch(`${FOLIO_BASE}/`, { mode: "cors" });
+    ok = res.ok;
+  } catch (e) {
+    ok = false;
   }
-
-  if (rootEntries.get(tab.id) === undefined && !fileTreeLoading.get(tab.id)) {
-    fetchFileTree(tab);
-  } else {
-    renderFileTree(tab);
-    // Re-show previously selected file for this tab, or clear preview
-    const prevSelected = selectedFiles.get(tab.id);
-    if (prevSelected) {
-      selectFile(tab, prevSelected);
-    } else {
-      resetPreview();
-    }
+  folioAvailable = ok;
+  const fbtn = document.querySelector('.dock-btn[data-view="files"]');
+  if (fbtn) fbtn.style.display = ok ? "" : "none";
+  if (!ok && activeView === "files") {
+    skipViewPersist = true;
+    setView("dashboard");
+    skipViewPersist = false;
   }
 }
+
+probeFolio();
+setInterval(probeFolio, KRUST_PROBE_MS);
 
 //#endregion
 
@@ -1801,18 +1410,6 @@ document.getElementById("branch-filter").addEventListener("input", () => {
   }, BRANCH_FILTER_DEBOUNCE_MS);
 });
 
-document.getElementById("file-tree-filter").addEventListener("input", () => {
-  if (!lastState) return;
-  const tab = activeTab(lastState);
-  if (!tab) return;
-  const filter = (document.getElementById("file-tree-filter").value || "").trim();
-  if (!filter) {
-    searchResults.delete(tab.id);
-    clearTimeout(searchTimer);
-  }
-  renderFileTree(tab);
-});
-
 document.getElementById("stash-list").addEventListener("click", (event) => {
   if (!lastState) return;
   const tab = activeTab(lastState);
@@ -1872,6 +1469,9 @@ function showView(view) {
     if (frame && frame.getAttribute("src")) {
       try { frame.contentWindow.focus(); } catch (e) { /* cross-origin focus is best-effort */ }
     }
+  }
+  if (view === "files") {
+    ensureFolioFrame();
   }
 }
 

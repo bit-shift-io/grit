@@ -11,13 +11,13 @@ pub(crate) use files::*;
 pub(crate) use actions::*;
 
 pub use types::{
-    CommitInfo, CommitSummary, FileChange, FileContent, FilePair, FileStat, FileTreeEntry,
-    GitAction, GitStatus, LogEntry, LogStatus, RepoState, StashEntry,
+    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, LogEntry,
+    LogStatus, RepoState, StashEntry,
 };
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

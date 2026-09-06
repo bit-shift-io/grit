@@ -3,6 +3,7 @@ mod server;
 #[cfg(feature = "desktop")]
 mod ui;
 mod krust;
+mod folio;
 mod shared_config;
 pub mod actions;
 #[cfg(test)]
