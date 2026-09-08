@@ -37,6 +37,7 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::CreateTag(n, t) => vec![seq(&["tag", n, t])],
         GitAction::DeleteTag(n) => vec![seq(&["tag", "-d", n])],
         GitAction::DeleteBranch(n) => vec![seq(&["branch", "-d", n])],
+        GitAction::Merge(b) => vec![seq(&["merge", b]), seq(&["push"])],
         GitAction::StashPush(m) => vec![seq(&["stash", "push", "-m", m])],
         GitAction::StashApply(id) => vec![seq(&["stash", "apply", id])],
         GitAction::StashPop(id) => vec![seq(&["stash", "pop", id])],
@@ -535,13 +536,14 @@ mod tests {
             (NewTab("x".into()), false),
             (CloseTab, false),
             (RunScript("tool.sh".into()), true),
+            (Merge("feature".into()), true),
             // History search is handled bespoke in the WebSocket layer with
             // no placeholder transcript entry today.
             (SearchHistory("q".into()), false),
         ];
         assert_eq!(
             cases.len(),
-            27,
+            28,
             "GitAction gained a variant; update this list and types.rs round-trip list"
         );
         for (action, previewable) in cases {
@@ -602,6 +604,7 @@ mod tests {
             CreateTag("t".into(), "head".into()),
             DeleteTag("t".into()),
             DeleteBranch("b".into()),
+            Merge("feature".into()),
         ];
         for action in actions {
             let preview = placeholder_command(&action);

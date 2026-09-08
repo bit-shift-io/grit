@@ -354,7 +354,14 @@ main { flex: 1; min-width: 0; }
   cursor: pointer;
 }
 .branch-action-btn:hover { background: #ececec; }
+.branch-action-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  background: transparent !important;
+  color: inherit !important;
+}
 .branch-delete:hover { background: #b3261e; color: #fff; border-color: #b3261e; }
+.branch-merge:hover { background: #1a73e8; color: #fff; border-color: #1a73e8; }
 #create-branch-btn {
   flex-shrink: 0;
   background: var(--btn-bg, #eee);

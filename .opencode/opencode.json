@@ -15,7 +15,6 @@
   },
   "plugin": [
     "opencode-auto-continue@https://github.com/developing-today/opencode-auto-continue/archive/refs/tags/latest.tar.gz",
-    "./plugins/xml-guard.js",
     "./plugins/network-watchdog.js"
   ],
   "permission": {
@@ -25,8 +24,6 @@
     },
     "read": {
       "*": "allow",
-      "data": "allow",
-      "data/**": "allow",
       "~/.cargo": "allow",
       "~/.cargo/**": "allow",
       "/tmp": "allow",
@@ -36,8 +33,6 @@
     },
     "edit": {
       "*": "allow",
-      "data": "deny",
-      "data/**": "deny",
       "~/.cargo": "allow",
       "~/.cargo/**": "allow",
       "/tmp": "allow",
@@ -47,7 +42,6 @@
     },
     "bash": {
       "*": "allow",
-      "*data*": "deny",
       "git commit*": "deny",
       "git push*": "deny"
     }

@@ -205,6 +205,8 @@ pub enum GitAction {
     RunScript(String),
     /// Server-side history search via `git log --grep`.
     SearchHistory(String),
+    /// Merge a branch into the current branch.
+    Merge(String),
 }
 
 #[cfg(test)]
@@ -307,6 +309,7 @@ mod tests {
             GitAction::CloseTab,
             GitAction::RunScript("scripts/deploy.sh".to_string()),
             GitAction::SearchHistory("embed".to_string()),
+            GitAction::Merge("feature".to_string()),
         ];
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();

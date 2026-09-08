@@ -491,33 +491,50 @@ function renderBranches(tab) {
       ? branch.split("/").slice(1).join("/")
       : branch;
 
+    const actions = document.createElement("div");
+    actions.className = "branch-actions";
+
+    const checkout = document.createElement("button");
+    checkout.className = "branch-action-btn";
+    checkout.dataset.branch = checkoutName;
+    checkout.dataset.action = "checkout";
+    checkout.textContent = "\u2192";
+    checkout.title = `Switch to ${branch}`;
+    actions.appendChild(checkout);
+
+    const del = document.createElement("button");
+    del.className = "branch-action-btn branch-delete";
+    del.dataset.branch = branch;
+    del.dataset.action = "delete";
+    del.textContent = "\u00d7";
+    del.title = `Delete branch ${branch}`;
+    actions.appendChild(del);
+
+    const merge = document.createElement("button");
+    merge.className = "branch-action-btn branch-merge";
+    merge.dataset.branch = branch;
+    merge.dataset.action = "merge";
+    merge.textContent = "\u2294";
+    merge.title = `Merge ${branch} into ${current} and push`;
+    actions.appendChild(merge);
+
+    // The current branch can't be merged into itself, deleted while checked
+    // out, or checked out again — grey those buttons out.
+    if (branch === current || checkoutName === current) {
+      checkout.disabled = true;
+      del.disabled = true;
+      merge.disabled = true;
+      merge.title = `${branch} is the current branch — nothing to merge into`;
+    }
+
     if (branch === current || checkoutName === current) {
       const label = document.createElement("span");
       label.className = "branch-current-label";
       label.textContent = "current";
       row.appendChild(label);
-    } else {
-      const actions = document.createElement("div");
-      actions.className = "branch-actions";
-
-      const checkout = document.createElement("button");
-      checkout.className = "branch-action-btn";
-      checkout.dataset.branch = checkoutName;
-      checkout.dataset.action = "checkout";
-      checkout.textContent = "\u2192";
-      checkout.title = `Switch to ${branch}`;
-      actions.appendChild(checkout);
-
-      const del = document.createElement("button");
-      del.className = "branch-action-btn branch-delete";
-      del.dataset.branch = branch;
-      del.dataset.action = "delete";
-      del.textContent = "\u00d7";
-      del.title = `Delete branch ${branch}`;
-      actions.appendChild(del);
-
-      row.appendChild(actions);
     }
+
+    row.appendChild(actions);
 
     branchListEl.appendChild(row);
   }
@@ -1432,6 +1449,10 @@ document.getElementById("branch-list").addEventListener("click", (event) => {
       }
     } else if (actionBtn.dataset.action === "checkout") {
       sendAction({ CheckoutBranch: branch });
+    } else if (actionBtn.dataset.action === "merge") {
+      if (confirm(`Merge branch "${branch}" into "${tab.state.current_branch}" and push?`)) {
+        sendAction({ Merge: branch });
+      }
     }
   }
 });
