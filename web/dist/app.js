@@ -947,7 +947,7 @@ function buildCommitActions(actionsEl, tab, hash) {
       label: "Delete Branch",
       run: () => {
         const name = prompt("Branch name to delete:");
-        if (name) sendAction({ DeleteBranch: name });
+        if (name) sendAction({ DeleteBranch: { name, local: true, remote: false } });
       },
     },
   ];
@@ -1444,8 +1444,20 @@ document.getElementById("branch-list").addEventListener("click", (event) => {
   if (actionBtn) {
     const branch = actionBtn.dataset.branch;
     if (actionBtn.dataset.action === "delete") {
-      if (confirm(`Delete branch "${branch}"?`)) {
-        sendAction({ DeleteBranch: branch });
+      const row = actionBtn.closest(".branch-row");
+      const isRemote = row && row.classList.contains("remote");
+      if (isRemote) {
+        const name = branch.split("/").slice(1).join("/");
+        if (confirm(`Delete remote branch "${branch}"? This removes it from origin.`)) {
+          sendAction({ DeleteBranch: { name, local: false, remote: true } });
+        }
+      } else {
+        const name = branch;
+        if (confirm(`Delete branch "${branch}" on remote also?`)) {
+          sendAction({ DeleteBranch: { name, local: true, remote: true } });
+        } else {
+          sendAction({ DeleteBranch: { name, local: true, remote: false } });
+        }
       }
     } else if (actionBtn.dataset.action === "checkout") {
       sendAction({ CheckoutBranch: branch });

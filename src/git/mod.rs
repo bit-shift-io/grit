@@ -11,8 +11,8 @@ pub(crate) use files::*;
 pub(crate) use actions::*;
 
 pub use types::{
-    CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus, LogEntry,
-    LogStatus, RepoState, StashEntry,
+    BranchDelete, CommitInfo, CommitSummary, FileChange, FilePair, FileStat, GitAction, GitStatus,
+    LogEntry, LogStatus, RepoState, StashEntry,
 };
 
 use std::cell::{Cell, RefCell};

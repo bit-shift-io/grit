@@ -170,6 +170,18 @@ pub struct LogEntry {
     pub duration_ms: u64,
 }
 
+/// Scope of a branch deletion: which refs (local working ref, origin remote
+/// ref, or both) should be removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchDelete {
+    /// Branch name without the `origin/` remote prefix.
+    pub name: String,
+    /// Delete the local branch ref (`git branch -d`).
+    pub local: bool,
+    /// Delete the branch on origin (`git push origin --delete`).
+    pub remote: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitAction {
     Stage(String),
@@ -189,7 +201,7 @@ pub enum GitAction {
     CreateBranch(String, String),
     CreateTag(String, String),
     DeleteTag(String),
-    DeleteBranch(String),
+    DeleteBranch(BranchDelete),
     /// Stash the current working-tree changes under the given message.
     StashPush(String),
     /// Apply and keep the stash identified by `stash@{n}`.
@@ -303,7 +315,11 @@ mod tests {
             GitAction::CreateBranch("feature".to_string(), "deadbeef".to_string()),
             GitAction::CreateTag("v1.0".to_string(), "deadbeef".to_string()),
             GitAction::DeleteTag("v1.0".to_string()),
-            GitAction::DeleteBranch("feature".to_string()),
+            GitAction::DeleteBranch(BranchDelete {
+                name: "feature".to_string(),
+                local: true,
+                remote: true,
+            }),
             GitAction::Reclone,
             GitAction::NewTab(r#"{"name":"new","path":""}"#.to_string()),
             GitAction::CloseTab,

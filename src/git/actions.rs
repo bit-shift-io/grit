@@ -33,10 +33,25 @@ fn action_argv(action: &GitAction) -> Option<Vec<Vec<String>>> {
         GitAction::Fetch => vec![seq(&["fetch", "--prune"])],
         GitAction::CheckoutBranch(b) => vec![seq(&["checkout", b])],
         GitAction::Revert(h) => vec![seq(&["revert", "--no-edit", h])],
-        GitAction::CreateBranch(n, f) => vec![seq(&["checkout", "-b", n, f])],
+        GitAction::CreateBranch(n, f) => {
+            vec![seq(&["checkout", "-b", n, f]), seq(&["push", "-u", "origin", n])]
+        }
         GitAction::CreateTag(n, t) => vec![seq(&["tag", n, t])],
         GitAction::DeleteTag(n) => vec![seq(&["tag", "-d", n])],
-        GitAction::DeleteBranch(n) => vec![seq(&["branch", "-d", n])],
+        GitAction::DeleteBranch(d) => {
+            let name: &str = &d.name;
+            let mut seqs = Vec::new();
+            if d.local {
+                seqs.push(seq(&["branch", "-d", name]));
+            }
+            if d.remote {
+                seqs.push(seq(&["push", "origin", "--delete", name]));
+            }
+            if seqs.is_empty() {
+                seqs.push(seq(&["branch", "-d", name]));
+            }
+            seqs
+        }
         GitAction::Merge(b) => vec![seq(&["merge", b]), seq(&["push"])],
         GitAction::StashPush(m) => vec![seq(&["stash", "push", "-m", m])],
         GitAction::StashApply(id) => vec![seq(&["stash", "apply", id])],
@@ -527,7 +542,7 @@ mod tests {
             (CreateBranch("n".into(), "f".into()), true),
             (CreateTag("n".into(), "t".into()), true),
             (DeleteTag("n".into()), true),
-            (DeleteBranch("n".into()), true),
+            (DeleteBranch(BranchDelete { name: "n".into(), local: true, remote: true }), true),
             (StashPush("m".into()), true),
             (StashApply("stash@{0}".into()), true),
             (StashPop("stash@{0}".into()), true),
@@ -603,7 +618,7 @@ mod tests {
             CreateBranch("n".into(), "main".into()),
             CreateTag("t".into(), "head".into()),
             DeleteTag("t".into()),
-            DeleteBranch("b".into()),
+            DeleteBranch(BranchDelete { name: "b".into(), local: true, remote: false }),
             Merge("feature".into()),
         ];
         for action in actions {
@@ -638,10 +653,36 @@ mod tests {
 
     #[test]
     fn create_branch_from_commit_and_switches() {
+        let origin = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
+        OsCommand::new("git")
+            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
         commit_all(dir.path(), "initial");
+        OsCommand::new("git")
+            .args(["push", "-q", "-u", "origin", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         let hash = get_repository_status(dir.path())
             .unwrap()
             .history[0]
@@ -660,6 +701,23 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "feature");
+
+        let remote = Command::new("git")
+            .args(["branch", "-r"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let remote = String::from_utf8(remote.stdout).unwrap();
+        assert!(remote.contains("origin/feature"), "got: {remote}");
+        let upstream = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "feature@{u}"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(upstream.stdout).unwrap().trim(),
+            "origin/feature"
+        );
     }
 
     #[test]
@@ -693,29 +751,144 @@ mod tests {
 
     #[test]
     fn delete_branch_removes_other_branch() {
+        let origin = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
         let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
+        OsCommand::new("git")
+            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
         commit_all(dir.path(), "initial");
+        OsCommand::new("git")
+            .args(["push", "-q", "-u", "origin", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
         let hash = get_repository_status(dir.path())
             .unwrap()
             .history[0]
             .hash
             .clone();
+        let original = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let original = String::from_utf8(original.stdout).unwrap().trim().to_string();
         execute_action(
             dir.path(),
             GitAction::CreateBranch("feature".to_string(), hash),
         )
         .unwrap();
         Command::new("git")
-            .args(["checkout", "main"])
+            .args(["checkout", &original])
             .current_dir(dir.path())
             .output()
             .unwrap();
 
-        execute_action(dir.path(), GitAction::DeleteBranch("feature".to_string())).unwrap();
+        execute_action(
+            dir.path(),
+            GitAction::DeleteBranch(BranchDelete {
+                name: "feature".to_string(),
+                local: true,
+                remote: false,
+            }),
+        )
+        .unwrap();
         let branches = get_repository_status(dir.path()).unwrap().branches;
         assert!(!branches.contains(&"feature".to_string()), "got: {branches:?}");
+    }
+
+    #[test]
+    fn delete_branch_removes_remote_branch_too() {
+        let origin = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        OsCommand::new("git")
+            .args(["clone", "-q", origin.path().to_str().unwrap(), "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("file.txt"), "hello\n").unwrap();
+        commit_all(dir.path(), "initial");
+        OsCommand::new("git")
+            .args(["push", "-q", "-u", "origin", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["checkout", "-q", "-b", "feature"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["push", "-q", "-u", "origin", "feature"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        OsCommand::new("git")
+            .args(["checkout", "-q", "-"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+
+        execute_action(
+            dir.path(),
+            GitAction::DeleteBranch(BranchDelete {
+                name: "feature".to_string(),
+                local: true,
+                remote: true,
+            }),
+        )
+        .unwrap();
+
+        let branches = get_repository_status(dir.path()).unwrap().branches;
+        assert!(
+            !branches.contains(&"feature".to_string()),
+            "got: {branches:?}"
+        );
+        let ls_remote = Command::new("git")
+            .args(["ls-remote", "--heads", "origin", "feature"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let ls_remote = String::from_utf8(ls_remote.stdout).unwrap();
+        assert!(
+            ls_remote.trim().is_empty(),
+            "remote branch still present: {ls_remote}"
+        );
     }
 
     #[test]
