@@ -200,6 +200,7 @@ fn reclone_repo(repo_path: &Path) -> Result<(), GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::types::BranchDelete;
     use crate::test_support::{commit_all, init_repo};
     use std::fs;
     use std::process::Command as OsCommand;
