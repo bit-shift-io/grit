@@ -1,12 +1,3 @@
 # TODO
 
-git push
-0.0s
-
-fatal: The current branch dev/optimise has no upstream branch.
-To push the current branch and set the remote as upstream, use
-
-    git push --set-upstream origin dev/optimise
-
-To have this happen automatically for branches without a tracking
-upstream, see 'push.autoSetupRemote' in 'git help config'.
+* change dashboard to be part of the tab bar. Each tab now needs 'Project-Name | F | T |' where clicking Project name text is the dashboard, F is the files/folio tab, T is the terminal tab. Remove the second terminal instance. We dont need the number counter, as the tab names shanges to italics when there is changes already. This should simplfy the dock system as its now a simplified tab system.

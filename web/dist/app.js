@@ -13,7 +13,6 @@ const KRUST_BASE = "http://localhost:3000";
 const KRUST_PROBE_MS = 5000;
 const KRUST_SESSIONS = {
   "term-1": { iframe: "krust-1", n: 1 },
-  "term-2": { iframe: "krust-2", n: 2 },
 };
 const FOLIO_BASE = "http://localhost:4000";
 
@@ -98,7 +97,8 @@ let browserSeeding = false;
 let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
-let activeView = getInitialView();
+let activeView = "dashboard"; // Default view
+let forceView = null; // Prevent view reset when user clicks F/T on a tab
 let lastViewRepo = null;
 let skipViewPersist = false;
 let historyQuery = "";
@@ -290,9 +290,7 @@ function render(state) {
   const branchesSection = document.getElementById("branches-section");
   const stashesSection = document.getElementById("stashes-section");
   const filesSection = document.getElementById("files-section");
-  const dock = document.getElementById("dock");
   const termView1 = document.getElementById("view-term-1");
-  const termView2 = document.getElementById("view-term-2");
 
   if (showAddForm || state.tabs.length === 0) {
     updateUrlTab(null);
@@ -305,10 +303,7 @@ function render(state) {
     stashesSection.style.display = "none";
     filesSection.style.display = "none";
     termView1.style.display = "none";
-    termView2.style.display = "none";
-    dock.style.display = "none";
-    document.body.classList.remove("view-dashboard", "view-files", "view-term-1", "view-term-2");
-    updateDockBadges(null);
+    document.body.classList.remove("view-dashboard", "view-files", "view-term-1");
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
@@ -316,10 +311,10 @@ function render(state) {
   const tab = activeTab(state);
 
   const scope = repoScope(tab.repo_path || "");
-  if (lastViewRepo !== null && scope !== lastViewRepo) {
+  if (forceView === null && lastViewRepo !== null && scope !== lastViewRepo) {
     let stored = null;
     try { stored = localStorage.getItem("grit:view:" + scope); } catch (e) {}
-    if (stored && ["dashboard", "files", "term-1", "term-2"].indexOf(stored) !== -1) {
+    if (stored && ["dashboard", "files", "term-1"].indexOf(stored) !== -1) {
       activeView = stored;
     } else {
       activeView = "dashboard";
@@ -328,15 +323,8 @@ function render(state) {
   lastViewRepo = scope;
 
   addRepoForm.style.display = "none";
-  dock.style.display = "flex";
   document.title = `Grit | ${tab.name}`;
   showView(activeView);
-  const kb1 = document.querySelector('.dock-btn[data-view="term-1"]');
-  const kb2 = document.querySelector('.dock-btn[data-view="term-2"]');
-  const repoLabel = tab.name || tab.repo_path || "";
-  if (kb1) kb1.title = "Terminal 1 \u2014 " + repoLabel + " (1)";
-  if (kb2) kb2.title = "Terminal 2 \u2014 " + repoLabel + " (2)";
-  updateDockBadges(tab);
   const overviewEl = document.getElementById("overview");
   const count = tab.state.changes.length;
   if (count === 0) {
@@ -727,8 +715,6 @@ async function probeFolio() {
     ok = false;
   }
   folioAvailable = ok;
-  const fbtn = document.querySelector('.dock-btn[data-view="files"]');
-  if (fbtn) fbtn.style.display = ok ? "" : "none";
   if (!ok && activeView === "files") {
     skipViewPersist = true;
     setView("dashboard");
@@ -1041,17 +1027,46 @@ function renderTabBar(state) {
   const tabsEl = document.getElementById("tabs");
   tabsEl.textContent = "";
   for (const tab of sortedTabs(state)) {
-    const btn = document.createElement("button");
-    btn.className = "tab";
-    if (tab.id === activeTabId) {
-      btn.classList.add("active");
+    const group = document.createElement("div");
+    group.className = "tab-group";
+
+    const nameBtn = document.createElement("button");
+    nameBtn.className = "tab-name";
+    if (tab.id === activeTabId && activeView === "dashboard") {
+      nameBtn.classList.add("active");
     }
-    btn.textContent = tab.name;
     if (tab.state.changes.length > 0) {
-      btn.classList.add("dirty");
+      nameBtn.classList.add("dirty");
     }
-    btn.dataset.tabId = tab.id;
-    tabsEl.appendChild(btn);
+    nameBtn.textContent = tab.name;
+    nameBtn.title = tab.name;
+    nameBtn.dataset.tabId = tab.id;
+    nameBtn.dataset.view = "dashboard";
+    group.appendChild(nameBtn);
+
+    const filesBtn = document.createElement("button");
+    filesBtn.className = "tab-view-btn";
+    if (tab.id === activeTabId && activeView === "files") {
+      filesBtn.classList.add("active");
+    }
+    filesBtn.textContent = "F";
+    filesBtn.title = "Files";
+    filesBtn.dataset.tabId = tab.id;
+    filesBtn.dataset.view = "files";
+    group.appendChild(filesBtn);
+
+    const termBtn = document.createElement("button");
+    termBtn.className = "tab-view-btn";
+    if (tab.id === activeTabId && activeView === "term-1") {
+      termBtn.classList.add("active");
+    }
+    termBtn.textContent = "T";
+    termBtn.title = "Terminal";
+    termBtn.dataset.tabId = tab.id;
+    termBtn.dataset.view = "term-1";
+    group.appendChild(termBtn);
+
+    tabsEl.appendChild(group);
   }
   const newTabBtn = document.createElement("button");
   newTabBtn.className = "tab new-tab";
@@ -1358,19 +1373,33 @@ document.getElementById("discard-all-btn").onclick = () => {
 };
 
 document.getElementById("tabs").addEventListener("click", (event) => {
-  const btn = event.target.closest(".tab");
+  const btn = event.target.closest("[data-tab-id], .new-tab");
   if (!btn || !lastState) return;
+
+  // Handle "+" new tab button
   if (btn.classList.contains("new-tab")) {
-    // The "+" toggles the local Add Repository view; no server round-trip.
     showAddForm = true;
     updateUrlTab(null);
-    if (lastState) render(lastState);
+    render(lastState);
     return;
   }
-  activeTabId = Number(btn.dataset.tabId);
-  showAddForm = false;
-  updateUrlTab(activeTabId);
-  render(lastState);
+
+  const tabId = Number(btn.dataset.tabId);
+  const view = btn.dataset.view;
+
+  if (!isNaN(tabId)) {
+    activeTabId = tabId;
+    updateUrlTab(activeTabId);
+    forceView = null;
+    if (btn.classList.contains("tab-name")) {
+      setView("dashboard");
+    } else if (btn.classList.contains("tab-view-btn")) {
+      forceView = view;
+      setView(view);
+    }
+    render(lastState);
+    forceView = null;
+  }
 });
 
 document.getElementById("changes").addEventListener("click", (event) => {
@@ -1526,11 +1555,6 @@ document.getElementById("create-stash-btn").onclick = () => {
 
 //#region View dock (Dashboard / Files / Log / Terminals)
 
-function getInitialView() {
-  const v = new URL(window.location.href).searchParams.get("view");
-  return v === "files" || v === "term-1" || v === "term-2" ? v : "dashboard";
-}
-
 function showView(view) {
   activeView = view;
   updateUrlView(view);
@@ -1543,13 +1567,9 @@ function showView(view) {
   document.getElementById("log-section").style.display = dashboard ? "block" : "none";
   document.getElementById("files-section").style.display = view === "files" ? "block" : "none";
   document.getElementById("view-term-1").style.display = view === "term-1" ? "block" : "none";
-  document.getElementById("view-term-2").style.display = view === "term-2" ? "block" : "none";
-  for (const v of ["dashboard", "files", "term-1", "term-2"]) {
+  for (const v of ["dashboard", "files", "term-1"]) {
     document.body.classList.toggle(`view-${v}`, v === view);
   }
-  document.querySelectorAll(".dock-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.view === view);
-  });
   const sess = KRUST_SESSIONS[view];
   if (sess) {
     ensureKrustFrame(sess);
@@ -1578,7 +1598,7 @@ function updateUrlView(view) {
 }
 
 function setView(view) {
-  if (activeView === view) return;
+  if (activeView === view && activeTabId !== null) return;
   if (!skipViewPersist) {
     try { localStorage.setItem("grit:view:" + repoScope(currentRepoPath()), view); } catch (e) {}
   }
@@ -1587,26 +1607,13 @@ function setView(view) {
 }
 
 function updateDockBadges(tab) {
-  const dashBadge = document.getElementById("dock-count-dashboard");
-  const nChanges = tab ? (tab.state ? tab.state.changes.length : 0) : 0;
-  dashBadge.textContent = nChanges > 0 ? String(nChanges) : "";
-  dashBadge.style.display = nChanges > 0 ? "" : "none";
+  // Dashboard badge removed; changes indicator is on tab name (dirty/italic)
 }
-
-document.getElementById("dock").addEventListener("click", (event) => {
-  const btn = event.target.closest(".dock-btn");
-  if (btn) setView(btn.dataset.view);
-});
 
 document.addEventListener("keydown", (event) => {
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const tag = event.target && event.target.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-  const key = event.key.toLowerCase();
-  if (key === "d") setView("dashboard");
-  else if (key === "f") setView("files");
-  else if (key === "1") setView("term-1");
-  else if (key === "2") setView("term-2");
 });
 
 //#region krust terminal integration
@@ -1666,7 +1673,7 @@ async function probeKrust() {
   document.querySelectorAll(".krust-btn").forEach((btn) => {
     btn.style.display = ok ? "" : "none";
   });
-  if (!ok && (activeView === "term-1" || activeView === "term-2")) {
+  if (!ok && activeView === "term-1") {
     skipViewPersist = true;
     setView("dashboard");
     skipViewPersist = false;
@@ -1675,6 +1682,12 @@ async function probeKrust() {
 
 probeKrust();
 setInterval(probeKrust, KRUST_PROBE_MS);
+
+// Ensure dashboard view is shown on initial load
+showView("dashboard");
+
+// Show empty tab bar immediately while waiting for initial state
+renderTabBar({ tabs: [] });
 
 //#endregion
 

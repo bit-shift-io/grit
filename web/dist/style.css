@@ -4,68 +4,9 @@ body { margin: 0; padding: 1rem; }
   display: flex;
   align-items: flex-start;
   gap: 0.75rem;
+  min-height: calc(100vh - 2rem);
 }
-main { flex: 1; min-width: 0; }
-#dock {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  padding: 0.5rem;
-  background: var(--dock-bg, rgba(224, 224, 224, 0.6));
-  border: 1px solid var(--btn-border, #ccc);
-  border-radius: 0.75rem;
-  position: sticky;
-  top: 1rem;
-  flex-shrink: 0;
-}
-#dock .dock-btn {
-  position: relative;
-  width: 2.4rem;
-  height: 2.4rem;
-  border: none;
-  border-radius: 0.5rem;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-weight: 700;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-#dock .dock-btn:hover { background: var(--section-hover, #d0d0d0); }
-#dock .dock-btn.active { background: var(--btn-hover, #ddd); }
-#dock .dock-btn.active::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  height: 60%;
-  width: 3px;
-  border-radius: 2px;
-  background: rgba(46, 125, 50, 0.85);
-}
-.dock-badge {
-  position: absolute;
-  top: 0;
-  right: 0;
-  transform: translate(30%, -30%);
-  min-width: 1.1rem;
-  height: 1.1rem;
-  line-height: 1.1rem;
-  padding: 0 0.25rem;
-  border-radius: 0.6rem;
-  background: #b3261e;
-  color: #fff;
-  font-size: 0.65rem;
-  font-weight: 700;
-  text-align: center;
-  box-sizing: border-box;
-}
-#dock .dock-btn .dock-badge-krust {
-  background: rgba(46, 125, 50, 0.85);
-}
+main { flex: 1; min-width: 0; min-height: 0; }
 .term-view { padding: 0; }
 .krust-frame,
 .folio-frame {
@@ -123,11 +64,42 @@ main { flex: 1; min-width: 0; }
   padding: 0;
   cursor: pointer;
   font: inherit;
-  opacity: 0.7;
 }
 #tabs .tab:hover { opacity: 1; text-decoration: underline; }
-#tabs .tab.active { opacity: 1; font-weight: 700; }
-#tabs .tab.dirty { font-style: italic; }
+#tabs .tab-group {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+#tabs .tab-group:hover { opacity: 1; }
+#tabs .tab-name {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+}
+#tabs .tab-view-btn {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0 0.2rem;
+  cursor: pointer;
+  font: inherit;
+  opacity: 0.7;
+}
+#tabs .tab-name:hover,
+#tabs .tab-view-btn:hover { text-decoration: underline; }
+#tabs .tab-name.active,
+#tabs .tab-view-btn.active { font-weight: 700; }
+#tabs .tab-name.dirty { font-style: italic; }
 #tabs .tab.new-tab {
   font-weight: 700;
   font-size: 1.2rem;
@@ -528,7 +500,6 @@ main { flex: 1; min-width: 0; }
     --log-rule: rgba(128, 128, 128, 0.2);
     --log-prompt: #7ec8a2;
     --log-failed: #ff8a80;
-    --dock-bg: rgba(42, 42, 42, 0.7);
   }
 }
 .commit-row { padding: 0; }
@@ -687,17 +658,5 @@ button.danger:hover { background: #d93a30; }
 
 @media (max-width: 680px) {
   .app-layout { gap: 0.35rem; }
-  #dock {
-    position: fixed;
-    left: 0;
-    top: 1rem;
-    z-index: 50;
-    transform: translateX(-52%);
-    transition: transform 0.18s ease;
-  }
-  #dock:hover,
-  #dock:focus-within {
-    transform: translateX(0);
-  }
 }
 
