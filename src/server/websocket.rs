@@ -424,6 +424,7 @@ mod tests {
                     log: Vec::new(),
                 },
             ],
+            revision: 0,
         });
         let app = AppState::new(registry);
         crate::server::refresh_all(&app).await;

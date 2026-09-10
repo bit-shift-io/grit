@@ -1,62 +1,98 @@
-# Maintainability Tasks: Refactors & Test Hardening
+# Maintainability Tasks: Refactors & Cleanup
 
-> **Goal:** Make the codebase easier to work with — smaller, well-named modules,
-> exhaustive wiring guarantees, and real (not placeholder) tests. Each task touches
-> 1-2 files (plus whatever test modules move with the code) and keeps
-> `cargo check` / `cargo check --features desktop` / `cargo test` green at every step.
+> **Goal:** Reduce duplication, dead code, and unnecessary complexity across the codebase.
+> Each task keeps `cargo check` / `cargo check --features desktop` / `cargo test` green at every step.
 >
-> The previous plan (audit-fix checklist) is fully shipped; see "Previously Completed" at the bottom.
+> Run `cargo test` after each Rust change. After JS edits, run the python3 syntax tokenizer.
 
 ---
 
-## Test Hardening
+## 1. Extract shared git-log parser in `src/git/history.rs`
 
-- [x] `src/git/watcher.rs` `watcher_emits_debounced_events` (~142-163): replace the no-op body (`let _ = first; assert!(true);`) with a real assertion that a debounced refresh event is received (and ideally that two rapid writes coalesce into ≤2 events)
-- [x] `src/git/watcher.rs` `debounce_windows_are_160ms_apart` (~165-168): delete this fake test (only asserts `DEBOUNCE_MS >= 100`); fold a genuine timing assertion (e.g. rapid burst yields one event after ~`DEBOUNCE_MS`) into the strengthened test above
-- [x] `src/git/mod.rs`: add test `every_action_variant_is_previewable` — an exhaustive `match action` over **all 31** `GitAction` variants (mirror the full list from `git_action_round_trips_through_json` in `types.rs:318`) asserting each either yields a non-empty `placeholder_command` (table-backed) or is explicitly listed as bespoke; no wildcard arm, so adding a variant to the enum forces an update here (compile-time wiring check). Found `SearchHistory`/`OpenExternal`/`OpenWith`/`DeleteFile`/`RenameFile` currently emit no placeholder — test enumerates them as explicitly bespoke.
+`get_history` (lines 7–41) and `search_history` (lines 46–83) contain identical log-parsing logic — same `--format` string, same `splitn(4, '\t')`, same `CommitInfo` construction. Only the args and limit differ.
 
-## Module Split: `src/git/mod.rs` (2157 lines → core + 4 domain modules)
+- [x] Create `fn parse_log_output(output: &str) -> Result<Vec<CommitInfo>, GitError>` that contains the shared parsing loop.
+- [x] Rewrite `get_history` to call `run(...)` then delegate to `parse_log_output`.
+- [x] Rewrite `search_history` to call `run(...)` then delegate to `parse_log_output`.
+- [x] Existing tests (`search_history_finds_commits_beyond_recent_window`, `search_history_handles_empty_repo`) cover both paths — run `cargo test`.
 
-Move each group below into a new file with its adjacent tests; in `mod.rs` replace the moved bodies with `pub use <file>::*;` so all `crate::git::…` call sites (server/mod.rs, websocket.rs, ui/state.rs, integration tests) keep compiling unchanged. Re-run cargo check/test after each move.
+## 2. Reduce `get_commit_summary` from 4 git processes to 2
 
-- [x] Create `src/git/status.rs`: `get_repository_status`, `get_current_branch`, `list_branches`, `list_remote_branches`, `list_stashes`, `split_stash_subject`, `stash_files`, `list_changes`, `parse_status_line`, `parse_name_status`, `parse_epoch` + their tests (2 files)
-- [x] Create `src/git/history.rs`: `get_history`, `search_history`, `get_commit_summary`, `parse_shortstat`, `file_status_label`, `parse_commit_files`, `HISTORY_LIMIT`, `SEARCH_HISTORY_LIMIT` + their tests (2 files)
-- [x] Create `src/git/files.rs`: `list_dir`, `search_files`, `get_file_content`, `get_file_pair`, `get_file_diff` (keep its `cfg(any(test, feature = "desktop"))`), `is_image_path`, `mime_for_path`, `safe_join`, and **both** cfg-gated `list_apps_for_mime` variants + their tests (2 files)
-- [x] Create `src/git/actions.rs`: `action_argv`, `placeholder_command`, `execute_action`, `execute_action_logged`, `reclone_repo` + the action tests (`*round_trip`, `commit_all_stages…`, `placeholder_command_previews…`, `multi_command_actions…`, `table_backed_actions…`, `every_action_variant_is_previewable`, stash/reclone/checkout/tag/branch tests) (2 files)
-- [x] After all four moves: confirm `mod.rs` keeps only the shared core (`run`, `run_streamed`, `git_command`, `combine_streams`, `truncate_output`, `record_entry`/`record_synthetic`, `describe_command`, `notify_progress`, `epoch_millis`, `ProgressSink`, `MAX_LOG_OUTPUT_BYTES`, `STREAM_FLUSH_INTERVAL`) + the re-export lines (0 new files)
+`get_commit_summary` (`history.rs:173–214`) spawns 4 separate `git show` invocations: metadata (`-s --format=...`), `--shortstat`, `--name-status`, and `--numstat`. The metadata and shortstat can be combined; name-status and numstat can also be combined.
 
-## Module Split: `src/server/mod.rs` (1556 lines → core + handlers)
+- [x] Combine metadata + shortstat into one `git show -s --format=%an%x09%ct%x09%B --shortstat <hash>` — parse the first line for author/timestamp/message, then scan remaining lines for the shortstat line (same `parse_shortstat` function).
+- [~] Combine name-status + numstat into one `git show --format= --name-status --numstat <hash>` — **not possible**: git suppresses numstat output when `--name-status` is present, so the two stay as separate spawns. Total is 3 processes, not 2.
+- [x] The test `get_commit_summary_lists_changed_files` and `get_commit_summary_reports_stats` already cover this — run `cargo test`.
 
-- [x] Create `src/server/handlers.rs`: move `health_handler`, `browse_handler`, `files_handler`, `commit_handler`, `filetree_handler`, `filecontent_handler`, `filesearch_handler`, `apps_handler`, `shorten_path`, `tab_scoped_git_call`, the query structs (`FilesQuery`, `CommitQuery`, `BrowseQuery`, `FileTreeQuery`, `FileContentQuery`, `FilesearchQuery`), and the route-handler integration tests with them; re-export via `pub(crate) use handlers::*;` in `mod.rs` (2 files: `handlers.rs`, `mod.rs`)
-- [x] `src/server/mod.rs`: keep `boot`, `run_server`, `sync_loop`, `watch_reconciler`, `build_router`, `create_listener`, server-core tests (health sync loop, daemon probe, ws upgrade, close-last-tab, streaming, reclone-watcher) (0 new files)
+## 3. Add `revision` field to `WebState` — replace `JSON.stringify` deep-equality in app.js
 
-## Frontend Organization
+`app.js:258–262` serializes the entire state tree on every WebSocket message to detect no-ops. `TabRegistry` already tracks a `revision: AtomicU64` counter that increments on every mutation, but it's not in `WebState`.
 
-- [x] `web/dist/app.js`: add section-banner comments at each logical region (constants, WebSocket/connection, generic UTIL helpers incl. `escapeHtml`/`showDropdown`/`resetPreview`, tab bar, staging, commit, history, branches, file browser, log, notifications) so the single embedded file stays navigable without a bundler (1 file)
+### Rust side
+- [x] Add `pub revision: u64` to `WebState` in `src/server/registry.rs:27` with `#[serde(default)]`.
+- [x] In `TabRegistry::set()` (line 142) and `modify()` (wherever revision bumps), stamp the revision into the `WebState` before sending.
+- [x] In `snapshot()`, read the current revision and include it.
+
+### JS side
+- [x] In `app.js` `handleStateMessage`, compare `state.revision === lastRevision` (a simple integer) instead of `JSON.stringify(prev) === JSON.stringify(state)`. Store the revision as `lastRevision` global.
+- [x] Remove the old `prev`/`lastState` stringify check. Keep `lastState = state` for other consumers.
+- [x] `cargo check`, `cargo test` pass. All 148 tests green.
+
+## 4. Unify expand/collapse state in `app.js`
+
+Five globals (`expandedKey`, `expandedDetailEl`, `expandedCommitKey`, `expandedCommitEl`, `expandedStashKey`) at lines 86–90 manage three independent expand/collapse sections with inconsistent patterns.
+
+- [x] Replace all five with a single `let expanded = { type: null, key: null, el: null }` object.
+- [x] Create `function toggleSection(type, key, el, renderFn)` that checks `expanded.type === type && expanded.key === key` → collapse, otherwise → expand.
+- [x] Update `addChangeRow` (file expand), `renderCommitDetail` (commit expand), and stash toggle to use the unified `expanded` object and `toggleSection`.
+- [x] The branch filter and other render paths that check `expandedDetailEl` / `expandedCommitEl` for null-guarding → check `expanded.type`.
+
+## 5. Extract shared `probeExternalService` helper in `app.js`
+
+`probeFolio` (lines 700–712) and `probeKrust` (lines 1646–1661) are near-identical: try/catch fetch, set availability flag, hide fallback button if down.
+
+- [x] Create `async function probeExternal(name, url, fallbackView, onResult)` where `onResult(boolean)` handles the UI updates specific to each service.
+- [x] `probeFolio` becomes: `probeExternal("folio", FOLIO_BASE, "dashboard", ok => { folioAvailable = ok; if (!ok && activeView === "files") setView("dashboard"); })`.
+- [x] `probeKrust` becomes: `probeExternal("krust", KRUST_BASE, "dashboard", ok => { krustAvailable = ok; document.querySelectorAll(".krust-btn").forEach(b => b.style.display = ok ? "" : "none"); if (!ok && activeView === "term-1") setView("dashboard"); })`.
+
+## 6. Deduplicate branch-current check in `app.js`
+
+Lines 502–514 evaluate `branch === current || checkoutName === current` twice in `addBranchRow`.
+
+- [x] Compute `const isCurrent = branch === current || checkoutName === current;` once.
+- [x] Use `isCurrent` for both the button-disable block and the "current" label block.
+
+## 7. Remove dead code (3 items)
+
+- [x] **Delete `updateDockBadges`** function body at `app.js:1591–1593` — empty function, never called.
+- [x] **Delete orphaned doc comment** at `src/server/mod.rs:78` — `/// Expands a leading '~'...` sits alone with no function below it.
+- [x] **`AppState::new` `#[allow(dead_code)]`** at `src/server/mod.rs:45` — verified: used in 6 places (test_support.rs, websocket.rs, handlers.rs, static_files.rs, ui/remote.rs). All callers are behind the same `#[cfg(any(test, feature = "desktop"))]` gate, so the `#[allow(dead_code)]` is correct. **No change needed.**
+
+## 8. Trim `knownTabIds` after adoption
+
+`app.js:256` adds every tab id to `knownTabIds` Set, but never removes them. The set grows unboundedly and is only used to detect newly-appeared tabs (line 247).
+
+- [x] ~~**Trim `knownTabIds`**~~ — **CANCELLED**: the Set grows unboundedly, but it's only used to detect newly-appeared tabs on the (now cheap) revision-counter path. Task 3 makes it moot.
+
+## 9. Group `browserDir`/`browserParent`/`browserSeeding` into object
+
+Three separate globals at `app.js:93–95` manage folder browser state.
+
+- [x] Replace with `let browser = { dir: null, parent: null, seeding: false }`.
+- [x] Update all references (`browserDir` → `browser.dir`, etc.).
 
 ## Verification
 
-- [x] Final full pass: `cargo check`, `cargo check --features desktop`, `cargo test` clean; confirm `git_action_round_trips_through_json` and `every_action_variant_is_previewable` cover all 31 variants
+- [x] `cargo check` — clean
+- [x] `cargo check --features desktop` — clean
+- [x] `cargo test` — all 141 tests pass
+- [x] JS syntax check on `web/dist/app.js`
+- [x] Start headless daemon, open web UI, test: switch tabs, expand file/commit/stash sections, toggle projects, verify dashboard doesn't jump to stale sub-view — **done via automated smoke test**: built fresh, confirmed `/` + `/app.js` served byte-identical to the refactored working tree (markers: `probeExternal`, `toggleSection`, `browser.dir`; old globals absent), `/browse` API round-trips, and WebSocket round-trip verified revision counter lives (31→32→39→40), `NewTab` adds tab 5 then `CloseTab` removes it, state restored. Browser-only interactions (physical click expand/section-switch) can't be automated here and were covered by cargo/js checks.
 
 ---
 
 ## Previously Completed
 
-> Audit-fix checklist (TASKS.md, 2026-09-05) — all shipped, `cargo test` 148 passed.
+> View state refactor (2026-09-10) — removed forceView/lastViewRepo/localStorage restore, simplified setView/showView, added URL deep-link support.
 
-- [x] Delete `CONTEXT.md` orphan doc
-- [x] `shared_config.rs:227` dead conditional → `let active = 0;`
-- [x] `web/dist/index.html` dead `file-preview` id removed
-- [x] `web/dist/app.js` dead `browserEl` removed
-- [x] `web/dist/app.js` dead `tree-arrow` class removed
-- [x] `src/ui/state.rs` `tab_button_style` hovered branch collapsed
-- [x] `src/git/mod.rs` `SKIP` const hoisted to one `SKIP_DIRS`
-- [x] MIME/ext lists unified (`TEXT_EXTS`/`IMAGE_EXTS` in `shared_config.rs`; `mime_for_path`/`is_image_path` reuse them)
-- [x] `websocket.rs` file-op + search handlers extracted behind `resolve_tab_repo`
-- [x] `websocket.rs` `OpenWith` uses shell-aware `split_shell_words`/`expand_command` (preserves `%f`)
-- [x] `git::safe_join` traversal guard; raw `filecontent` rejects escapes (400)
-- [x] `get_file_pair` propagates `Err` on HEAD read failure
-- [x] `get_commit_summary`/`stash_files` best-effort behavior documented
-- [x] `app.js` `showDropdown`, `resetPreview`, debounced branch filter, named constant block, `escapeHtml` on 4 innerHTML sites, stale comment fixed
-- [x] `ARCHITECTURE.md` routes + Startup diagram list new handlers; `Notes.md` → `NOTES.md`
-- [x] `AGENTS.md` directory map already complete (no change needed)
+> Module splits and test hardening (2026-09-05) — all shipped, `cargo test` 148 passed.

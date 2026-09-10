@@ -378,6 +378,7 @@ mod tests {
                     log: Vec::new(),
                 },
             ],
+            revision: 0,
         });
         let app = AppState::new(registry);
         let router = build_router(app);

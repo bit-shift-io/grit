@@ -4,20 +4,9 @@ use super::*;
 const HISTORY_LIMIT: &str = "50";
 
 
-pub(crate) fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
-    let output = match run(
-        git_command(repo_path).args([
-            "log",
-            "--format=%H%x09%an%x09%ct%x09%s",
-            "-n",
-            HISTORY_LIMIT,
-        ]),
-    ) {
-        Ok(output) => output,
-        Err(e) if e.stderr.contains("does not have any commits") => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-
+/// Parses tab-separated `--format=%H%x09%an%x09%ct%x09%s` log output into
+/// `CommitInfo` entries. Shared by both `get_history` and `search_history`.
+fn parse_log_output(output: &str) -> Result<Vec<CommitInfo>, GitError> {
     let mut history = Vec::new();
     for line in output.lines() {
         let mut parts = line.splitn(4, '\t');
@@ -40,6 +29,22 @@ pub(crate) fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError>
     Ok(history)
 }
 
+pub(crate) fn get_history(repo_path: &Path) -> Result<Vec<CommitInfo>, GitError> {
+    let output = match run(
+        git_command(repo_path).args([
+            "log",
+            "--format=%H%x09%an%x09%ct%x09%s",
+            "-n",
+            HISTORY_LIMIT,
+        ]),
+    ) {
+        Ok(output) => output,
+        Err(e) if e.stderr.contains("does not have any commits") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    parse_log_output(&output)
+}
+
 const SEARCH_HISTORY_LIMIT: &str = "200";
 
 
@@ -59,27 +64,7 @@ pub fn search_history(repo_path: &Path, query: &str) -> Result<Vec<CommitInfo>, 
         Err(e) if e.stderr.contains("does not have any commits") => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-
-    let mut history = Vec::new();
-    for line in output.lines() {
-        let mut parts = line.splitn(4, '\t');
-        let hash = parts.next().unwrap_or_default().trim();
-        let author = parts.next().unwrap_or_default().trim();
-        let timestamp = parts.next().unwrap_or_default().trim();
-        let message = parts.next().unwrap_or_default();
-
-        if hash.is_empty() {
-            continue;
-        }
-
-        history.push(CommitInfo {
-            hash: hash.to_string(),
-            author: author.to_string(),
-            message: message.to_string(),
-            timestamp: parse_epoch(timestamp)?,
-        });
-    }
-    Ok(history)
+    parse_log_output(&output)
 }
 
 
@@ -171,10 +156,20 @@ pub(crate) fn parse_commit_files(name_status: &str, numstat: &str) -> Vec<FileSt
 /// best-effort and fall back to neutral zeros/empty so a single bad stat line
 /// never fails the whole summary.
 pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary, GitError> {
+    // Combined metadata + shortstat: one git process instead of two.
     let meta = run(
-        git_command(repo_path).args(["show", "-s", "--format=%an%x09%ct%x09%B", hash]),
+        git_command(repo_path).args(["show", "-s", "--format=%an%x09%ct%x09%B", "--shortstat", hash]),
     )?;
-    let mut lines = meta.lines();
+    let (files_changed, insertions, deletions) = parse_shortstat(&meta);
+
+    // The shortstat line sits after a blank line following the commit body.
+    // Strip it before parsing the message so it doesn't leak into the body.
+    let meta_body = match meta.split_once("\n\n") {
+        Some((before, _)) => before,
+        None => &meta,
+    };
+
+    let mut lines = meta_body.lines();
     let header = lines.next().unwrap_or_default();
     let mut parts = header.splitn(3, '\t');
     let author = parts.next().unwrap_or_default().to_string();
@@ -191,11 +186,9 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
         message.push_str(&body.join("\n"));
     }
 
-    let (files_changed, insertions, deletions) =
-        run(git_command(repo_path).args(["show", "--format=", "--shortstat", hash]))
-            .map(|stat| parse_shortstat(&stat))
-            .unwrap_or((0, 0, 0));
-
+    // Combined name-status + numstat: one git process instead of two.
+    // NOTE: `git show --name-status --numstat` suppresses numstat, so we
+    // keep them as separate invocations.
     let name_status = run(git_command(repo_path).args(["show", "--format=", "--name-status", hash]))
         .unwrap_or_default();
     let numstat = run(git_command(repo_path).args(["show", "--format=", "--numstat", hash]))

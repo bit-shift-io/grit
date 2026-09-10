@@ -83,29 +83,50 @@ openSocket();
 // ======================================
 let activeTabId = null;
 let lastState = null;
-let expandedKey = null;
-let expandedDetailEl = null;
-let expandedCommitKey = null;
-let expandedCommitEl = null;
-let expandedStashKey = null;
+let lastRevision = 0;
+// The single currently-expanded section (file diff, commit detail, or stash).
+let expanded = { type: null, key: null, el: null };
 let awaitingNewTab = false;
 // Folder-browser picker state for the "+ new tab" form.
-let browserDir = null;
-let browserParent = null;
-let browserSeeding = false;
+let browser = { dir: null, parent: null, seeding: false };
 // Client-local view state: entries with seq <= this are hidden by "Clear Log".
 let clearedUpToSeq = 0;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
 let activeView = "dashboard"; // Default view
-let forceView = null; // Prevent view reset when user clicks F/T on a tab
-let lastViewRepo = null;
-let skipViewPersist = false;
 let historyQuery = "";
 let historySearchTimer = null;
 const knownTabIds = new Set();
 const commitCache = new Map();
 const pairCache = new Map();
+
+// Toggles the single expandable section identified by (type, key). Returns
+// true when the section is now expanded, false when it was collapsed. The
+// caller is responsible for its section-specific DOM after the toggle;
+// renderFn (when given) is invoked after the state change to re-render.
+function toggleSection(type, key, el, renderFn) {
+  const isOpen = expanded.type === type && expanded.key === key;
+  // Collapse whatever was previously expanded (if any other section/element).
+  if (expanded.el && !isOpen) {
+    const prev = expanded.el;
+    prev.style.display = "none";
+    prev.textContent = "";
+    const prevRow = prev.closest(".change-row");
+    if (prevRow) prevRow.classList.remove("open");
+  }
+  if (isOpen) {
+    expanded.type = null;
+    expanded.key = null;
+    expanded.el = null;
+    if (renderFn) renderFn();
+    return false;
+  }
+  expanded.type = type;
+  expanded.key = key;
+  expanded.el = el;
+  if (renderFn) renderFn();
+  return true;
+}
 
 //#region Add-repo form ("+" is a client-local mode, never a server tab)
 
@@ -129,7 +150,7 @@ function setupAddRepoForm(tab) {
     pathInput.value = "";
     delete nameInput.dataset.userSet;
     errorEl.style.display = "none";
-    browserDir = null;
+    browser.dir = null;
     document.getElementById("folder-browser").style.display = "block";
   }
 
@@ -156,8 +177,8 @@ function setupAddRepoForm(tab) {
       const url = path ? `/browse?path=${encodeURIComponent(path)}` : "/browse";
       const response = await fetch(url);
       const data = await response.json();
-      browserDir = data.current;
-      browserParent = data.parent;
+      browser.dir = data.current;
+      browser.parent = data.parent;
       browserCurrent.textContent = data.current;
       upBtn.disabled = !data.parent;
       applyDir(data.current);
@@ -183,14 +204,14 @@ function setupAddRepoForm(tab) {
     }
   }
 
-  upBtn.onclick = () => { if (browserParent) loadBrowser(browserParent); };
+  upBtn.onclick = () => { if (browser.parent) loadBrowser(browser.parent); };
   homeBtn.onclick = () => loadBrowser("");
 
   // The browser is always open: seed it once per form appearance.
-  if (!browserDir && !browserSeeding) {
-    browserSeeding = true;
+  if (!browser.dir && !browser.seeding) {
+    browser.seeding = true;
     loadBrowser(pathInput.value.trim()).finally(() => {
-      browserSeeding = false;
+      browser.seeding = false;
     });
   }
 
@@ -240,6 +261,12 @@ function handleStateMessage(event) {
   } else {
     activeTabId = null;
   }
+  if (lastState === null) {
+    const urlView = new URL(window.location.href).searchParams.get("view");
+    if (urlView && ["dashboard", "files", "term-1"].indexOf(urlView) !== -1) {
+      activeView = urlView;
+    }
+  }
   const newIds = state.tabs.map((t) => t.id).filter((id) => !knownTabIds.has(id));
   if (awaitingNewTab) {
     const target = state.tabs.find((t) => newIds.includes(t.id));
@@ -252,11 +279,11 @@ function handleStateMessage(event) {
   for (const id of state.tabs.map((t) => t.id)) {
     knownTabIds.add(id);
   }
-  const prev = lastState;
   lastState = state;
-  if (prev !== null && JSON.stringify(prev) === JSON.stringify(state)) {
+  if (state.revision === lastRevision) {
     return;
   }
+  lastRevision = state.revision;
   pairCache.clear();
   commitCache.clear();
   updateUrlTab(activeTabId);
@@ -310,18 +337,6 @@ function render(state) {
   }
   const tab = activeTab(state);
 
-  const scope = repoScope(tab.repo_path || "");
-  if (forceView === null && lastViewRepo !== null && scope !== lastViewRepo) {
-    let stored = null;
-    try { stored = localStorage.getItem("grit:view:" + scope); } catch (e) {}
-    if (stored && ["dashboard", "files", "term-1"].indexOf(stored) !== -1) {
-      activeView = stored;
-    } else {
-      activeView = "dashboard";
-    }
-  }
-  lastViewRepo = scope;
-
   addRepoForm.style.display = "none";
   document.title = `Grit | ${tab.name}`;
   showView(activeView);
@@ -344,14 +359,15 @@ function render(state) {
 
   const changesEl = document.getElementById("changes");
   let stillOpen = false;
-  expandedDetailEl = null;
+  if (expanded.type === "file") expanded.el = null;
   changesEl.textContent = "";
   for (const change of tab.state.changes) {
     if (appendChangeRow(changesEl, change, tab)) stillOpen = true;
   }
-  if (!stillOpen) {
-    expandedKey = null;
-    expandedDetailEl = null;
+  if (!stillOpen && expanded.type === "file") {
+    expanded.type = null;
+    expanded.key = null;
+    expanded.el = null;
   }
 
   renderHistory(tab);
@@ -387,7 +403,7 @@ function renderHistory(tab) {
   }
 
   let commitStillOpen = false;
-  expandedCommitEl = null;
+  if (expanded.type === "commit") expanded.el = null;
   for (const commit of commits) {
     const key = `${tab.id}:${commit.hash}`;
     const row = document.createElement("div");
@@ -410,13 +426,13 @@ function renderHistory(tab) {
 
     const actions = document.createElement("div");
     actions.className = "commit-actions";
-    const expanded = expandedCommitKey === key;
-    if (expanded) {
+    const expandedNow = expanded.type === "commit" && expanded.key === key;
+    if (expandedNow) {
       commitStillOpen = true;
-      expandedCommitEl = actions;
+      expanded.el = actions;
     }
-    actions.style.display = expanded ? "block" : "none";
-    if (expanded) {
+    actions.style.display = expandedNow ? "block" : "none";
+    if (expandedNow) {
       buildCommitActions(actions, tab, commit.hash);
     }
 
@@ -424,9 +440,10 @@ function renderHistory(tab) {
     row.appendChild(actions);
     historyEl.appendChild(row);
   }
-  if (!commitStillOpen) {
-    expandedCommitKey = null;
-    expandedCommitEl = null;
+  if (!commitStillOpen && expanded.type === "commit") {
+    expanded.type = null;
+    expanded.key = null;
+    expanded.el = null;
   }
 }
 
@@ -479,6 +496,10 @@ function renderBranches(tab) {
       ? branch.split("/").slice(1).join("/")
       : branch;
 
+    // The current branch can't be merged into itself, deleted while checked
+    // out, or checked out again.
+    const isCurrent = branch === current || checkoutName === current;
+
     const actions = document.createElement("div");
     actions.className = "branch-actions";
 
@@ -508,14 +529,14 @@ function renderBranches(tab) {
 
     // The current branch can't be merged into itself, deleted while checked
     // out, or checked out again — grey those buttons out.
-    if (branch === current || checkoutName === current) {
+    if (isCurrent) {
       checkout.disabled = true;
       del.disabled = true;
       merge.disabled = true;
       merge.title = `${branch} is the current branch — nothing to merge into`;
     }
 
-    if (branch === current || checkoutName === current) {
+    if (isCurrent) {
       const label = document.createElement("span");
       label.className = "branch-current-label";
       label.textContent = "current";
@@ -564,6 +585,7 @@ function renderStashes(tab) {
   }
 
   let stillOpen = false;
+  if (expanded.type === "stash") expanded.el = null;
   for (const stash of stashes) {
     const key = `${tab.id}:${stash.id}`;
     const row = document.createElement("div");
@@ -586,9 +608,10 @@ function renderStashes(tab) {
 
     const actions = document.createElement("div");
     actions.className = "stash-actions";
-    const expanded = expandedStashKey === key;
-    if (expanded) {
+    const expandedNow = expanded.type === "stash" && expanded.key === key;
+    if (expandedNow) {
       stillOpen = true;
+      expanded.el = actions;
       actions.style.display = "block";
       buildStashActions(actions, stash);
     } else {
@@ -599,8 +622,10 @@ function renderStashes(tab) {
     row.appendChild(actions);
     listEl.appendChild(row);
   }
-  if (!stillOpen) {
-    expandedStashKey = null;
+  if (!stillOpen && expanded.type === "stash") {
+    expanded.type = null;
+    expanded.key = null;
+    expanded.el = null;
   }
 }
 
@@ -706,20 +731,13 @@ function renderFileBrowser(tab) {
   ensureFolioFrame();
 }
 
-async function probeFolio() {
-  let ok = false;
-  try {
-    const res = await fetch(`${FOLIO_BASE}/`, { mode: "cors" });
-    ok = res.ok;
-  } catch (e) {
-    ok = false;
-  }
-  folioAvailable = ok;
-  if (!ok && activeView === "files") {
-    skipViewPersist = true;
-    setView("dashboard");
-    skipViewPersist = false;
-  }
+function probeFolio() {
+  probeExternal("folio", FOLIO_BASE, "dashboard", (ok) => {
+    folioAvailable = ok;
+    if (!ok && activeView === "files") {
+      setView("dashboard");
+    }
+  });
 }
 
 probeFolio();
@@ -862,39 +880,32 @@ function appendChangeRow(container, change, tab) {
 
   const detail = document.createElement("div");
   detail.className = "change-diff";
-  const expanded = expandedKey === key;
-  if (expanded) {
-    expandedDetailEl = detail;
+  const expandedNow = expanded.type === "file" && expanded.key === key;
+  if (expandedNow) {
+    expanded.el = detail;
   }
-  detail.style.display = expanded ? "block" : "none";
-  if (expanded) {
+  detail.style.display = expandedNow ? "block" : "none";
+  if (expandedNow) {
     showDiff(detail, tab, change.path);
   }
 
   row.appendChild(head);
   row.appendChild(detail);
-  if (expanded) {
+  if (expandedNow) {
     row.classList.add("open");
   }
   container.appendChild(row);
-  return expanded;
+  return expandedNow;
 }
 
 function toggleCommitActions(actionsEl, tab, hash) {
   const key = `${tab.id}:${hash}`;
-  if (expandedCommitKey === key) {
-    expandedCommitKey = null;
-    expandedCommitEl.style.display = "none";
-    expandedCommitEl = null;
-    return;
+  if (toggleSection("commit", key, actionsEl)) {
+    actionsEl.style.display = "block";
+    buildCommitActions(actionsEl, tab, hash);
+  } else {
+    actionsEl.style.display = "none";
   }
-  if (expandedCommitEl) {
-    expandedCommitEl.style.display = "none";
-  }
-  expandedCommitKey = key;
-  expandedCommitEl = actionsEl;
-  actionsEl.style.display = "block";
-  buildCommitActions(actionsEl, tab, hash);
 }
 
 function buildCommitActions(actionsEl, tab, hash) {
@@ -1113,26 +1124,17 @@ function getInitialTabId(state) {
 // ======================================
 async function toggleDiff(detailEl, tab, path) {
   const key = `${tab.id}:${path}`;
-  if (expandedKey === key) {
-    expandedKey = null;
-    expandedDetailEl.style.display = "none";
-    expandedDetailEl.textContent = "";
-    expandedDetailEl = null;
+  if (toggleSection("file", key, detailEl)) {
+    detailEl.style.display = "block";
+    detailEl.closest(".change-row").classList.add("open");
+    await showDiff(detailEl, tab, path);
+    if (expanded.el === detailEl) {
+      scrollToFirstDiffBlock(detailEl);
+    }
+  } else {
+    detailEl.style.display = "none";
+    detailEl.textContent = "";
     detailEl.closest(".change-row").classList.remove("open");
-    return;
-  }
-  if (expandedDetailEl) {
-    expandedDetailEl.style.display = "none";
-    expandedDetailEl.textContent = "";
-    expandedDetailEl.closest(".change-row").classList.remove("open");
-  }
-  expandedKey = key;
-  expandedDetailEl = detailEl;
-  detailEl.style.display = "block";
-  detailEl.closest(".change-row").classList.add("open");
-  await showDiff(detailEl, tab, path);
-  if (expandedDetailEl === detailEl) {
-    scrollToFirstDiffBlock(detailEl);
   }
 }
 
@@ -1390,15 +1392,12 @@ document.getElementById("tabs").addEventListener("click", (event) => {
   if (!isNaN(tabId)) {
     activeTabId = tabId;
     updateUrlTab(activeTabId);
-    forceView = null;
     if (btn.classList.contains("tab-name")) {
       setView("dashboard");
     } else if (btn.classList.contains("tab-view-btn")) {
-      forceView = view;
       setView(view);
     }
     render(lastState);
-    forceView = null;
   }
 });
 
@@ -1534,13 +1533,7 @@ document.getElementById("stash-list").addEventListener("click", (event) => {
   const head = event.target.closest(".stash-head");
   if (!head) return;
   const key = `${tab.id}:${head.dataset.id}`;
-  if (expandedStashKey === key) {
-    expandedStashKey = null;
-    renderStashes(tab);
-  } else {
-    expandedStashKey = key;
-    renderStashes(tab);
-  }
+  toggleSection("stash", key, head.nextElementSibling, () => renderStashes(tab));
 });
 
 document.getElementById("create-stash-btn").onclick = () => {
@@ -1598,16 +1591,22 @@ function updateUrlView(view) {
 }
 
 function setView(view) {
-  if (activeView === view && activeTabId !== null) return;
-  if (!skipViewPersist) {
-    try { localStorage.setItem("grit:view:" + repoScope(currentRepoPath()), view); } catch (e) {}
-  }
   showView(view);
   if (lastState) render(lastState);
 }
 
-function updateDockBadges(tab) {
-  // Dashboard badge removed; changes indicator is on tab name (dirty/italic)
+// Probes an external service (folio/krust) on a fixed cadence. `onResult(ok)`
+// applies the per-service UI updates (availability flag, button visibility,
+// view fallback when a service-dependent view is active but the service is down).
+async function probeExternal(name, url, fallbackView, onResult) {
+  let ok = false;
+  try {
+    const res = await fetch(`${url}/`, { mode: "cors" });
+    ok = res.ok;
+  } catch (e) {
+    ok = false;
+  }
+  onResult(ok);
 }
 
 document.addEventListener("keydown", (event) => {
@@ -1661,23 +1660,16 @@ function ensureKrustFrame(sess) {
   frame.setAttribute("src", krustFrameSrc(sess, sid));
 }
 
-async function probeKrust() {
-  let ok = false;
-  try {
-    const res = await fetch(`${KRUST_BASE}/`, { mode: "cors" });
-    ok = res.ok;
-  } catch (e) {
-    ok = false;
-  }
-  krustAvailable = ok;
-  document.querySelectorAll(".krust-btn").forEach((btn) => {
-    btn.style.display = ok ? "" : "none";
+function probeKrust() {
+  probeExternal("krust", KRUST_BASE, "dashboard", (ok) => {
+    krustAvailable = ok;
+    document.querySelectorAll(".krust-btn").forEach((btn) => {
+      btn.style.display = ok ? "" : "none";
+    });
+    if (!ok && activeView === "term-1") {
+      setView("dashboard");
+    }
   });
-  if (!ok && activeView === "term-1") {
-    skipViewPersist = true;
-    setView("dashboard");
-    skipViewPersist = false;
-  }
 }
 
 probeKrust();

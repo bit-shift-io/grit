@@ -157,7 +157,7 @@ fn web_state_from_saved(saved: Vec<SavedTab>) -> crate::server::registry::WebSta
         });
     }
     let active = 0;
-    crate::server::registry::WebState { active, tabs }
+    crate::server::registry::WebState { active, tabs, revision: 0 }
 }
 
 /// Restores a WebState from saved tabs, skipping dead repository paths.

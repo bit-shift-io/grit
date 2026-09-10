@@ -1053,6 +1053,7 @@ mod tests {
         registry.set(WebState {
             active: 0,
             tabs: vec![webtab(0, "grit", dir.path())],
+            revision: 0,
         });
         let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
         assert_eq!(app.tabs.len(), 1);
@@ -1060,6 +1061,7 @@ mod tests {
         registry.set(WebState {
             active: 0,
             tabs: Vec::new(),
+            revision: 0,
         });
         let _ = app.update(Message::WebTabsSync(registry.snapshot().tabs));
 

@@ -74,9 +74,6 @@ pub fn build_router(state: AppState) -> Router {
         .layer(CorsLayer::permissive())
 }
 
-
-/// Expands a leading `~` in a user-supplied path to the home directory.
-
 /// Recomputes the state of one repository tab on a blocking task.
 pub async fn refresh_tab(app: &AppState, tab_id: usize) {
     let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
@@ -388,6 +385,7 @@ mod tests {
             .set(crate::server::registry::WebState {
                 active: 0,
                 tabs: vec![],
+                revision: 0,
             });
         let received = tokio::time::timeout(std::time::Duration::from_secs(2), bcast.recv()).await;
         assert!(received.is_ok(), "sync_loop stopped responding to changes");

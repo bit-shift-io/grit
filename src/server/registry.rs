@@ -27,6 +27,10 @@ pub struct WebTab {
 pub struct WebState {
     pub active: usize,
     pub tabs: Vec<WebTab>,
+    /// Monotonically increasing counter; bumped on every publish so clients
+    /// can cheaply detect unchanged frames without serializing the full payload.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 impl Default for WebState {
@@ -34,6 +38,7 @@ impl Default for WebState {
         Self {
             active: 0,
             tabs: Vec::new(),
+            revision: 0,
         }
     }
 }
@@ -135,14 +140,18 @@ impl TabRegistry {
                 state: RepoState::default(),
                 log: Vec::new(),
             }],
+            revision: 0,
         });
         registry
     }
 
     /// Replaces the entire tab list.
-    pub fn set(&self, state: WebState) {
-        self.revision
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    pub fn set(&self, mut state: WebState) {
+        let rev = self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        state.revision = rev;
         let _ = self.tx.send(state);
     }
 
@@ -368,6 +377,7 @@ mod tests {
         registry.set(WebState {
             active: 1,
             tabs: vec![sample_tab(0, "a"), sample_tab(1, "b")],
+            revision: 0,
         });
         let state = registry.snapshot();
         assert_eq!(state.active, 1);
@@ -380,6 +390,7 @@ mod tests {
         registry.set(WebState {
             active: 0,
             tabs: vec![sample_tab(0, "a"), sample_tab(1, "b")],
+            revision: 0,
         });
         let fresh = RepoState {
             current_branch: "dev".to_string(),
@@ -402,6 +413,7 @@ mod tests {
         registry.set(WebState {
             active: 0,
             tabs: vec![sample_tab(7, "alpha")],
+            revision: 0,
         });
         assert_eq!(
             registry.repo_path_for(7),
@@ -417,6 +429,7 @@ mod tests {
         registry.set(WebState {
             active: 0,
             tabs: vec![sample_tab(0, "new")],
+            revision: 0,
         });
         assert!(rx.changed().await.is_ok());
         assert_eq!(registry.snapshot().tabs.len(), 1);
@@ -454,6 +467,7 @@ mod tests {
         clone.set(WebState {
             active: 0,
             tabs: vec![sample_tab(9, "x")],
+            revision: 0,
         });
         assert_eq!(registry.snapshot().tabs.len(), 1);
     }
