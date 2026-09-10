@@ -25,7 +25,7 @@ const FOLIO_PORT: u16 = 4000;
 async fn folio_is_up() -> bool {
     use tokio::net::TcpStream;
     tokio::time::timeout(
-        Duration::from_millis(400),
+        Duration::from_millis(100),
         TcpStream::connect(format!("127.0.0.1:{FOLIO_PORT}")),
     )
     .await

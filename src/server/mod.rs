@@ -21,7 +21,7 @@ const BROADCAST_CAPACITY: usize = 128;
 
 /// Per-operation deadline for the raw-TCP daemon probe on `/health`.
 #[cfg(any(test, feature = "desktop"))]
-const DAEMON_PROBE_TIMEOUT_MS: u64 = 500;
+const DAEMON_PROBE_TIMEOUT_MS: u64 = 100;
 
 /// Listen backlog for the TCP listener (`socket.listen`).
 const LISTEN_BACKLOG: u32 = 1024;
@@ -96,12 +96,14 @@ pub async fn refresh_tab(app: &AppState, tab_id: usize) {
     }
 }
 
-/// Recomputes the state of every open repository tab.
+/// Recomputes the state of every open repository tab concurrently.
 pub async fn refresh_all(app: &AppState) {
     let tabs = app.registry.snapshot().tabs;
-    for tab in tabs {
-        refresh_tab(app, tab.id).await;
-    }
+    let futures: Vec<_> = tabs
+        .iter()
+        .map(|tab| refresh_tab(app, tab.id))
+        .collect();
+    futures_util::future::join_all(futures).await;
 }
 
 /// Listens for file-watcher refresh events and registry changes, re-broadcasting
@@ -260,12 +262,16 @@ pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<(
     // Refresh statuses in the background so clients can connect while git
     // commands are still running; each finished tab's update_state publish
     // flows through sync_loop to every client, so tabs appear one by one.
+    // All tabs refresh concurrently to minimize startup latency.
     tokio::spawn({
         let app = app.clone();
         async move {
-            for tab in app.registry.snapshot().tabs {
-                refresh_tab(&app, tab.id).await;
-            }
+            let tabs = app.registry.snapshot().tabs;
+            let futures: Vec<_> = tabs
+                .iter()
+                .map(|tab| refresh_tab(&app, tab.id))
+                .collect();
+            futures_util::future::join_all(futures).await;
         }
     });
 

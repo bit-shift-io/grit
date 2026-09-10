@@ -4,20 +4,46 @@ use super::*;
 
 pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
     let current_branch = get_current_branch(repo_path)?;
-    let branches = list_branches(repo_path)?;
-    let remote_branches = list_remote_branches(repo_path)?;
-    let stashes = list_stashes(repo_path)?;
-    let changes = list_changes(repo_path)?;
-    let history = get_history(repo_path)?;
+
+    // Run ALL heavy operations concurrently via scoped threads.  Each one
+    // spawns git subprocesses; parallelising turns the sum of their latencies
+    // into the latency of the single slowest operation.
+    let (branches_res, remote_res, stashes_res, changes_res, history_res, scripts_res) =
+        std::thread::scope(|s| {
+            let h_branches = s.spawn(|| -> Result<Vec<String>, GitError> {
+                let output = run(git_command(repo_path).args(["branch", "--format=%(refname:short)"]))?;
+                Ok(output.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+            });
+            let h_remote = s.spawn(|| -> Result<Vec<String>, GitError> {
+                let output = match run(git_command(repo_path).args(["branch", "-r", "--format=%(refname:short)"])) {
+                    Ok(output) => output,
+                    Err(e) if e.stderr.contains("no remote configured") => return Ok(Vec::new()),
+                    Err(e) => return Err(e),
+                };
+                Ok(output.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.ends_with("/HEAD")).collect())
+            });
+            let h_stashes = s.spawn(|| list_stashes(repo_path));
+            let h_changes = s.spawn(|| list_changes(repo_path));
+            let h_history = s.spawn(|| get_history(repo_path));
+            let h_scripts = s.spawn(|| crate::actions::discover(repo_path));
+            (
+                h_branches.join().unwrap(),
+                h_remote.join().unwrap(),
+                h_stashes.join().unwrap(),
+                h_changes.join().unwrap(),
+                h_history.join().unwrap(),
+                h_scripts.join().unwrap(),
+            )
+        });
 
     Ok(RepoState {
         current_branch,
-        branches,
-        remote_branches,
-        stashes,
-        changes,
-        history,
-        scripts: crate::actions::discover(repo_path),
+        branches: branches_res?,
+        remote_branches: remote_res?,
+        stashes: stashes_res?,
+        changes: changes_res?,
+        history: history_res?,
+        scripts: scripts_res,
     })
 }
 
@@ -30,28 +56,6 @@ pub(crate) fn get_current_branch(repo_path: &Path) -> Result<String, GitError> {
             Ok(format!("detached@{}", hash.trim()))
         }
     }
-}
-
-pub(crate) fn list_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
-    let output = run(git_command(repo_path).args(["branch", "--format=%(refname:short)"]))?;
-    Ok(output
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
-}
-
-pub(crate) fn list_remote_branches(repo_path: &Path) -> Result<Vec<String>, GitError> {
-    let output = match run(git_command(repo_path).args(["branch", "-r", "--format=%(refname:short)"])) {
-        Ok(output) => output,
-        Err(e) if e.stderr.contains("no remote configured") => return Ok(Vec::new()),
-        Err(e) => return Err(e),
-    };
-    Ok(output
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
-        .collect())
 }
 
 pub(crate) fn list_stashes(repo_path: &Path) -> Result<Vec<StashEntry>, GitError> {
@@ -67,7 +71,9 @@ pub(crate) fn list_stashes(repo_path: &Path) -> Result<Vec<StashEntry>, GitError
         Err(e) => return Err(e),
     };
 
+    // First pass: parse stash metadata (id, branch, message, timestamp).
     let mut stashes = Vec::new();
+    let mut stash_ids: Vec<String> = Vec::new();
     for line in output.lines() {
         let mut parts = line.splitn(3, '\t');
         let id = parts.next().unwrap_or_default().trim().to_string();
@@ -79,16 +85,25 @@ pub(crate) fn list_stashes(repo_path: &Path) -> Result<Vec<StashEntry>, GitError
         }
 
         let (branch, message) = split_stash_subject(&msg_with_branch);
-        let files = stash_files(repo_path, &id);
-
+        stash_ids.push(id.clone());
         stashes.push(StashEntry {
             id,
             branch,
             message,
             timestamp: parse_epoch(timestamp).unwrap_or(0),
-            files,
+            files: Vec::new(), // populated below
         });
     }
+
+    // Batch-fetch file lists for all stashes in a single shell pipeline.
+    if !stash_ids.is_empty() {
+        let id_refs: Vec<&str> = stash_ids.iter().map(|s| s.as_str()).collect();
+        let batched = stash_files_batch(repo_path, &id_refs);
+        for (stash, files) in stashes.iter_mut().zip(batched) {
+            stash.files = files;
+        }
+    }
+
     Ok(stashes)
 }
 
@@ -109,44 +124,75 @@ pub(crate) fn split_stash_subject(subject: &str) -> (String, String) {
     (subject.to_string(), String::new())
 }
 
-/// Best-effort file list for a stash: `git stash show` with name+num stats.
-/// Falls back to an empty list on any git error so a single bad stash never
-/// fails an entire status refresh.
-pub(crate) fn stash_files(repo_path: &Path, id: &str) -> Vec<FileStat> {
-    let name_status =
-        run(git_command(repo_path).args(["stash", "show", "--name-status", id])).unwrap_or_default();
-    let numstat = run(git_command(repo_path).args(["stash", "show", "--numstat", id]))
-        .unwrap_or_default();
-    parse_commit_files(&name_status, &numstat)
+/// Batch-fetches file lists for multiple stashes in a single shell pipeline.
+/// Falls back to empty file lists on any error.
+pub(crate) fn stash_files_batch(repo_path: &Path, ids: &[&str]) -> Vec<Vec<FileStat>> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let repo = repo_path.to_string_lossy();
+    let sep = "GRIT_SEP";
+    // Build a pipeline: for each stash, run name-status && echo SEP && numstat && echo SEP
+    let mut pipeline = String::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            pipeline.push_str(&format!(" && echo {sep} && "));
+        }
+        pipeline.push_str(&format!(
+            "cd '{repo}' && LC_ALL=C git stash show --name-status '{id}' && echo {sep} && LC_ALL=C git stash show --numstat '{id}'"
+        ));
+    }
+    let shell_cmd = format!("cd '{repo}' && {pipeline}");
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &shell_cmd]);
+    let combined = run(&mut cmd).unwrap_or_default();
+
+    let sections: Vec<&str> = combined.split(sep).collect();
+    // Each stash produces 2 sections: name-status, numstat
+    let mut results = Vec::with_capacity(ids.len());
+    for i in 0..ids.len() {
+        let ns = sections.get(i * 2).copied().unwrap_or("");
+        let num = sections.get(i * 2 + 1).copied().unwrap_or("");
+        results.push(parse_commit_files(ns, num));
+    }
+    results
 }
 
 pub(crate) fn list_changes(repo_path: &Path) -> Result<Vec<FileChange>, GitError> {
+    // Combined staged + unstaged + untracked in a single shell pipeline.
+    // Three git invocations joined by a separator parsed on the Rust side.
+    let repo = repo_path.to_string_lossy();
+    let sep = "GRIT_SEP";
+    let shell_cmd = format!(
+        "cd '{repo}' && LC_ALL=C git diff --name-status --cached --diff-filter=ACMRD \
+         && echo {sep} \
+         && LC_ALL=C git diff --name-status --diff-filter=ACMRD \
+         && echo {sep} \
+         && LC_ALL=C git ls-files --others --exclude-standard"
+    );
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &shell_cmd]);
+    let combined = run(&mut cmd)?;
+
     let mut changes = Vec::new();
+    let sections: Vec<&str> = combined.split(sep).collect();
 
-    let staged = run(
-        git_command(repo_path)
-            .args(["diff", "--name-status", "--cached", "--diff-filter=ACMRD"]),
-    )?;
-    changes.extend(parse_name_status(&staged, true, GitStatus::Staged));
-
-    let unstaged = run(
-        git_command(repo_path)
-            .args(["diff", "--name-status", "--diff-filter=ACMRD"]),
-    )?;
-    changes.extend(parse_name_status(&unstaged, false, GitStatus::Modified));
-
-    let untracked = run(
-        git_command(repo_path)
-            .args(["ls-files", "--others", "--exclude-standard"]),
-    )?;
-    for path in untracked.lines() {
-        let path = path.trim();
-        if !path.is_empty() {
-            changes.push(FileChange {
-                path: path.to_string(),
-                status: GitStatus::Untracked,
-                is_staged: false,
-            });
+    if let Some(staged) = sections.first() {
+        changes.extend(parse_name_status(staged, true, GitStatus::Staged));
+    }
+    if let Some(unstaged) = sections.get(1) {
+        changes.extend(parse_name_status(unstaged, false, GitStatus::Modified));
+    }
+    if let Some(untracked) = sections.get(2) {
+        for path in untracked.lines() {
+            let path = path.trim();
+            if !path.is_empty() {
+                changes.push(FileChange {
+                    path: path.to_string(),
+                    status: GitStatus::Untracked,
+                    is_staged: false,
+                });
+            }
         }
     }
 

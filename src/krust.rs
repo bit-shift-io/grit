@@ -20,7 +20,7 @@ const KRUST_PORT: u16 = 3000;
 async fn krust_is_up() -> bool {
     use tokio::net::TcpStream;
     tokio::time::timeout(
-        Duration::from_millis(400),
+        Duration::from_millis(100),
         TcpStream::connect(format!("127.0.0.1:{KRUST_PORT}")),
     )
     .await
