@@ -16,31 +16,39 @@ default = []
 desktop = ["dep:iced", "dep:rfd", "dep:futures-channel", "dep:tokio-tungstenite"]
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }
 axum = { version = "0.8", features = ["ws", "tokio", "http1"] }
-tower-http = { version = "0.7", features = ["fs", "cors", "trace"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-futures-util = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 futures-channel = { version = "0.3", optional = true }
 notify = "8"
 rust-embed = { version = "8", features = ["mime-guess"] }
-clap = { version = "4", features = ["derive"] }
-dirs = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-freedesktop-desktop-entry = "0.8"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 
 # Desktop GUI only (enabled via the `desktop` feature).
-iced = { version = "0.14", optional = true }
+# Explicit feature set: no `wgpu` (UI is text/button widgets only, rendered with
+# tiny-skia) and no `linux-theme-detection` (the app hardcodes Theme::Dark).
+iced = { version = "0.14", optional = true, default-features = false, features = [
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "thread-pool",
+    "x11",
+    "wayland",
+    "tokio",
+] }
 rfd = { version = "0.15", optional = true }
-tokio-tungstenite = { version = "0.30", optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-# Test WebSocket client needs tungstenite even in web-only builds.
-tokio-tungstenite = "0.30"
+# Test WebSocket client needs tungstenite even in web-only builds. Pinned to 0.29
+# to match the version axum 0.8 resolves, so the stack is not compiled twice.
+tokio-tungstenite = "0.29"
 
 [profile.release]
 opt-level = 3

@@ -183,6 +183,7 @@ impl GritApp {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            // Tab management and the "+" add-repository form.
             Message::AddTabPressed => {
                 self.show_add_form = true;
                 Task::none()
@@ -210,9 +211,11 @@ impl GritApp {
             }
             Message::BrowseFolder => Task::perform(
                 async move {
-                    rfd::FileDialog::new()
+                    rfd::AsyncFileDialog::new()
                         .set_title("Select a Git repository folder")
                         .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
                 },
                 Message::FolderPicked,
             ),
@@ -223,27 +226,38 @@ impl GritApp {
                 Task::none()
             }
             Message::OpenNewRepo => self.handle_open_new_repo(),
-            Message::OpenRepoResult(result) => {
-                match result {
-                    Ok(id) => {
-                        // The form resets for its next use; the tab itself
-                        // arrives through WebTabsSync adoption.
-                        self.show_add_form = false;
-                        self.add_name.clear();
-                        self.add_path.clear();
-                        self.add_error = None;
-                        if let Some(tab) = self.tabs.iter().find(|r| r.id == id) {
-                            let path = tab.repo_path.clone();
-                            return refresh(id, path);
-                        }
-                    }
-                    Err(error) => {
-                        self.add_error = Some(error);
-                    }
+            Message::OpenRepoResult(result) => self.handle_open_repo_result(result),
+            m => self.handle_git_message(m),
+        }
+    }
+
+    /// Outcome of opening a repository tab: reset the form and refresh the
+    /// new tab, or surface the error in the form.
+    fn handle_open_repo_result(&mut self, result: Result<usize, String>) -> Task<Message> {
+        match result {
+            Ok(id) => {
+                // The form resets for its next use; the tab itself
+                // arrives through WebTabsSync adoption.
+                self.show_add_form = false;
+                self.add_name.clear();
+                self.add_path.clear();
+                self.add_error = None;
+                if let Some(tab) = self.tabs.iter().find(|r| r.id == id) {
+                    let path = tab.repo_path.clone();
+                    return refresh(id, path);
                 }
-                Task::none()
             }
-            // Git actions on the active repository tab.
+            Err(error) => {
+                self.add_error = Some(error);
+            }
+        }
+        Task::none()
+    }
+
+    /// Git actions on the active repository tab, plus the watcher and
+    /// background updates routed by tab id.
+    fn handle_git_message(&mut self, message: Message) -> Task<Message> {
+        match message {
             Message::StageFile(path) => self.run_action(GitAction::Stage(path)),
             Message::UnstageFile(path) => self.run_action(GitAction::Unstage(path)),
             Message::CommitPressed => {
@@ -324,13 +338,11 @@ impl GritApp {
             }
             // Watcher and background updates, routed by tab id.
             Message::TabRefresh(id) => {
-                let path = self.tabs.iter().find_map(|t| {
-                    if t.id == id {
-                        Some(t.repo_path.clone())
-                    } else {
-                        None
-                    }
-                });
+                let path = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.repo_path.clone());
                 match path {
                     Some(path) => refresh(id, path),
                     None => Task::none(),
@@ -352,6 +364,8 @@ impl GritApp {
             }
             Message::WebTabsSync(live_tabs) => self.handle_web_tabs_sync(&live_tabs),
             Message::Nop => Task::none(),
+            // Handled by `update`; unreachable via this path.
+            _ => Task::none(),
         }
     }
 
@@ -805,6 +819,8 @@ mod tests {
             changes: vec![],
             history: vec![],
             scripts: vec![],
+            remote_branches: vec![],
+            stashes: vec![],
         }
     }
 

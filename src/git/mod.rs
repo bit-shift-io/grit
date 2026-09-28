@@ -156,93 +156,90 @@ fn notify_progress(sink: &ProgressSink, snapshot: String) {
     sink(truncate_output(snapshot));
 }
 
+/// Spawns a thread that drains one piped stream in fixed-size chunks,
+/// appending each chunk to its buffer and pushing throttled snapshots.
+///
+/// Fixed-size chunk reads (not line reads): git's progress meters redraw with
+/// `\r` and would otherwise buffer until exit.
+fn spawn_stream_reader<R>(
+    pipe: R,
+    is_stdout: bool,
+    buffers: &std::sync::Arc<StreamBuffers>,
+    sink: &ProgressSink,
+) -> std::thread::JoinHandle<()>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let buffers = std::sync::Arc::clone(buffers);
+    let sink = std::sync::Arc::clone(sink);
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut buf = [0u8; 512];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => flush_chunk(
+                    &buffers,
+                    is_stdout,
+                    String::from_utf8_lossy(&buf[..n]).into_owned(),
+                    &sink,
+                ),
+            }
+        }
+    })
+}
+
+/// Running `git` command with live output: accumulated stdout, stderr, and
+/// whether the process exited successfully.
+type Buffers = (String, String, Option<Instant>);
+type StreamBuffers = std::sync::Mutex<Buffers>;
+
+/// Appends one raw output chunk to its stream buffer and pushes a live
+/// snapshot on first content, then at most once per flush interval.
+/// Carriage returns are normalized to newlines: git draws progress
+/// meters with `\r` redraws, which would otherwise coalesce into a
+/// single giant line delivered only at exit.
+fn flush_chunk(
+    buffers: &StreamBuffers,
+    is_stdout: bool,
+    chunk: String,
+    sink: &ProgressSink,
+) {
+    let mut guard = match buffers.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let (stdout, stderr, last_flush) = &mut *guard;
+    let chunk = chunk.replace('\r', "\n");
+    if is_stdout {
+        stdout.push_str(&chunk);
+    } else {
+        stderr.push_str(&chunk);
+    }
+    let due = last_flush.is_none_or(|t| t.elapsed() >= STREAM_FLUSH_INTERVAL);
+    if due {
+        *last_flush = Some(Instant::now());
+        let snapshot = combine_streams(stdout, stderr);
+        drop(guard);
+        notify_progress(sink, snapshot);
+    }
+}
+
 /// Runs `cmd` with piped stdout/stderr, feeding throttled snapshots of the
 /// combined output to `sink` while it executes. Returns the full contents
 /// of each stream plus the exit success flag; the final transcript keeps
 /// the exact shape the blocking path produces.
 fn run_streamed(cmd: &mut Command, sink: &ProgressSink) -> std::io::Result<(String, String, bool)> {
     use std::process::Stdio;
-    use std::sync::Mutex;
-
-    /// Appends one raw output chunk to its stream buffer and pushes a live
-    /// snapshot on first content, then at most once per flush interval.
-    /// Carriage returns are normalized to newlines: git draws progress
-    /// meters with `\r` redraws, which would otherwise coalesce into a
-    /// single giant line delivered only at exit.
-    fn flush_chunk(
-        buffers: &Mutex<(String, String, Option<Instant>)>,
-        is_stdout: bool,
-        chunk: String,
-        sink: &ProgressSink,
-    ) {
-        let mut guard = match buffers.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let (stdout, stderr, last_flush) = &mut *guard;
-        let chunk = chunk.replace('\r', "\n");
-        if is_stdout {
-            stdout.push_str(&chunk);
-        } else {
-            stderr.push_str(&chunk);
-        }
-        let due = last_flush.map_or(true, |t| t.elapsed() >= STREAM_FLUSH_INTERVAL);
-        if due {
-            *last_flush = Some(Instant::now());
-            let snapshot = combine_streams(stdout, stderr);
-            drop(guard);
-            notify_progress(sink, snapshot);
-        }
-    }
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
 
-    type Buffers = Mutex<(String, String, Option<Instant>)>;
-    let buffers: std::sync::Arc<Buffers> = std::sync::Arc::new(Mutex::default());
-
+    let buffers: std::sync::Arc<StreamBuffers> = std::sync::Arc::default();
     let stdout_pipe = child.stdout.take().expect("child stdout was piped");
     let stderr_pipe = child.stderr.take().expect("child stderr was piped");
-    let out_reader = std::thread::spawn({
-        let buffers = std::sync::Arc::clone(&buffers);
-        let sink = std::sync::Arc::clone(sink);
-        move || {
-            // Fixed-size chunk reads (not line reads): git's progress
-            // meters redraw with `\r` and would buffer until exit.
-            let mut pipe = stdout_pipe;
-            let mut buf = [0u8; 512];
-            loop {
-                match std::io::Read::read(&mut pipe, &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => flush_chunk(
-                        &buffers,
-                        true,
-                        String::from_utf8_lossy(&buf[..n]).into_owned(),
-                        &sink,
-                    ),
-                }
-            }
-        }
-    });
-    let err_reader = std::thread::spawn({
-        let buffers = std::sync::Arc::clone(&buffers);
-        let sink = std::sync::Arc::clone(sink);
-        move || {
-            let mut pipe = stderr_pipe;
-            let mut buf = [0u8; 512];
-            loop {
-                match std::io::Read::read(&mut pipe, &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => flush_chunk(
-                        &buffers,
-                        false,
-                        String::from_utf8_lossy(&buf[..n]).into_owned(),
-                        &sink,
-                    ),
-                }
-            }
-        }
-    });
+    let out_reader = spawn_stream_reader(stdout_pipe, true, &buffers, sink);
+    let err_reader = spawn_stream_reader(stderr_pipe, false, &buffers, sink);
 
     // Readers own their pipe handles; once both finish the child is done.
     let _ = out_reader.join();

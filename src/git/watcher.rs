@@ -153,18 +153,18 @@ mod tests {
         fs::write(dir.path().join("file.txt"), "hello").unwrap();
         fs::write(dir.path().join("file.txt"), "world").unwrap();
 
-        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for debounced event")
             .expect("channel closed");
-        assert_eq!(first, ());
+        assert_eq!((), ());
 
         fs::write(dir.path().join("other.txt"), "second burst").unwrap();
-        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for second debounced event")
             .expect("channel closed");
-        assert_eq!(second, (), "debouncer must keep firing after the first event");
+        assert_eq!((), (), "debouncer must keep firing after the first event");
     }
 
     #[tokio::test]
@@ -183,11 +183,11 @@ mod tests {
             fs::write(dir.path().join(format!("burst-{i}.txt")), "x").unwrap();
         }
 
-        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timed out waiting for debounced event")
             .expect("channel closed");
-        assert_eq!(first, ());
+        assert_eq!((), ());
 
         // A fresh raw event arriving after the burst could legitimately arm a
         // second 200 ms window, so only assert that the debouncer never

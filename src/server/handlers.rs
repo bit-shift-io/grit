@@ -199,7 +199,7 @@ pub(crate) async fn browse_handler(
     let parent = if Some(&dir) == home.as_ref() {
         None
     } else {
-        dir.parent().map(|p| shorten_path(p))
+        dir.parent().map(shorten_path)
     };
 
     Json(BrowseResponse {
@@ -276,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn health_endpoint_reports_ok() {
         let dir = tempfile::tempdir().unwrap();
-        let app = app_for(&dir.path().to_path_buf());
+        let app = app_for(dir.path());
         let router = build_router(app);
 
         let response = router
@@ -302,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn files_endpoint_returns_file_pair() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
         std::fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
         std::process::Command::new("git")
             .args(["add", "-A"])
@@ -316,7 +316,7 @@ mod tests {
             .unwrap();
         std::fs::write(dir.path().join("a.txt"), "v2\n").unwrap();
 
-        let app = app_for(&dir.path().to_path_buf());
+        let app = app_for(dir.path());
         let router = build_router(app);
 
         let response = router
@@ -343,7 +343,7 @@ mod tests {
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
         for dir in [&dir1, &dir2] {
-            init_repo(&dir.path().to_path_buf());
+            init_repo(dir.path());
             std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
             std::process::Command::new("git")
                 .args(["add", "-A"])
@@ -405,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn commit_endpoint_returns_summary() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
         std::fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
         std::process::Command::new("git")
             .args(["add", "-A"])
@@ -423,7 +423,7 @@ mod tests {
             .hash
             .clone();
 
-        let app = app_for(&dir.path().to_path_buf());
+        let app = app_for(dir.path());
         let router = build_router(app);
 
         let response = router

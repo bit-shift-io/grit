@@ -9,7 +9,7 @@
 //! entirely, delete this file plus the few `actions::` call sites in
 //! `git/mod.rs` and the UI.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::git::types::ScriptEntry;
 
@@ -282,18 +282,110 @@ fn desktop_preferences() -> Vec<(&'static str, &'static [&'static str])> {
     }
 }
 
+/// The handful of `[Desktop Entry]` keys we care about when scanning for
+/// installed terminal emulators.
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct DesktopEntry {
+    exec: Option<String>,
+    try_exec: Option<String>,
+    categories: Vec<String>,
+    hidden: bool,
+    no_display: bool,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl DesktopEntry {
+    /// Parses a `.desktop` file body. Only the main `[Desktop Entry]` group is
+    /// considered; other groups and malformed lines are ignored.
+    fn parse(content: &str) -> Self {
+        let mut entry = Self::default();
+        let mut in_main_group = false;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_main_group = line == "[Desktop Entry]";
+                continue;
+            }
+            if !in_main_group {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "Exec" => entry.exec = Some(value.trim().to_string()),
+                "TryExec" => entry.try_exec = Some(value.trim().to_string()),
+                "Categories" => {
+                    entry.categories = value
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                }
+                "Hidden" => entry.hidden = value.trim() == "true",
+                "NoDisplay" => entry.no_display = value.trim() == "true",
+                _ => {}
+            }
+        }
+        entry
+    }
+
+    /// Reads and parses one `.desktop` file, or None when it is unreadable.
+    fn from_path(path: &Path) -> Option<Self> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let entry = Self::parse(&content);
+        Some(entry)
+    }
+}
+
+/// Directories scanned for `.desktop` files, in freedesktop priority order:
+/// `$XDG_DATA_HOME/applications`, then each `$XDG_DATA_DIRS` entry's
+/// `applications/` subdir, then the `/usr/local` and `/usr` defaults.
+#[cfg(not(target_os = "macos"))]
+fn desktop_dirs() -> Vec<PathBuf> {
+    let mut data_dirs = Vec::new();
+    if let Some(home) = std::env::var_os("XDG_DATA_HOME") {
+        let dir = PathBuf::from(home);
+        if dir.is_absolute() {
+            data_dirs.push(dir);
+        }
+    }
+    if let Some(list) = std::env::var_os("XDG_DATA_DIRS") {
+        for dir in std::env::split_paths(&list) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            data_dirs.push(dir);
+        }
+    }
+    data_dirs.push(PathBuf::from("/usr/local/share"));
+    data_dirs.push(PathBuf::from("/usr/share"));
+
+    let mut apps = Vec::new();
+    for dir in data_dirs {
+        let applications = dir.join("applications");
+        if !apps.contains(&applications) {
+            apps.push(applications);
+        }
+    }
+    apps
+}
+
 /// The launchable binary name advertised by a TerminalEmulator entry:
 /// `TryExec` when present, else the first token of `Exec` (basename only).
 /// Flatpak-wrapped launchers return None — the wrapper does not accept a
 /// plain `sh -c` command line.
 #[cfg(not(target_os = "macos"))]
-fn primary_binary(entry: &freedesktop_desktop_entry::DesktopEntry) -> Option<String> {
-    if entry.exec().is_some_and(|e| e.starts_with("flatpak run")) {
+fn primary_binary(entry: &DesktopEntry) -> Option<String> {
+    if entry.exec.as_deref().is_some_and(|e| e.starts_with("flatpak run")) {
         return None;
     }
     let bin = entry
-        .try_exec()
-        .or_else(|| entry.exec().and_then(|e| e.split_whitespace().next()))?;
+        .try_exec
+        .as_deref()
+        .or_else(|| entry.exec.as_deref().and_then(|e| e.split_whitespace().next()))?;
     Some(
         Path::new(bin)
             .file_name()
@@ -308,34 +400,42 @@ fn primary_binary(entry: &freedesktop_desktop_entry::DesktopEntry) -> Option<Str
 /// our static list has never heard of. Returns (flag-known, flag-unknown).
 #[cfg(not(target_os = "macos"))]
 fn desktop_file_terminals() -> (Vec<String>, Vec<String>) {
-    use freedesktop_desktop_entry::{default_paths, DesktopEntry, Iter};
-
     let mut known = Vec::new();
     let mut unknown = Vec::new();
-    for path in Iter::new(default_paths()) {
-        let Ok(entry) = DesktopEntry::from_path(path, None as Option<&[String]>) else {
+    for dir in desktop_dirs() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
-        if entry.hidden() || entry.no_display() {
-            continue;
-        }
-        let Some(categories) = entry.categories() else {
-            continue;
-        };
-        if !categories.iter().any(|c| *c == "TerminalEmulator") {
-            continue;
-        }
-        let Some(binary) = primary_binary(&entry) else {
-            continue;
-        };
+        // Sort for deterministic priority within a single directory; the
+        // cross-directory priority still comes from `desktop_dirs()` order.
+        let mut paths: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "desktop"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Some(entry) = DesktopEntry::from_path(&path) else {
+                continue;
+            };
+            if entry.hidden || entry.no_display {
+                continue;
+            }
+            if !entry.categories.iter().any(|c| c == "TerminalEmulator") {
+                continue;
+            }
+            let Some(binary) = primary_binary(&entry) else {
+                continue;
+            };
 
-        let target = if flags_for(&binary).is_some() {
-            &mut known
-        } else {
-            &mut unknown
-        };
-        if !target.contains(&binary) {
-            target.push(binary);
+            let target = if flags_for(&binary).is_some() {
+                &mut known
+            } else {
+                &mut unknown
+            };
+            if !target.contains(&binary) {
+                target.push(binary);
+            }
         }
     }
     (known, unknown)
@@ -704,14 +804,29 @@ mod tests {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn decode_entry(content: &str) -> freedesktop_desktop_entry::DesktopEntry {
-        use freedesktop_desktop_entry::DesktopEntry;
-        DesktopEntry::from_str(
-            "/tmp/fake/org.example.Term.desktop",
-            content,
-            None as Option<&[String]>,
-        )
-        .expect("fixture decodes")
+    fn decode_entry(content: &str) -> DesktopEntry {
+        DesktopEntry::parse(content)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn desktop_entry_parses_keys_and_ignores_other_groups() {
+        let entry = decode_entry(
+            "[Desktop Action New]\n\
+             Exec=/bin/false\n\
+             [Desktop Entry]\n\
+             Type=Application\n\
+             Name=T\n\
+             Exec=/usr/local/bin/weird-term --flag\n\
+             TryExec=weird-term\n\
+             Categories=TerminalEmulator;System;\n\
+             Hidden=true\n",
+        );
+        assert_eq!(entry.exec.as_deref(), Some("/usr/local/bin/weird-term --flag"));
+        assert_eq!(entry.try_exec.as_deref(), Some("weird-term"));
+        assert_eq!(entry.categories, vec!["TerminalEmulator", "System"]);
+        assert!(entry.hidden);
+        assert!(!entry.no_display);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -839,3 +954,5 @@ mod tests {
         assert!(launch(dir.path(), "plain.txt").is_err());
     }
 }
+
+

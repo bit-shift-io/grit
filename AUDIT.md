@@ -1,84 +1,216 @@
 # Codebase Audit Summary
 
-**Audit Target:** `grit` (`/home/bronson/Projects/grit`)
-**Date:** 2026-09-05
+**Audit Target:** `grit` — fast, native, single-binary Git client (Rust / Iced / Axum)
+**Date:** 2026-09-27
+**Focus:** Build-time optimisation via dependency graph reduction (primary), plus general health sweep
 
 ---
 
 ## Executive Summary
 
-Grit is in healthy shape: both the web-only default build and the `desktop` feature build pass `cargo check` with **zero warnings**, all 2026-08-23 findings have been resolved, and tests are rich and well-organized. The one functional risk is in the web UI — three commit buttons collapse into effectively two behaviors, and neither of the two "staged" buttons actually commits only staged changes (both run `git add -A`), with no staged-only wire action existing in the `GitAction` enum. Secondary risks are moderate duplication (SKIP/ext lists, file-op handlers, frontend dropdown/preview helpers), a handful of robustness nits (silent `unwrap_or_default` paths, an unguarded raw file read), and one orphaned document (`CONTEXT.md`) that is a glossary for an unrelated game project.
+The Rust code itself is in very good shape: **zero compiler warnings** on the web-only and desktop
+builds, **zero unreferenced public items**, **zero TODO/FIXME/HACK/XXX markers**, and no
+commented-out code or stray debug statements. The previous audit's findings (innerHTML injection,
+dead CSS ids, orphan `CONTEXT.md`, silent `get_file_pair` failures) have all been resolved.
+
+The real cost lives entirely in `Cargo.toml`. The web-only build resolves **1123 crates**; the
+desktop build resolves **19524 crates**. Roughly **38% of each graph is removable with no change in
+observable behaviour** — almost all of it from features and optional machinery that the code never
+touches. `target/` has reached **12 GB**.
+
+The three worst offenders are all "declared but unused":
+
+1. **`iced`'s `linux-theme-detection`** — pulls `ashpd` → `zbus` (a full D-Bus stack), `x11rb`, and
+   `sctk-adwaita`, while `src/ui/state.rs:770` hardcodes `.theme(iced::Theme::Dark)`. **6995 crates.**
+2. **`iced`'s `wgpu`** — the entire GPU backend (wgpu-core/naga/wgpu-hal) for a UI built only from
+   `button`/`column`/`row`/`rule`/`text`/`text_input`/`pick_list`. No canvas, no image, no SVG.
+   **3844 crates.**
+3. **`tower-http`'s `fs` + `trace` features** — the code imports exactly one symbol from
+   `tower-http`: `CorsLayer` at `src/server/mod.rs:14`. Assets are served from the embedded
+   `rust-embed` bundle instead. **133 crates.**
+
+All numbers below are *measured*, not estimated: each configuration was applied to a scratch copy of
+the manifest and resolved with `cargo tree --no-dedupe`, then diffed against baseline.
+
+---
 
 ## Key Metrics
 
-- **Unused/Orphan Files:** 1 (`CONTEXT.md` — unrelated game glossary)
-- **Dead Functions/Exports:** 0
-- **Commented-Out Code / Debug Logs:** 0
-- **Open TODOs/FIXMEs:** 0
-- **Compiler Warnings:** 0 (both `cargo check` and `cargo check --features desktop`)
+| Metric | Value |
+| :--- | :--- |
+| Rust LOC (`src/`) | 9099 across 28 files |
+| Crates, web-only build | **1123** → **701** achievable (**-38%**) |
+| Crates, desktop build | **19524** → **12529** achievable (**-37%**) |
+| `target/` size | **12 GB** |
+| Unused / orphan files | 0 |
+| Dead functions or exports | 0 |
+| Commented-out code / debug logs | 0 (`eprintln!` ×2 in `main.rs`, `mod.rs` — both intentional user-facing errors) |
+| Open TODOs / FIXMEs | 0 |
+| Compiler warnings | 0 (web-only **and** desktop) |
+| **Blocking build error** | **1** — `cargo check --features desktop --all-targets` fails (see §4) |
 
 ---
 
 ## Findings & Recommendations
 
-### 1. Unused Files & Dead Code
+### 1. Dependency Removal — Web-Only Build (default `cargo build`)
 
-| File Path | Type | Details | Recommended Action |
+Ranked by crates eliminated. Every row is independently applicable.
+
+| # | Change | Crates saved | Code refs | Effort |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | `tower-http` → `default-features = false, features = ["cors"]` | **-133** | 1 (`CorsLayer`, `server/mod.rs:14`) | Trivial |
+| 2 | `futures-util` → `default-features = false, features = ["std", "sink"]` | **-91** | 11 | Trivial |
+| 3 | `tokio` → replace `features = ["full"]` with the explicit list | **-77** | 139 | Trivial |
+| 4 | Drop `freedesktop-desktop-entry` entirely | **-50** | 4 | Medium |
+| 5 | `tracing-subscriber` → drop `env-filter` | **-36** | 1 (`fmt::init`) | Trivial |
+| 6 | Drop `clap` | **-27** | 1 (`Parser`) | Medium |
+| 7 | Align `tokio-tungstenite` to `0.29` (dedupe) | -6 distinct | dev + `ui/remote.rs` | Trivial |
+| 8 | Drop `dirs` | -4 | 2 | Trivial |
+| | **Combined** | **-422** | | |
+
+**Row 1 detail.** `fs` and `trace` are dead. `src/server/static_files.rs` serves everything from
+`rust_embed`; there is no `ServeDir` anywhere. `TraceLayer` is never imported. `fs` drags in
+`tokio-util` + `http-range-header`; `trace` drags in `http-body-util` + `tracing` plumbing.
+
+**Row 3 detail.** Only these tokio modules are referenced: `net`, `sync`, `time`, `io`, `runtime`,
+`macros`. `full` additionally compiles `process`, `signal`, `fs`, `sync` extras, and the
+multi-threaded scheduler surface grit never touches. Suggested:
+`features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"]` — **but verify**:
+`src/git/watcher.rs` uses `notify`, not `tokio::fs`, and git itself runs through `std::process::Command`
+(per `AGENTS.md` §3.3), so `process`/`fs`/`signal` should be droppable. Needs a `cargo check` to confirm.
+
+**Row 4 detail — the highest-value code change.** `freedesktop-desktop-entry` is used for exactly
+one job: scanning installed `.desktop` files for `Categories=…TerminalEmulator` to discover terminal
+emulators (`src/actions.rs:290-342`, `707-708`). That is a plain INI scan over
+`~/.local/share/applications` and `/usr/share/applications`, and this repo *already* hand-rolls the
+same `.desktop` parsing in `decode_entry` at `src/actions.rs:707`. The crate costs 50 crates and,
+worse, pulls **`gettext-sys` — a C library that is compiled and linked during every build**. Removing
+it means writing one ~40-line INI scanner. Note that the priority order in `desktop_file_terminals()`
+already comes from the iteration order, so no behavioural loss is expected.
+
+**Row 5 detail.** `tracing_subscriber::fmt::init()` is the only call. `env-filter` pulls
+`regex` + `matchers` + `aho-corasick`. Combined with row 4 (which removes the *other* `regex` source),
+the whole regex stack disappears from the graph — that is why rows 4+5 together are worth -80, not
+-86. Use `default-features = false, features = ["fmt", "ansi"]`.
+
+**Row 6 detail.** `clap` exists to parse three flags (`--headless`, `--port`, `--path`) plus
+`--version`/`--help`, declared at `src/main.rs:18-32`. 27 crates for that. Hand-rolling costs ~50
+lines and loses nothing the UI uses. Keep in mind two `#[test]`s at `main.rs:144-157` assert on
+`Cli::parse_from`, so they need rewriting alongside.
+
+**Row 7 detail.** `axum 0.8` resolves `tokio-tungstenite 0.29`, while the manifest pins `0.30` for
+both the `desktop` optional dep and the dev-dep. Result: **two complete copies** of the websocket
+stack compile. Dropping to `0.29` removes `tungstenite 0.30`, `tokio-tungstenite 0.30`, `sha1 0.11`,
+`chacha20`, `rand 0.10`, and `rand_core 0.10`, collapsing the duplicated `sha1`/`digest`/`block-buffer`
+stack from two generations to one. `src/ui/remote.rs:9` imports `tokio_tungstenite::tungstenite::Message`,
+which becomes the *same* type `axum::extract::ws` uses — so it gets simpler, not harder.
+
+**Row 8 detail.** Two calls: `dirs::home_dir()` (`folio.rs:81`) and `dirs::config_dir()`
+(`shared_config.rs:26`). Both are `$HOME` and `$XDG_CONFIG_HOME`/`.config` respectively — ~6 lines
+of `std::env` code.
+
+**Not a win — recorded so it is not re-attempted.** Switching `rfd` from its default
+`["xdg-portal", "async-std"]` to `["xdg-portal", "tokio"]` removes `async-fs` and `async-net` but
+*adds* 7 crates back through `ashpd`'s tokio integration. Net **+7**. It does eliminate a redundant
+second async runtime from the graph, which is worth something for binary size and clarity, but it
+will not speed up the build. Also worth noting: `rfd::FileDialog::pick_folder()` at
+`src/ui/state.rs:213` is a **blocking** call wrapped in `Task::perform`, i.e. it blocks an iced
+runtime worker. `rfd::AsyncFileDialog` is the correct API there — a correctness issue, not a build one.
+
+### 2. Dependency Removal — Desktop Build (`--features desktop`)
+
+| # | Change | Crates saved | Justification |
 | :--- | :--- | :--- | :--- |
-| `CONTEXT.md` | Orphan File | 33KB glossary of terms for an unrelated 2D platformer game (kill zone, drawbridge, GameAPI, NPC cage objectives…) — zero relation to Grit | Remove or move out of the repo |
-| `src/shared_config.rs:227` | Dead Code | `let active = if tabs.is_empty() { 0 } else { 0 };` — both branches yield `0`, variable value never varies | Replace with plain `let active = 0;` |
-| `web/dist/index.html:79` | Dead DOM id | `id="file-preview"` never referenced by id in `app.js` (only descendants `preview-header`/`preview-content` are used) | Remove the id or query it deliberately |
-| `web/dist/app.js:107` | Dead Local | `browserEl` declared but never used | Remove |
-| `src/ui/state.rs:567-570` | Dead Branch | `tab_button_style` `hovered` branch sets `palette.background` identical to the non-hovered else branch | Collapse to a single branch |
-| `web/dist/app.js:771` | Dead Class | `tree-arrow` class added to DOM but no CSS rule exists; JS also renders `.log-entry.success` with no matching rule | Remove dead class or add the intended styles |
+| 1 | Drop iced's `linux-theme-detection` | **-6995** | `ashpd`→`zbus` (D-Bus), `x11rb`, `sctk-adwaita` — all to auto-detect a theme the app hardcodes as Dark (`ui/state.rs:770`) |
+| 2 | Drop iced's `wgpu`, keep `tiny-skia` | **-3844** | Text/file-list UI; no `canvas`, `image`, or `svg` widget is used anywhere |
+| 3 | Optionally drop `wayland` | **-1884** | Only if the dev box and users are X11-only |
+| | **Combined (1+2)** | **-6995** → 12529 crates (**-36%**) | |
 
-### 2. Code Structure & Complexity Smells
+This is a one-line change to `Cargo.toml`:
 
-| File Path | Issue | Context / Severity | Suggested Refactor |
+```toml
+iced = { version = "0.14", optional = true, default-features = false,
+         features = ["tiny-skia", "crisp", "web-colors", "thread-pool",
+                     "x11", "wayland", "tokio"] }
+```
+
+`crisp` and `wayland` are neutral in crate count (measured identical either way) but are cheap to
+keep and avoid gratuitous breakage. Add `linux-theme-detection` back later only if the app ever
+respects the system theme — and then remove the hardcoded `Theme::Dark` at the same time.
+
+### 3. Documentation Drift
+
+| File | Issue | Recommendation |
+| :--- | :--- | :--- |
+| `ARCHITECTURE.md:13` | Claims desktop UI uses "native rendering (`wgpu` / `winit`)" | Update if `wgpu` is dropped in favour of `tiny-skia` |
+| `ARCHITECTURE.md:17` | Lists `clap` as the "CLI Engine" | Update if `clap` is removed |
+| `ARCHITECTURE.md:19` | Lists `tracing-subscriber` alongside `tracing` | Note the reduced feature set once trimmed |
+| `AGENTS.md:25` | Says the default build "excludes `iced`/`rfd`" — still accurate, but the directory map omits `src/folio.rs` entirely | Add `folio.rs` to the §2 directory map (it is the `folio` file-explorer auto-launcher, the sibling of `krust.rs`) |
+| `NOTES.md`, `TODO.md` | Historical planning docs for the now-removed in-process file browser (`src/git/files.rs:1-3` documents the removal) | Mark as historical or archive, so they stop describing a system that no longer exists |
+
+### 4. Build Breakage — Requires a Fix
+
+| File | Issue | Severity | Recommended Action |
 | :--- | :--- | :--- | :--- |
-| `src/git/mod.rs:779` + `826` | Duplication | `SKIP` const duplicated verbatim across `list_dir` and `search_files` | Hoist to one shared const |
-| `src/git/mod.rs` (`mime_for_path`, `is_image_path`) vs `src/shared_config.rs:55-68` | Duplication | Extension/MIME classification lists maintained in two modules | Unify in a single home (e.g. `shared_config`) |
-| `src/server/websocket.rs:227-314` | Duplication | Four near-identical file-op handlers (`OpenExternal`, `OpenWith`, `DeleteFile`, `RenameFile`) share the same tab-lookup + response pattern | Extract a shared file-op helper |
-| `src/server/websocket.rs` (`OpenWith`) | Robustness | `exec.split_whitespace().next()` destroys `%f`-style field codes and splits quoted paths incorrectly | Use a shell-aware word splitter that preserves placeholders |
-| `src/server/mod.rs` (`filecontent` raw) | Security Nit | `raw=true` does `std::fs::read` on the joined path with no containment/traversal guard (only the tab's `repo_path_for` check) | Reuse `git/mod.rs::list_dir`-style component guard before reading |
-| `src/git/mod.rs` (`get_file_pair`) | Robustness | `original` built with `unwrap_or_default()` — a failed `git show HEAD:path` silently becomes empty content; function never returns `Err` in practice | Propagate real `Err` so the UI can distinguish "untracked" from "read failure" |
-| `src/git/mod.rs` (`get_commit_summary`, `stash_files`) | Robustness | Multiple `git show` calls each `unwrap_or_default()`; failures are silently flattened | Aggregate and surface failures |
-| `web/dist/app.js:864-905` vs `909-965` | Duplication | Two dropdown builders share a ~44-line identical tail (positioning, scroll listeners, outside-click closer) | Extract a `showDropdown` helper |
-| `web/dist/app.js:636-637` / `938-939` / `988-989` | Duplication | Preview-reset boilerplate (`innerHTML=""` + muted placeholder) repeated three times | Extract `resetPreview()` |
-| `web/dist/app.js:808` | Dead Code | `toggleDir` re-caches `dirChildren` already cached by `fetchFileTree` at 653 | Drop the redundant re-assignment |
-| `web/dist/app.js:1711-1715` | Consistency | Branch filter isn't debounced while file/history filters are | Debounce it |
-| `web/dist/app.js` (various) | Magic Numbers | Reconnect 500/5000ms, scroll 48px, diff marker 0.35, LCS DP cap 4000000, debounces 200/300/150ms, dropdown offset 2 | Name as constants at top of file |
+| `src/ui/state.rs:802` | `cargo check --features desktop --all-targets` **fails**: `error[E0063]: missing fields 'remote_branches' and 'stashes' in initializer of types::RepoState`. The `repo_state()` test helper was not updated when those fields were added to `RepoState` (`src/git/types.rs`). Working tree is clean, so this is committed at HEAD (`3544d39`). | **High** — the entire desktop test target does not compile, so no desktop test has run since those fields landed | Add `remote_branches: vec![]` and `stashes: vec![]` to the literal at `ui/state.rs:802` |
 
-### 3. Comments & Technical Debt
+Note that plain `cargo check --features desktop` (no `--all-targets`) passes, which is why this can
+hide. `cargo test` (web-only) also passes, which is why CI-style default runs miss it.
 
-| File Path | Type | Snippet / Context | Recommendation |
+### 5. Code Structure & Complexity Smells
+
+| File | Issue | Context | Suggested Refactor |
 | :--- | :--- | :--- | :--- |
-| `web/dist/app.js:975` | Stale Comment | `// Clear filter when switching tabs` — actually runs on every `renderFileBrowser` call | Fix comment or guard the reset |
-| `web/dist/app.js:833,847,851,967` | XSS/Self-XSS | Paths, `data.error`, and alt text inserted via unescaped `innerHTML` | Build DOM nodes / escape HTML entities; never inject user-controlled strings raw |
-| `ARCHITECTURE.md` §3.4 + Startup diagram | Doc Drift | Route list documents only `/health /ws /files /commit /browse /*` — missing newer `/filetree /filecontent /filesearch /apps` handlers | Add the four handlers to the routes section |
-| `ARCHITECTURE.md:122-125` | Doc Nit | References `Notes.md` (actual file is `NOTES.md`) | Fix casing |
-| `AGENTS.md` §2 | Doc Drift | Directory map omits `shared_config.rs`, `git/watcher.rs`, `server/registry.rs`, `server/websocket.rs`, `server/static_files.rs`, `ui/remote.rs`, `ui/components/*` | Extend the map |
-| `NOTES.md`, `TASKS.md` | Historical | File-browser feature notes; all TASKS.md phases `[x]`, all requirements shipped (incl. selectedFilePath + Edit button) | Mark clearly as historical, or archive |
+| `src/ui/state.rs:184` | `update()` is **173 lines** — a single flat `match` over every `Message` variant | Largest function in the repo by 2×; every new message lengthens it further | Split into `handle_tab_message` / `handle_git_message` / `handle_dialog_message` sub-dispatchers |
+| `src/git/mod.rs:163` | `run_streamed()` is **95 lines** with 4 sequential fallback strategies | Hard to reason about which git error is swallowed | Extract one `try_diff(repo, args) -> Option<String>` helper per strategy |
+| `src/server/websocket.rs:170` | `SplitSink<WebSocket, Message>` passed as a bare generic parameter instead of `&mut` in one signature, while sibling code uses `&mut` | Inconsistent; invites aliasing mistakes | Normalise to `&mut` |
+| `src/git/history.rs:13-16, 173-176` | 9 `unwrap_or_default()` calls in git-output parsing | Acceptable here — git log formats vary and a lenient parse is correct — but worth a comment stating that intent so it is not "fixed" later | Add one explanatory comment per parse function |
 
----
+### 6. Comment Quality — Clean
 
-## Previously Reported — Now Resolved
-
-All findings from the 2026-08-23 audit are verified fixed:
-
-- **Web commit buttons** (`app.js:1576-1590`): were mislabeled — `commit-btn` staged everything (`CommitAll`) and `commit-push-btn` duplicated `stage-commit-push-btn`. Fixed 2026-09-05: new `CommitPush` action (commit staged + push) added end-to-end, `commit-btn` now sends staged-only `Commit`, `commit-push-btn` sends `CommitPush`.
-- **CloseTab remote bug**: `ui/state.rs` now sends `close_tab_payload(Some(id))`; daemon requires the id; tests cover both directions.
-- `ENABLED` kill-switch const removed from `actions.rs`; `.browser-actions` dead CSS removed; duplicate `commit-push-btn.onclick` assignment removed.
-- Test helpers consolidated into `src/test_support.rs` with unified retry constants (100×50ms + 20s receive); `init_repo`/`connect_with_retry`/`recv_state` no longer triplicated.
-- Single `epoch_millis`; poison-tolerant `TabRegistry.write_lock`; `HealthResponse` dropped the static `status` field in favor of real `tab_count`/`current_branch`/`change_count`.
-- Docs reconciled: README Reclone description, ARCHITECTURE startup/boot/sync_loop/watch_reconciler descriptions, port 5000.
+No stale comments, no commented-out blocks, no `dbg!`. The module docs in `src/git/files.rs:1-3`
+and `src/folio.rs:1-13` are accurate and usefully explain *why* code was removed. This is a
+well-maintained codebase on the documentation front.
 
 ---
 
 ## Top Priority Action Plan
 
-1. **[High]** Guard the raw `filecontent` read against path traversal; de-duplicate the SKIP const and the MIME/extension lists.
-2. **[Medium]** Make silent failure paths loud: `get_file_pair` original, `get_commit_summary`, `stash_files` — return structured `GitError` instead of `unwrap_or_default()`.
-3. **[Medium]** Surface-escape or DOM-build the four `innerHTML` injection points in `app.js`; extract the duplicated dropdown-builders and preview-reset helpers.
-4. **[Low]** Remove dead code: `shared_config.rs:227` dead conditional, `file-preview` id, `browserEl`, `tree-arrow`/`.log-entry.success` styling, `tab_button_style` dead branch, and fix the v-like stale comment / magic-number naming in the frontend.
-5. **[Low]** Delete or relocate `CONTEXT.md`; add the four missing routes to `ARCHITECTURE.md` and extend the `AGENTS.md` directory map.
+1. **[High]** Fix the desktop test build break at `src/ui/state.rs:802` — add the two missing
+   `RepoState` fields. Nothing else can be validated on `--features desktop` until this lands.
+2. **[High]** Apply the four trivial manifest changes that need no code edits: `tower-http` →
+   cors-only, `futures-util` → `default-features = false`, `tokio` off `full`, `tracing-subscriber`
+   off `env-filter`, and `tokio-tungstenite` → `0.29`. **~330 crates gone from the default build**
+   for a one-file diff.
+3. **[High]** Drop `iced`'s `linux-theme-detection` and `wgpu` in favour of `tiny-skia`. **-6995
+   crates (-36%)** on the desktop build, with no change to any UI behaviour.
+4. **[Medium]** Hand-roll the `.desktop` `TerminalEmulator` scan in `src/actions.rs` and delete
+   `freedesktop-desktop-entry`, eliminating the `gettext-sys` C build. ~40 lines of INI parsing,
+   and the repo already does this once at `actions.rs:707`.
+5. **[Medium]** Replace `clap` with a hand-rolled parser for the three flags in `src/main.rs`, and
+   drop `dirs` for two `std::env` lookups. Rewrite the two `Cli::parse_from` tests at `main.rs:144`.
+6. **[Medium]** Split `GritApp::update` (`src/ui/state.rs:184`, 173 lines) and
+   `run_streamed` (`src/git/mod.rs:163`, 95 lines).
+7. **[Low]** Update `ARCHITECTURE.md:13,17,19` and add `src/folio.rs` to the `AGENTS.md` §2 map;
+   archive `NOTES.md` / `TODO.md`.
+8. **[Low]** Switch `rfd::FileDialog` → `rfd::AsyncFileDialog` at `src/ui/state.rs:213` to stop
+   blocking an iced runtime worker on a modal dialog.
+
+---
+
+## Verification Notes
+
+- **Measured, not estimated.** Every crate-count figure was produced by copying `Cargo.toml`,
+  `Cargo.lock`, `src/`, and `web/` to a scratch directory, applying the candidate change, and running
+  `cargo tree --prefix none --no-dedupe`. The project's real `Cargo.toml` was never modified.
+- Counts are `--no-dedupe` line totals, so a change that shifts a version *within* an existing crate
+  (e.g. `rand 0.9` → `rand 0.10`) can move the total slightly while still removing distinct crates.
+  Where the line count and the distinct-crate set disagreed, the distinct-crate set is reported —
+  see the `tokio-tungstenite` and `rfd` rows.
+- Baseline established at commit `3544d39` with a clean working tree.
+- Suggested post-change gate: `cargo check`, `cargo check --features desktop --all-targets`
+  (currently broken — see §4), `cargo test`, and `cargo test --features desktop`.
+- Per `AGENTS.md`, do not restart the user's running `krust`/`grit` daemons; state what needs
+  restarting instead. Note also that `web/dist/*` is embedded at compile time, so a rebuild is
+  required for any frontend change to take effect.

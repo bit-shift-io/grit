@@ -1,5 +1,11 @@
 # Notes: File Browser Feature (Web UI)
 
+> **HISTORICAL — no longer implemented.** The in-process file browser was
+> removed; see the module doc in `src/git/files.rs:1-3`. File browsing now runs
+> through the external `folio` daemon (see `src/folio.rs`) plus the `/files`,
+> `/filetree`, and `/filecontent` HTTP routes. This document is kept only for
+> historical context and does not describe current behaviour.
+
 ## Confirmed Requirements
 
 - **Type**: Repository file tree browser (not full filesystem)

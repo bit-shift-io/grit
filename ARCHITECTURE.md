@@ -9,14 +9,14 @@
 **Project Goal:** A fast, native, single-binary Git client written in Rust that bridges desktop UI performance and embedded local web convenience. It operates simultaneously as a native desktop application (`Iced` GUI) and an embedded web server daemon (`Axum` over WebSockets).
 
 ### Key Technology Stack
-* **Language & Runtime:** Rust (latest stable), Tokio async runtime (`full` features)
-* **Desktop UI:** `Iced` (v0.14) with native rendering (`wgpu` / `winit`)
+* **Language & Runtime:** Rust (latest stable), Tokio async runtime (explicit feature set: `rt-multi-thread`, `macros`, `net`, `sync`, `time`, `io-util`)
+* **Desktop UI:** `Iced` (v0.14) with software rendering (`tiny-skia` / `winit`); no GPU backend, no system-theme detection
 * **Web Server Daemon:** `Axum` (with `ws`, `tokio`, `http1` features)
 * **Static Asset Embedding:** `rust-embed` (embeds static frontend assets into single compiled binary)
 * **FileSystem Watching:** `notify` (v8) monitoring `.git/` directory changes
-* **CLI Engine:** `clap` (v4+ with `derive` macro support)
+* **CLI Parsing:** hand-rolled in `src/main.rs` (three flags: `--headless`, `--port`, `--path`)
 * **Serialization:** `serde` & `serde_json`
-* **Logging/Tracing:** `tracing` & `tracing-subscriber`
+* **Logging/Tracing:** `tracing` & `tracing-subscriber` (`fmt` + `ansi` only)
 
 ### Core Design Principle: Single Writer
 
@@ -262,7 +262,7 @@ hidden when no scripts exist. The web UI exposes the same launcher inside
 ### Startup
 ```
 main.rs
-  ├── Parse CLI (clap: --headless, --port=5000 default, --path optional)
+  ├── Parse CLI (hand-rolled: --headless, --port=5000 default, --path optional)
   └── IF --headless (or GUI requested but no display server detected):
         └── Spawn Tokio runtime → server::run(registry)
               ├── boot(): restore-from-config-if-empty → watch_reconciler +

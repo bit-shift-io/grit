@@ -12,27 +12,113 @@ mod test_support;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
+const ABOUT: &str = env!("CARGO_PKG_DESCRIPTION");
 
-/// Fast, native, single-binary Git client.
-#[derive(Debug, Parser)]
-#[command(name = "grit", version, about)]
+/// Command-line options.
+#[derive(Debug, PartialEq)]
 struct Cli {
     /// Run the headless web daemon without the desktop GUI.
-    #[arg(long)]
     headless: bool,
-
     /// Port for the embedded web daemon.
-    #[arg(long, default_value_t = 5000)]
     port: u16,
-
     /// Repository path to open.
-    #[arg(long)]
     path: Option<PathBuf>,
 }
 
+/// What a parse produced: run with these options, or print text and exit 0.
+enum Parsed {
+    Run(Cli),
+    Print(String),
+}
+
+fn help_text() -> String {
+    format!(
+        "grit {}\n{}\n\n\
+         Usage: grit [OPTIONS]\n\n\
+         Options:\n\
+         \x20     --headless        Run the headless web daemon without the desktop GUI\n\
+         \x20     --port <PORT>     Port for the embedded web daemon [default: 5000]\n\
+         \x20     --path <PATH>     Repository path to open\n\
+         \x20 -h, --help            Print help\n\
+         \x20 -V, --version         Print version\n",
+        env!("CARGO_PKG_VERSION"),
+        ABOUT,
+    )
+}
+
+impl Cli {
+    /// Parses `argv`-style arguments, where index 0 is the program name.
+    /// `Err` carries a message to print after an `error: ` prefix.
+    fn parse_from<I, S>(args: I) -> Result<Parsed, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let argv: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
+        let mut cli = Cli {
+            headless: false,
+            port: 5000,
+            path: None,
+        };
+        let mut i = 1; // skip the program name
+        while i < argv.len() {
+            let arg = argv[i].clone();
+            let (name, inline) = match arg.split_once('=') {
+                Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                None => (arg.clone(), None),
+            };
+            match name.as_str() {
+                "-h" | "--help" => return Ok(Parsed::Print(help_text())),
+                "-V" | "--version" => {
+                    return Ok(Parsed::Print(format!(
+                        "grit {}\n",
+                        env!("CARGO_PKG_VERSION")
+                    )))
+                }
+                "--headless" => {
+                    if let Some(value) = inline {
+                        return Err(format!("unexpected value '{value}' for '--headless'"));
+                    }
+                    cli.headless = true;
+                }
+                "--port" | "--path" => {
+                    let value = match inline {
+                        Some(v) => v,
+                        None => {
+                            i += 1;
+                            argv.get(i).cloned().ok_or_else(|| {
+                                format!("a value is required for '{name}' but none was supplied")
+                            })?
+                        }
+                    };
+                    if name == "--port" {
+                        cli.port = value
+                            .parse()
+                            .map_err(|e| format!("invalid value '{value}' for '--port': {e}"))?;
+                    } else {
+                        cli.path = Some(PathBuf::from(value));
+                    }
+                }
+                _ => return Err(format!("unexpected argument '{arg}' found")),
+            }
+            i += 1;
+        }
+        Ok(Parsed::Run(cli))
+    }
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::parse_from(std::env::args()) {
+        Ok(Parsed::Run(cli)) => cli,
+        Ok(Parsed::Print(text)) => {
+            print!("{text}");
+            return ExitCode::SUCCESS;
+        }
+        Err(message) => {
+            eprintln!("error: {message}\n\nUsage: grit [OPTIONS]\n\nFor more information, try '--help'.");
+            return ExitCode::from(2);
+        }
+    };
     tracing_subscriber::fmt::init();
 
     let repo_path = resolve_path(cli.path.as_deref().unwrap_or(Path::new(".")));
@@ -41,7 +127,7 @@ fn main() -> ExitCode {
     {
         // Web-only build: everything runs headless.
         serve_headless(&cli, repo_path);
-        return ExitCode::SUCCESS;
+        ExitCode::SUCCESS
     }
 
     #[cfg(feature = "desktop")]
@@ -140,9 +226,16 @@ fn resolve_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> Cli {
+        match Cli::parse_from(args).expect("parse should succeed") {
+            Parsed::Run(cli) => cli,
+            Parsed::Print(_) => panic!("expected options, got help/version output"),
+        }
+    }
+
     #[test]
     fn parses_defaults() {
-        let cli = Cli::parse_from(["grit"]);
+        let cli = parse(&["grit"]);
         assert!(!cli.headless);
         assert_eq!(cli.port, 5000);
         assert!(cli.path.is_none());
@@ -150,10 +243,37 @@ mod tests {
 
     #[test]
     fn parses_headless_port_and_path() {
-        let cli = Cli::parse_from(["grit", "--headless", "--port", "9090", "--path", "/repo"]);
+        let cli = parse(&["grit", "--headless", "--port", "9090", "--path", "/repo"]);
         assert!(cli.headless);
         assert_eq!(cli.port, 9090);
         assert_eq!(cli.path, Some(PathBuf::from("/repo")));
+    }
+
+    #[test]
+    fn parses_inline_equals_values() {
+        let cli = parse(&["grit", "--port=9090", "--path=/repo"]);
+        assert_eq!(cli.port, 9090);
+        assert_eq!(cli.path, Some(PathBuf::from("/repo")));
+    }
+
+    #[test]
+    fn rejects_unknown_and_incomplete_flags() {
+        assert!(Cli::parse_from(["grit", "--nope"]).is_err());
+        assert!(Cli::parse_from(["grit", "--port"]).is_err());
+        assert!(Cli::parse_from(["grit", "--port", "not-a-number"]).is_err());
+        assert!(Cli::parse_from(["grit", "--headless=yes"]).is_err());
+    }
+
+    #[test]
+    fn help_and_version_short_circuit() {
+        assert!(matches!(
+            Cli::parse_from(["grit", "--help"]),
+            Ok(Parsed::Print(_))
+        ));
+        assert!(matches!(
+            Cli::parse_from(["grit", "-V"]),
+            Ok(Parsed::Print(_))
+        ));
     }
 
     #[test]

@@ -590,16 +590,18 @@ mod tests {
 
         // The "+" form is client-local now: no empty placeholder may appear.
         for _ in 0..10 {
-            match tokio::time::timeout(std::time::Duration::from_millis(60), ws.next()).await {
-                Ok(Some(Ok(Message::Text(text)))) => {
-                    let s: crate::server::registry::WebState =
-                        serde_json::from_str(&text).unwrap();
-                    assert!(
-                        s.tabs.iter().all(|t| !t.repo_path.is_empty()),
-                        "no placeholder tab may exist"
-                    );
-                }
-                _ => {}
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_millis(60),
+                ws.next(),
+            )
+            .await;
+            if let Ok(Some(Ok(Message::Text(text)))) = frame {
+                let s: crate::server::registry::WebState =
+                    serde_json::from_str(&text).unwrap();
+                assert!(
+                    s.tabs.iter().all(|t| !t.repo_path.is_empty()),
+                    "no placeholder tab may exist"
+                );
             }
         }
     }
@@ -631,18 +633,18 @@ mod tests {
         }
 
         for _ in 0..10 {
-            match tokio::time::timeout(std::time::Duration::from_millis(60), ws.next())
-                .await
-                .ok()
-                .flatten()
-            {
-                Some(Ok(Message::Text(text))) => {
-                    let s: crate::server::registry::WebState =
-                        serde_json::from_str(&text).unwrap();
-                    assert_eq!(s.tabs.len(), 1, "pathless NewTab must not create tabs");
-                    assert!(s.tabs.iter().all(|t| !t.repo_path.is_empty()));
-                }
-                _ => {}
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_millis(60),
+                ws.next(),
+            )
+            .await
+            .ok()
+            .flatten();
+            if let Some(Ok(Message::Text(text))) = frame {
+                let s: crate::server::registry::WebState =
+                    serde_json::from_str(&text).unwrap();
+                assert_eq!(s.tabs.len(), 1, "pathless NewTab must not create tabs");
+                assert!(s.tabs.iter().all(|t| !t.repo_path.is_empty()));
             }
         }
     }
