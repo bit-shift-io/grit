@@ -1,98 +1,206 @@
-# Maintainability Tasks: Refactors & Cleanup
+# Web UI Refactoring Plan
 
-> **Goal:** Reduce duplication, dead code, and unnecessary complexity across the codebase.
-> Each task keeps `cargo check` / `cargo check --features desktop` / `cargo test` green at every step.
->
-> Run `cargo test` after each Rust change. After JS edits, run the python3 syntax tokenizer.
+## Goal
+Refactor Grit's web UI for better maintainability by extracting modules and adding architectural documentation, following Tally's patterns while preserving all existing functionality. The web UI is hand-maintained (embedded via rust-embed), no build step - keep it simple.
 
----
+## Prerequisites
+- Understand current behavior: `web/dist/app.js` (1688 lines), `index.html`, `style.css`
+- No existing tests for web UI (it's hand-tested). Be careful not to change behavior.
+- All changes to `web/dist/*` require rebuild + restart to take effect (per AGENTS.md)
 
-## 1. Extract shared git-log parser in `src/git/history.rs`
+## Tasks
 
-`get_history` (lines 7–41) and `search_history` (lines 46–83) contain identical log-parsing logic — same `--format` string, same `splitn(4, '\t')`, same `CommitInfo` construction. Only the args and limit differ.
+### Task 1: Create common utilities module (common.js)
+Extract shared helpers used across the codebase.
 
-- [x] Create `fn parse_log_output(output: &str) -> Result<Vec<CommitInfo>, GitError>` that contains the shared parsing loop.
-- [x] Rewrite `get_history` to call `run(...)` then delegate to `parse_log_output`.
-- [x] Rewrite `search_history` to call `run(...)` then delegate to `parse_log_output`.
-- [x] Existing tests (`search_history_finds_commits_beyond_recent_window`, `search_history_handles_empty_repo`) cover both paths — run `cargo test`.
+**Files to create/modify:**
+- Create `web/dist/common.js`
 
-## 2. Reduce `get_commit_summary` from 4 git processes to 2
+**What to extract:**
+- Section toggle helpers: `toggleSection` (lines ~132-179 in app.js) - manages single expanded section invariant
+- URL helpers: `updateUrlView`, `updateUrlTab` (around line ~1596, ~1612, also updateUrlTab is used elsewhere)
+- DOM utilities if any shared patterns emerge
+- General helpers that don't depend on module-specific state
 
-`get_commit_summary` (`history.rs:173–214`) spawns 4 separate `git show` invocations: metadata (`-s --format=...`), `--shortstat`, `--name-status`, and `--numstat`. The metadata and shortstat can be combined; name-status and numstat can also be combined.
+**Implementation notes:**
+- Keep functions simple, export via global scope for now (or use ES modules). Prefer ES modules for cleanliness.
+- Document the single-expansion invariant in comments.
 
-- [x] Combine metadata + shortstat into one `git show -s --format=%an%x09%ct%x09%B --shortstat <hash>` — parse the first line for author/timestamp/message, then scan remaining lines for the shortstat line (same `parse_shortstat` function).
-- [~] Combine name-status + numstat into one `git show --format= --name-status --numstat <hash>` — **not possible**: git suppresses numstat output when `--name-status` is present, so the two stay as separate spawns. Total is 3 processes, not 2.
-- [x] The test `get_commit_summary_lists_changed_files` and `get_commit_summary_reports_stats` already cover this — run `cargo test`.
+### Task 2: Extract diff rendering module (diff.js)
+Largest self-contained chunk - extract diff/LCS logic.
 
-## 3. Add `revision` field to `WebState` — replace `JSON.stringify` deep-equality in app.js
+**Files to create/modify:**
+- Create `web/dist/diff.js`
 
-`app.js:258–262` serializes the entire state tree on every WebSocket message to detect no-ops. `TabRegistry` already tracks a `revision: AtomicU64` counter that increments on every mutation, but it's not in `WebState`.
+**What to extract (from app.js):**
+- `showDiff(detailEl, tab, path)` (line ~1175)
+- `renderFilePair(detailEl, pair)` (line ~1198)
+- `splitLines(text)` (line ~1219)
+- `alignLines(a, b)` (line ~1227)
+- `renderSideBySide(leftText, rightText)` (around ~1340+)
+- `renderDiffRow(row)` (around ~1365+)
+- `renderChunk(leftLines, rightLines, start, end, leftType, rightType)` (around ~1420+)
+- Any related helpers (DIFF_MARKER_RATIO, LCS_DIFF_CELL_CAP constants used)
 
-### Rust side
-- [x] Add `pub revision: u64` to `WebState` in `src/server/registry.rs:27` with `#[serde(default)]`.
-- [x] In `TabRegistry::set()` (line 142) and `modify()` (wherever revision bumps), stamp the revision into the `WebState` before sending.
-- [x] In `snapshot()`, read the current revision and include it.
+**Dependencies/coupling:**
+- Uses `pairCache` (Map) - could keep as global or pass reference. Better to keep minimal coupling; pairCache lives in app.js state.
+- Uses constants from core.
 
-### JS side
-- [x] In `app.js` `handleStateMessage`, compare `state.revision === lastRevision` (a simple integer) instead of `JSON.stringify(prev) === JSON.stringify(state)`. Store the revision as `lastRevision` global.
-- [x] Remove the old `prev`/`lastState` stringify check. Keep `lastState = state` for other consumers.
-- [x] `cargo check`, `cargo test` pass. All 148 tests green.
+**Implementation notes:**
+- This is mostly pure logic + DOM construction - good candidate for extraction.
+- Add file-level comment explaining diff approach (side-by-side, LCS for alignment, chunking with DIFF_MARKER_RATIO).
 
-## 4. Unify expand/collapse state in `app.js`
+### Task 3: Create core module (core.js)
+Extract WebSocket, connection, core state, message handling.
 
-Five globals (`expandedKey`, `expandedDetailEl`, `expandedCommitKey`, `expandedCommitEl`, `expandedStashKey`) at lines 86–90 manage three independent expand/collapse sections with inconsistent patterns.
+**Files to create/modify:**
+- Create `web/dist/core.js`
 
-- [x] Replace all five with a single `let expanded = { type: null, key: null, el: null }` object.
-- [x] Create `function toggleSection(type, key, el, renderFn)` that checks `expanded.type === type && expanded.key === key` → collapse, otherwise → expand.
-- [x] Update `addChangeRow` (file expand), `renderCommitDetail` (commit expand), and stash toggle to use the unified `expanded` object and `toggleSection`.
-- [x] The branch filter and other render paths that check `expandedDetailEl` / `expandedCommitEl` for null-guarding → check `expanded.type`.
+**What to extract:**
+- Constants: RECONNECT_*, SCROLL_HIT_SLACK_PX, DIFF_MARKER_RATIO, LCS_DIFF_CELL_CAP, HISTORY_SEARCH_*, BRANCH_FILTER_DEBOUNCE_MS, KRUST_BASE, KRUST_PROBE_MS, KRUST_SESSIONS, FOLIO_BASE (lines 1-79)
+- WebSocket management: `ws`, `reconnectTimer`, `reconnectDelayMs`, `scheduleReconnect()`, `openSocket()`, `setConnStatus()`, `sendRaw()` (lines ~26-79)
+- Global state: `activeTabId`, `lastState`, `lastRevision`, `expanded`, `awaitingNewTab`, `browser`, `clearedUpToSeq`, `showAddForm`, `activeView`, `historyQuery`, `historySearchTimer`, `knownTabIds`, `commitCache`, `pairCache` (lines ~83-137)
+- Message handling: `handleStateMessage()` (lines ~254-320)
+- Core helpers: `sendAction()`, `activeTab()` (lines ~324-338)
 
-## 5. Extract shared `probeExternalService` helper in `app.js`
+**Implementation notes:**
+- Keep state in module scope (or attach to window if mixing with non-module code). With ES modules, use module scope and export what's needed.
+- Document key invariants: server is source of truth via WS pushes, revision-based render suppression, single expanded section, exactly one active view.
 
-`probeFolio` (lines 700–712) and `probeKrust` (lines 1646–1661) are near-identical: try/catch fetch, set availability flag, hide fallback button if down.
+### Task 4: Create views module (views.js)
+Extract view switching and dock logic.
 
-- [x] Create `async function probeExternal(name, url, fallbackView, onResult)` where `onResult(boolean)` handles the UI updates specific to each service.
-- [x] `probeFolio` becomes: `probeExternal("folio", FOLIO_BASE, "dashboard", ok => { folioAvailable = ok; if (!ok && activeView === "files") setView("dashboard"); })`.
-- [x] `probeKrust` becomes: `probeExternal("krust", KRUST_BASE, "dashboard", ok => { krustAvailable = ok; document.querySelectorAll(".krust-btn").forEach(b => b.style.display = ok ? "" : "none"); if (!ok && activeView === "term-1") setView("dashboard"); })`.
+**Files to create/modify:**
+- Create `web/dist/views.js`
 
-## 6. Deduplicate branch-current check in `app.js`
+**What to extract:**
+- `showView(view)` (line ~1553)
+- `updateUrlView(view)` (line ~1596)
+- `setView(view)` (line ~1612)
+- `probeExternal()` (line ~1630+)
+- krust/folio frame management: `ensureKrustFrame()`, `ensureFolioFrame()`, related helpers (around ~1650+)
+- View-related event handlers
 
-Lines 502–514 evaluate `branch === current || checkoutName === current` twice in `addBranchRow`.
+**Implementation notes:**
+- Depends on core state (activeView) and DOM elements.
 
-- [x] Compute `const isCurrent = branch === current || checkoutName === current;` once.
-- [x] Use `isCurrent` for both the button-disable block and the "current" label block.
+### Task 5: Create tabs module (tabs.js)
+Extract tab bar and add-repo form.
 
-## 7. Remove dead code (3 items)
+**Files to create/modify:**
+- Create `web/dist/tabs.js`
 
-- [x] **Delete `updateDockBadges`** function body at `app.js:1591–1593` — empty function, never called.
-- [x] **Delete orphaned doc comment** at `src/server/mod.rs:78` — `/// Expands a leading '~'...` sits alone with no function below it.
-- [x] **`AppState::new` `#[allow(dead_code)]`** at `src/server/mod.rs:45` — verified: used in 6 places (test_support.rs, websocket.rs, handlers.rs, static_files.rs, ui/remote.rs). All callers are behind the same `#[cfg(any(test, feature = "desktop"))]` gate, so the `#[allow(dead_code)]` is correct. **No change needed.**
+**What to extract:**
+- `getTabNameFromPath()` (line ~185)
+- `setupAddRepoForm()` (line ~195+)
+- `renderTabBar()` and related tab rendering (earlier in file - look around where tabs rendered)
+- Tab-related helpers
 
-## 8. Trim `knownTabIds` after adoption
+**Note:** Need to locate full `renderTabBar` function in original file.
 
-`app.js:256` adds every tab id to `knownTabIds` Set, but never removes them. The set grows unboundedly and is only used to detect newly-appeared tabs (line 247).
+### Task 6: Create changes module (changes.js)
+Extract staging, commit UI, change rows.
 
-- [x] ~~**Trim `knownTabIds`**~~ — **CANCELLED**: the Set grows unboundedly, but it's only used to detect newly-appeared tabs on the (now cheap) revision-counter path. Task 3 makes it moot.
+**Files to create/modify:**
+- Create `web/dist/changes.js`
 
-## 9. Group `browserDir`/`browserParent`/`browserSeeding` into object
+**What to extract:**
+- `appendChangeRow()` (line ~900+)
+- `toggleCommitActions()`, `buildCommitActions()` (around ~960+)
+- `renderScriptRunner()`, script execution (earlier sections)
+- Staging/commit/discard action handlers
 
-Three separate globals at `app.js:93–95` manage folder browser state.
+### Task 7: Create history module (history.js)
+Extract history rendering and search.
 
-- [x] Replace with `let browser = { dir: null, parent: null, seeding: false }`.
-- [x] Update all references (`browserDir` → `browser.dir`, etc.).
+**Files to create/modify:**
+- Create `web/dist/history.js`
 
-## Verification
+**What to extract:**
+- `renderHistory()` and related helpers (around ~400-550 range based on earlier grep)
+- History search logic, RECENT_COMMIT_COUNT constant usage
+- Commit details expansion
 
-- [x] `cargo check` — clean
-- [x] `cargo check --features desktop` — clean
-- [x] `cargo test` — all 141 tests pass
-- [x] JS syntax check on `web/dist/app.js`
-- [x] Start headless daemon, open web UI, test: switch tabs, expand file/commit/stash sections, toggle projects, verify dashboard doesn't jump to stale sub-view — **done via automated smoke test**: built fresh, confirmed `/` + `/app.js` served byte-identical to the refactored working tree (markers: `probeExternal`, `toggleSection`, `browser.dir`; old globals absent), `/browse` API round-trips, and WebSocket round-trip verified revision counter lives (31→32→39→40), `NewTab` adds tab 5 then `CloseTab` removes it, state restored. Browser-only interactions (physical click expand/section-switch) can't be automated here and were covered by cargo/js checks.
+### Task 8: Create branches-stashes module (branches-stashes.js)
+Extract branches and stashes.
 
----
+**Files to create/modify:**
+- Create `web/dist/branches-stashes.js`
 
-## Previously Completed
+**What to extract:**
+- `renderBranches()`, branch filtering, create branch (around ~670+)
+- `renderStashes()`, create stash, stash actions (around ~1480+)
+- Branch filter debounce logic
 
-> View state refactor (2026-09-10) — removed forceView/lastViewRepo/localStorage restore, simplified setView/showView, added URL deep-link support.
+### Task 9: Create log module (log.js)
+Extract log rendering.
 
-> Module splits and test hardening (2026-09-05) — all shipped, `cargo test` 148 passed.
+**Files to create/modify:**
+- Create `web/dist/log.js`
+
+**What to extract:**
+- `renderLog()` (around ~770+)
+- Clear log handler (`document.getElementById("clear-log-btn").onclick` at ~850+)
+
+### Task 10: Create terminals module (terminals.js)
+Extract krust/folio specific logic not in views.
+
+**Files to create/modify:**
+- Create `web/dist/terminals.js`
+
+**What to extract:**
+- Krust session management details
+- Frame URL construction, reset logic
+- Terminal-specific helpers
+
+### Task 11: Create main entry point (main.js) and update index.html
+Tie everything together.
+
+**Files to modify/create:**
+- Create `web/dist/main.js` - imports modules, initializes app, wires up global event listeners, calls `openSocket()`, sets up global handlers that span modules
+- Update `web/dist/index.html` to load via ES modules: `<script type="module" src="/main.js"></script>`
+
+**What moves to main:**
+- Global event listeners not specific to a module (visibilitychange, pageshow - lines ~66-79)
+- Keydown handler (line ~1645+)
+- Initial `openSocket()` call (line ~79)
+- App initialization and coordination
+
+**HTML changes:**
+```html
+<script type="module" src="/main.js"></script>
+```
+Instead of `<script src="/app.js"></script>`
+
+### Task 12: Preserve original app.js as reference (optional) or remove after verification
+Don't delete immediately. Keep `app.js.bak` or just verify behavior first.
+
+### Task 13: Add architectural comments
+Add file-level comments to each new module following Tally's style:
+- Purpose, responsibilities
+- Key invariants
+- Design decisions
+- "Why" explanations for non-obvious choices
+
+### Task 14: Verify and rebuild
+- Ensure no behavior changes (functionality identical)
+- After changes, rebuild with cargo (web assets embedded at compile time)
+- Test key flows: connect, add repo, view changes, diff, history, branches, terminals
+- Verify `cargo check` passes
+
+## Implementation strategy
+
+1. **Incremental approach**: Extract modules one by one. After each extraction, we could in theory load both, but easier to build up main.js that imports from modules and also temporarily keep functions in app.js? Or better: create modules, move code, update main. But since it's one SPA and we're restructuring, better to do it systematically.
+
+2. **Use ES modules**: Cleanest, no global namespace pollution. All modules export what main needs, main imports. This matches modern practices and is fine for hand-maintained files served by Axum.
+
+3. **Handle shared state**: State lives in core.js (module scope). Other modules import from core or receive state as parameters. Many rendering functions take `(state, tab, ...)` as params already - that’s good design, makes extraction easier.
+
+4. **Preserve exact behavior**: Don't change logic, just move code. Copy-paste carefully, keep same variable names, same DOM operations.
+
+5. **Order of extraction**: Extract diff.js first (isolated), then core.js (foundation), then others, then wire up main.js and update index.html.
+
+## Notes
+- AGENTS.md says web/dist/* is embedded at compile time - rebuild required after changes.
+- No build tools/linter available for JS - rely on careful manual review and Python tokenizer if needed for syntax checks (as mentioned in AGENTS.md).
+- Don't restart running daemons unless asked - user restarts himself.
