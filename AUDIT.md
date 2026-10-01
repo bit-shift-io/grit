@@ -1,13 +1,17 @@
 # Codebase Audit Summary
 
 **Audit Target:** `grit` (`/home/bronson/Projects/grit`)
-**Date:** 2026-09-05
+**Date:** 2026-10-01
 
 ---
 
 ## Executive Summary
 
 Grit is in healthy shape: both the web-only default build and the `desktop` feature build pass `cargo check` with **zero warnings**, all 2026-08-23 findings have been resolved, and tests are rich and well-organized. The one functional risk is in the web UI — three commit buttons collapse into effectively two behaviors, and neither of the two "staged" buttons actually commits only staged changes (both run `git add -A`), with no staged-only wire action existing in the `GitAction` enum. Secondary risks are moderate duplication (SKIP/ext lists, file-op handlers, frontend dropdown/preview helpers), a handful of robustness nits (silent `unwrap_or_default` paths, an unguarded raw file read), and one orphaned document (`CONTEXT.md`) that is a glossary for an unrelated game project.
+
+A comparative audit of Tally's web UI (which recently underwent its own web refactor) surfaced additional hardening opportunities: ARIA attribute gaps on rollup elements, arrow-direction inconsistency, CSS duplication risk, and missing tests for initial rollup state. Grit's single-page architecture avoids Tally's fragmentation problem, but the rollup component still needs the same accessibility and consistency hardening to prevent drift as Grit grows.
+
+---
 
 ## Key Metrics
 
@@ -16,6 +20,8 @@ Grit is in healthy shape: both the web-only default build and the `desktop` feat
 - **Commented-Out Code / Debug Logs:** 0
 - **Open TODOs/FIXMEs:** 0
 - **Compiler Warnings:** 0 (both `cargo check` and `cargo check --features desktop`)
+- **Rollup ARIA Coverage:** Partial — `aria-expanded` missing on initial load
+- **Rollup Arrow Consistency:** Mixed — ▲ vs ▶ depending on context
 
 ---
 
@@ -25,7 +31,7 @@ Grit is in healthy shape: both the web-only default build and the `desktop` feat
 
 | File Path | Type | Details | Recommended Action |
 | :--- | :--- | :--- | :--- |
-| `CONTEXT.md` | Orphan File | 33KB glossary of terms for an unrelated 2D platformer game (kill zone, drawbridge, GameAPI, NPC cage objectives…) — zero relation to Grit | Remove or move out of the repo |
+| `CONTEXT.md` | Orphan File | 33KB glossary of terms for an unrelated 2D platformer (kill zone, drawbridge, GameAPI, NPC cage objectives…) — zero relation to Grit | Remove or move out of the repo |
 | `src/shared_config.rs:227` | Dead Code | `let active = if tabs.is_empty() { 0 } else { 0 };` — both branches yield `0`, variable value never varies | Replace with plain `let active = 0;` |
 | `web/dist/index.html:79` | Dead DOM id | `id="file-preview"` never referenced by id in `app.js` (only descendants `preview-header`/`preview-content` are used) | Remove the id or query it deliberately |
 | `web/dist/app.js:107` | Dead Local | `browserEl` declared but never used | Remove |
@@ -62,6 +68,57 @@ Grit is in healthy shape: both the web-only default build and the `desktop` feat
 
 ---
 
+### 4. Web UI Audit — Tally Comparison
+
+A comparative audit of Tally's recent web refactor surfaced hardening opportunities for Grit's rollup component. Tally's refactor was driven by real defects; Grit can adopt the fixes proactively.
+
+#### 4.1 ARIA Attribute Gaps (Critical)
+
+Tally's rollup elements had no `aria-expanded` on initial load — screen readers reported undefined state for the actual loaded state. Grit's `toggleSection` / `wireRollup` logic initializes state reactively (on click), not at wire time.
+
+**Fix:** Initialize ARIA on every rollup header at wire time:
+```javascript
+header.setAttribute('role', 'button');
+header.setAttribute('tabindex', '0');
+header.setAttribute('aria-expanded', 'true');   // initial state = expanded
+header.setAttribute('aria-controls', body.id);
+```
+
+#### 4.2 Arrow Direction Inconsistency (High)
+
+Tally used ▲ (up) for closed and ▶ (right) for open on some pages, and the opposite on others — a genuine split-brain, not a load-order bug. Grit's rollup arrow logic lives in one place, but the CSS class toggles (`collapsed` / not) must map to a single semantic convention.
+
+**Fix:** Standardize on CSS-controlled arrows:
+```css
+.section-title .arrow::before { content: "▼"; }          /* open */
+.section.collapsed .section-title .arrow::before { content: "▶"; }  /* closed */
+```
+
+#### 4.3 CSS Duplication Risk (Medium)
+
+Tally duplicated `.hint` and `code` rules across `style.css`, and had unused `--grid-header-hover` in both colour schemes. Grit currently keeps all CSS in one file — this is fine for now, but splitting into logical modules (`base.css`, `components.css`, `diff.css`) prevents the duplication that creeps in as Grit grows.
+
+**Fix:** No action needed yet; add a `CONTRIBUTING.md` note that new CSS rules go in the relevant module, not appended to `style.css`.
+
+#### 4.4 Test Coverage for Rollup State (Medium)
+
+Tally had zero tests pinning the initial collapsed state or the arrow glyph — all regressed silently. Grit's integration tests cover server state but not the initial DOM/ARIA of rollup elements.
+
+**Fix:** Add a test (or manual checklist) that verifies:
+- Rollups render expanded by default with `aria-expanded="true"`
+- Arrow glyph points down (`▼`) when expanded, right (`▶`) when collapsed
+- Clicking toggles both attributes in sync
+
+#### 4.5 Card Component Semantics (N/A for Grit)
+
+Tally's `.card` class served dual purposes (page link vs. expander) — a semantic ambiguity that caused cascade bugs. Grit does not use a `.card` component; its rollup `.section` pattern is clean and unambiguous. **No action needed** — Grit's single-page architecture avoids this entirely.
+
+#### 4.6 Rollups as Sibling of `main` (N/A for Grit)
+
+Tally's `#toolbar` was a rollup sibling of `main`, requiring special-case CSS to reach it. Grit's structure keeps all rollups inside `main` — no special casing needed. **No action needed.**
+
+---
+
 ## Previously Reported — Now Resolved
 
 All findings from the 2026-08-23 audit are verified fixed:
@@ -77,8 +134,19 @@ All findings from the 2026-08-23 audit are verified fixed:
 
 ## Top Priority Action Plan
 
-1. **[High]** Guard the raw `filecontent` read against path traversal; de-duplicate the SKIP const and the MIME/extension lists.
-2. **[Medium]** Make silent failure paths loud: `get_file_pair` original, `get_commit_summary`, `stash_files` — return structured `GitError` instead of `unwrap_or_default()`.
-3. **[Medium]** Surface-escape or DOM-build the four `innerHTML` injection points in `app.js`; extract the duplicated dropdown-builders and preview-reset helpers.
-4. **[Low]** Remove dead code: `shared_config.rs:227` dead conditional, `file-preview` id, `browserEl`, `tree-arrow`/`.log-entry.success` styling, `tab_button_style` dead branch, and fix the v-like stale comment / magic-number naming in the frontend.
-5. **[Low]** Delete or relocate `CONTEXT.md`; add the four missing routes to `ARCHITECTURE.md` and extend the `AGENTS.md` directory map.
+### Immediate (Critical)
+1. **[High]** Add `aria-expanded`, `role="button"`, `tabindex="0"`, `aria-controls` to rollup headers at wire time — prevents screen-reader state mismatch.
+2. **[High]** Standardize rollup arrow glyphs — `▼` open / `▶` closed via CSS only; remove any inline arrow characters from JS.
+
+### Short-Term (High)
+3. **[High]** Guard the raw `filecontent` read against path traversal; de-duplicate the SKIP const and the MIME/extension lists.
+4. **[Medium]** Make silent failure paths loud: `get_file_pair` original, `get_commit_summary`, `stash_files` — return structured `GitError` instead of `unwrap_or_default()`.
+5. **[Medium]** Add rollup initial-state test coverage (ARIA attributes, arrow direction, click toggle sync).
+
+### Medium-Term (Medium)
+6. **[Medium]** Surface-escape or DOM-build the four `innerHTML` injection points in `app.js`; extract the duplicated dropdown-builders and preview-reset helpers.
+7. **[Low]** Remove dead code: `shared_config.rs:227` dead conditional, `file-preview` id, `browserEl`, `tree-arrow`/`.log-entry.success` styling, `tab_button_style` dead branch, and fix the v-like stale comment / magic-number naming in the frontend.
+
+### Long-Term (Low)
+8. **[Low]** Delete or relocate `CONTEXT.md`; add the four missing routes to `ARCHITECTURE.md` and extend the `AGENTS.md` directory map.
+9. **[Low]** Consider CSS module split (`base.css`, `components.css`, `diff.css`) once the codebase grows past ~2000 lines.

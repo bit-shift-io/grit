@@ -11,9 +11,9 @@
   <nav id="tabs"></nav>
   <div class="app-layout">
     <main>
-      <section id="actions" class="section" style="display: none;">
-    <h2 class="section-title">Actions <span class="arrow">&#9662;</span></h2>
-    <div class="section-body">
+       <section id="actions" class="section" style="display: none;">
+     <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="actions-body">Actions <span class="arrow"></span></h2>
+     <div class="section-body" id="actions-body">
       <div class="action-row">
         <button id="pull-btn" title="Fetch remote changes and merge them into the current branch">Pull</button>
         <button id="push-btn" title="Push local commits to the remote">Push</button>
@@ -27,8 +27,8 @@
     </div>
   </section>
   <section id="add-repo-form" class="section" style="display: none;">
-      <h2 class="section-title">Add Repository <span class="arrow">&#9662;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="add-repo-form-body">Add Repository <span class="arrow"></span></h2>
+      <div class="section-body" id="add-repo-form-body">
         <div class="form-group">
           <label for="new-repo-path">Directory</label>
           <input id="new-repo-path" type="text" placeholder="~/projects/my-repo">
@@ -57,8 +57,8 @@
       </div>
     </section>
     <section id="repo-view" class="section" style="display: none;">
-      <h2 class="section-title"><span>Changes <span id="overview" class="muted"></span></span><span class="arrow">&#9662;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="repo-view-body"><span>Changes <span id="overview" class="muted"></span></span><span class="arrow"></span></h2>
+      <div class="section-body" id="repo-view-body">
         <div class="commit-bar">
           <input id="commit-msg" type="text" placeholder="Commit message">
           <button id="stage-commit-push-btn" title="Stage all changes, commit, and push to remote">Stage All + Commit + Push</button>
@@ -73,8 +73,8 @@
       <iframe id="folio-frame" class="folio-frame" title="Files" allow="clipboard-read; clipboard-write"></iframe>
     </section>
     <section id="branches-section" class="section collapsed" style="display: none;">
-      <h2 class="section-title"><span>Branches <span id="branch-subtitle" class="muted"></span></span><span class="arrow">&#9652;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="false" aria-controls="branches-section-body"><span>Branches <span id="branch-subtitle" class="muted"></span></span><span class="arrow"></span></h2>
+      <div class="section-body" id="branches-section-body">
         <div class="branch-toolbar">
           <input id="branch-filter" type="text" placeholder="New branch name or search">
           <button id="create-branch-btn" title="Create a branch from HEAD with this name">+ Branch</button>
@@ -83,8 +83,8 @@
       </div>
     </section>
     <section id="stashes-section" class="section collapsed" style="display: none;">
-      <h2 class="section-title"><span>Stashes <span id="stash-subtitle" class="muted"></span></span><span class="arrow">&#9652;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="false" aria-controls="stashes-section-body"><span>Stashes <span id="stash-subtitle" class="muted"></span></span><span class="arrow"></span></h2>
+      <div class="section-body" id="stashes-section-body">
         <div class="stash-toolbar">
           <input id="stash-input" type="text" placeholder="Stash message (optional)">
           <button id="create-stash-btn" title="Stash all current changes">+ Stash</button>
@@ -93,15 +93,15 @@
       </div>
     </section>
     <section id="history-section" class="section collapsed" style="display: none;">
-      <h2 class="section-title">History <span class="arrow">&#9652;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="false" aria-controls="history-section-body">History <span class="arrow"></span></h2>
+      <div class="section-body" id="history-section-body">
         <input id="history-search" type="text" placeholder="Search full history (hash, author, message)">
         <div id="history"></div>
       </div>
     </section>
     <section id="log-section" class="section collapsed" style="display: none;">
-      <h2 class="section-title">Log <span class="arrow">&#9652;</span></h2>
-      <div class="section-body">
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="false" aria-controls="log-section-body">Log <span class="arrow"></span></h2>
+      <div class="section-body" id="log-section-body">
         <div id="log"></div>
       </div>
     </section>

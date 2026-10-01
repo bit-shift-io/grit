@@ -1186,7 +1186,7 @@ async function showDiff(detailEl, tab, path) {
     pairCache.set(key, pair);
     renderFilePair(detailEl, pair);
   } catch (err) {
-    detailEl.textContent = `Failed to load diff: ${err}`;
+    detailEl.textContent = "Failed to load diff: " + err;
   }
 }
 
@@ -1458,9 +1458,11 @@ document.getElementById("history-search").addEventListener("input", (event) => {
 document.querySelectorAll(".section-title").forEach((title) => {
   title.onclick = () => {
     const section = title.parentElement;
+    const isExpanded = !section.classList.contains("collapsed");
     section.classList.toggle("collapsed");
-    const arrow = title.querySelector(".arrow");
-    arrow.innerHTML = section.classList.contains("collapsed") ? "&#9652;" : "&#9662;";
+    // Update ARIA attributes
+    title.setAttribute("aria-expanded", String(!isExpanded));
+    // Arrow is now controlled via CSS ::before pseudo-element
   };
 });
 

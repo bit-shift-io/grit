@@ -47,7 +47,8 @@ main { flex: 1; min-width: 0; min-height: 0; }
 .section-title:hover { background: var(--section-hover, #d0d0d0); }
 .section-title .arrow { font-size: 0.8rem; color: var(--muted, #888); }
 .section.collapsed .section-body { display: none; }
-.section-body { padding: 0.5rem 0; }
+.section.collapsed .section-title .arrow::before { content: "▶"; }
+.section:not(.collapsed) .section-title .arrow::before { content: "▼"; }
 
 #tabs {
   display: flex;

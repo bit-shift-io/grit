@@ -146,11 +146,17 @@ ids come from one monotonic allocator and are never reused within a session.
   paths whose `.git` no longer exists). The server is the sole writer of this file.
 
 ### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
-* **Routes**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
+* **`routes`**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
   `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
   the add-repo form), `/filetree?tab=&path=` (file browser listing), `/filecontent?tab=&path=&raw=`
   (lazy preview content; `raw` serves literal file bytes), `/filesearch?tab=&q=` (case-insensitive
   file name search), `/apps?path=` (external editor apps for a file), `/*` embedded static assets.
+* **Rollup ARIA hardening**: All `.section-title` elements must have `role="button"`,
+  `tabindex="0"`, and `aria-expanded` initialized at wire time. Initial state is
+  expanded (`aria-expanded="true"`), and arrow direction is controlled via CSS
+  `::before` pseudo-element (`▼` when open, `▶` when closed). This prevents screen
+  readers from reporting undefined state and ensures consistent visual semantics
+  across all pages — addressing lessons learned from Tally's recent web refactor.
 * **`boot(registry)`**: restores tabs from config **only if the registry is empty**
   (then re-persists the healed state), spawns the `watch_reconciler`, and starts
   the persist task (writes config on every registry change). It then kicks off a
