@@ -1643,7 +1643,7 @@ function sessionIdFor(sess) {
 }
 
 function krustFrameSrc(sess, sid) {
-  return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}`;
+  return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}&r=2d`;
 }
 
 function ensureKrustFrame(sess) {
