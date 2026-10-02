@@ -6,6 +6,12 @@ const HISTORY_LIMIT: &str = "50";
 
 /// Parses tab-separated `--format=%H%x09%an%x09%ct%x09%s` log output into
 /// `CommitInfo` entries. Shared by both `get_history` and `search_history`.
+///
+/// The `unwrap_or_default()` calls below are intentional: git log output is
+/// user-controlled (commit messages may contain tabs, odd author names, or
+/// empty fields), so a malformed line should yield a leniently-parsed commit
+/// rather than an error. An empty `hash` is the only case treated as
+/// unusable, and it is skipped below. Do not convert these to `expect()`.
 fn parse_log_output(output: &str) -> Result<Vec<CommitInfo>, GitError> {
     let mut history = Vec::new();
     for line in output.lines() {
@@ -170,6 +176,9 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
     };
 
     let mut lines = meta_body.lines();
+    // Lenient by design: `git show` output varies with user config (encoding,
+    // gpg signature blocks, mailmap), so a missing or short header field
+    // yields an empty value instead of failing the whole commit summary.
     let header = lines.next().unwrap_or_default();
     let mut parts = header.splitn(3, '\t');
     let author = parts.next().unwrap_or_default().to_string();
@@ -189,6 +198,9 @@ pub fn get_commit_summary(repo_path: &Path, hash: &str) -> Result<CommitSummary,
     // Combined name-status + numstat: one git process instead of two.
     // NOTE: `git show --name-status --numstat` suppresses numstat, so we
     // keep them as separate invocations.
+    // `unwrap_or_default()` here is deliberate: a missing stats side (e.g. a
+    // hash that no longer resolves) should render a commit detail pane with
+    // whatever files data exists, not fail the whole summary.
     let name_status = run(git_command(repo_path).args(["show", "--format=", "--name-status", hash]))
         .unwrap_or_default();
     let numstat = run(git_command(repo_path).args(["show", "--format=", "--numstat", hash]))

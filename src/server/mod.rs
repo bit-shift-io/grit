@@ -372,8 +372,8 @@ mod tests {
     #[tokio::test]
     async fn sync_loop_idles_when_refresh_channel_closes() {
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
-        let app = app_for(&dir.path().to_path_buf());
+        init_repo(dir.path());
+        let app = app_for(dir.path());
 
         // Simulate every watcher dying: the refresh channel closes up-front.
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
@@ -402,9 +402,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
         let (_refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
-        let _server = run_server(listener, app_for(&dir.path().to_path_buf()), refresh_rx);
+        let _server = run_server(listener, app_for(dir.path()), refresh_rx);
 
         assert!(is_daemon_running(port).await);
 
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn ws_route_requires_websocket_upgrade() {
         let dir = tempfile::tempdir().unwrap();
-        let app = app_for(&dir.path().to_path_buf());
+        let app = app_for(dir.path());
         let router = build_router(app);
 
         let response = router
@@ -442,7 +442,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
 
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -507,7 +507,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
 
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -583,7 +583,7 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", cfg_dir.path());
 
         let dir = tempfile::tempdir().unwrap();
-        init_repo(&dir.path().to_path_buf());
+        init_repo(dir.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -648,9 +648,9 @@ mod tests {
             .output()
             .unwrap();
         let seed = tempfile::tempdir().unwrap();
-        init_repo(&seed.path().to_path_buf());
+        init_repo(seed.path());
         std::fs::write(seed.path().join("a.txt"), "v1\n").unwrap();
-        commit_all(&seed.path().to_path_buf(), "seed");
+        commit_all(seed.path(), "seed");
         std::process::Command::new("git")
             .args(["push", "-q", bare.to_str().unwrap(), "main"])
             .current_dir(seed.path())

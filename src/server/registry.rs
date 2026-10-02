@@ -24,6 +24,7 @@ pub struct WebTab {
 
 /// The full set of open tabs, broadcast to connected web clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct WebState {
     pub active: usize,
     pub tabs: Vec<WebTab>,
@@ -33,15 +34,6 @@ pub struct WebState {
     pub revision: u64,
 }
 
-impl Default for WebState {
-    fn default() -> Self {
-        Self {
-            active: 0,
-            tabs: Vec::new(),
-            revision: 0,
-        }
-    }
-}
 
 /// Shared registry that both the desktop GUI and web server read/write.
 #[derive(Debug)]

@@ -29,9 +29,10 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
 
 ## 2. Directory Map & Component Roles
 
-* **`src/main.rs`**: Entry point parsing CLI parameters via `clap`. Boots background Tokio tasks and conditionally launches the `Iced` main thread GUI.
-* **`src/actions.rs`**: Script discovery (`discover()`) and terminal-window launching (`launch()`) for one-click script runs; probes `$TERMINAL`/`TERM_PROGRAM`/`/proc` ancestors/`xdg-terminal-exec`/desktop entries with a `GRIT_NO_TERMINAL` test hook.
+* **`src/main.rs`**: Entry point parsing CLI parameters via a hand-rolled parser in the same file (`--headless`, `--port`, `--path`, `--help`, `--version`). Boots background Tokio tasks and conditionally launches the `Iced` main thread GUI.
+* **`src/actions.rs`**: Script discovery (`discover()`) and terminal-window launching (`launch()`) for one-click script runs; probes `$TERMINAL`/`TERM_PROGRAM`/`/proc` ancestors/`xdg-terminal-exec`/hand-rolled `.desktop` entries with a `GRIT_NO_TERMINAL` test hook.
 * **`src/shared_config.rs`**: Cross-subsystem configuration shared between the native UI and the web daemon.
+* **`src/folio.rs`**: Best-effort auto-launcher for the `folio` file-explorer daemon (`FOLIO_BIN`/`FOLIO_PORT`, sibling of `krust.rs`). Powers the web UI's files dock.
 * **`src/git/`**: Git engine subsystem.
   * **`types.rs`**: Shared data models (`RepoState`, `FileChange`, `GitStatus`, `GitAction`) — single source of truth for both UI events and WebSocket JSON payloads.
   * **`mod.rs`**: Invokes local `git` CLI subcommands using `std::process::Command`.

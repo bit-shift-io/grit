@@ -10,13 +10,10 @@ use super::*;
 pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
     let diff = run(git_command(repo_path).args(["diff", "HEAD", "--", path]));
 
-    match diff {
-        Ok(output) => {
-            if !output.trim().is_empty() {
-                return Ok(output);
-            }
+    if let Ok(output) = diff {
+        if !output.trim().is_empty() {
+            return Ok(output);
         }
-        Err(_) => {}
     }
 
     let staged = run(git_command(repo_path).args(["diff", "--cached", "--", path]));

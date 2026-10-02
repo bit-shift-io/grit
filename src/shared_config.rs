@@ -21,9 +21,13 @@ pub struct GritConfig {
     pub tabs: Vec<SavedTab>,
 }
 
-/// Config folder: `$XDG_CONFIG_HOME/bitshift/grit`
+/// Config folder: `$XDG_CONFIG_HOME/bitshift/grit`, else `$HOME/.config/bitshift/grit`.
 fn config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("bitshift").join("grit"))
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
+    let base = xdg.or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("bitshift").join("grit"))
 }
 
 /// Path of the shared tabs configuration file.

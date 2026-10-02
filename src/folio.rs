@@ -78,7 +78,9 @@ pub async fn ensure_folio(root: Option<&Path>) {
     };
     let root = match root {
         Some(root) if root.is_dir() => root.to_path_buf(),
-        _ => dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+        _ => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".")),
     };
     match Command::new(&bin)
         .args(["--root", root.to_str().unwrap_or(".")])

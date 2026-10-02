@@ -7,10 +7,11 @@ body { margin: 0; padding: 1rem; height: 100vh; box-sizing: border-box; display:
   gap: 0.75rem;
 }
 main { flex: 1; min-width: 0; min-height: 0; }
-.term-view { padding: 0; height: 100%; }
+.term-view { padding: 0; height: 100%; overflow: hidden; }
 .krust-frame,
 .folio-frame {
   display: block;
+  box-sizing: border-box;
   width: 100%;
   height: 100%;
   border: 1px solid var(--btn-border, #ccc);
