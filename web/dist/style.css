@@ -1,4 +1,4 @@
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; --stack-gap: 1rem; }
 body { margin: 0; padding: 1rem; height: 100vh; box-sizing: border-box; display: flex; flex-direction: column; }
 .app-layout {
   flex: 1;
@@ -7,6 +7,11 @@ body { margin: 0; padding: 1rem; height: 100vh; box-sizing: border-box; display:
   gap: 0.75rem;
 }
 main { flex: 1; min-width: 0; min-height: 0; }
+/* The tab bar's `margin-bottom` owns the gap above the first thing on the page;
+   everything below it is spaced by `--stack-gap`. Without this, a rollup that
+   happens to be first in the markup would push its view down further than the
+   view whose first element is not a rollup. */
+main > :first-child { margin-top: 0; }
 .term-view { padding: 0; height: 100%; overflow: hidden; }
 .krust-frame,
 .folio-frame {
@@ -33,7 +38,10 @@ main { flex: 1; min-width: 0; min-height: 0; }
 .muted { color: var(--muted, #888); }
 .section-title .muted { font-weight: normal; }
 
-.section { margin-top: 0; }
+/* Same gap the rollups in Tally use, so they are spaced from each other exactly
+   as its panels are. `main > :first-child` above takes this back off the first
+   one, keeping it at the tab bar's gap instead of stacking the two. */
+.section { margin-top: var(--stack-gap); }
 .section-title {
   display: flex;
   justify-content: space-between;
@@ -48,6 +56,10 @@ main { flex: 1; min-width: 0; min-height: 0; }
 .section-title:hover { background: var(--section-hover, #d0d0d0); }
 .section-title .arrow { font-size: 0.8rem; color: var(--muted, #888); }
 .section.collapsed .section-body { display: none; }
+/* Same inset the title bar has, so a panel's content lines up with its own label.
+   Before the dock refactor this was `0.5rem 0`, which left body content sitting
+   flush against the section edges and 0.75rem left of its title. */
+.section-body { padding: 0.5rem 0.75rem; }
 .section.collapsed .section-title .arrow::before { content: "▶"; }
 .section:not(.collapsed) .section-title .arrow::before { content: "▼"; }
 
@@ -222,7 +234,9 @@ main { flex: 1; min-width: 0; min-height: 0; }
   overflow: auto;
   border: 1px solid var(--btn-border, #ccc);
   border-radius: 4px;
-  margin: 0.25rem 0.5rem 0.5rem;
+  /* No side margin: the section body's own inset already holds this back, and
+     another 0.5rem here would leave the diff wider than the commit bar above. */
+  margin: 0.25rem 0 0.5rem;
 }
 .side-by-side {
   width: 100%;
