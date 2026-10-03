@@ -110,6 +110,15 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
         }
     }
 
+    // The first client of the session is the signal that spending a round trip
+    // on the remote is worthwhile, so release the sync ticker here. Placed
+    // *after* the snapshot send: a badge must never arrive before the tab list
+    // has rendered. `request_sync_check` returns true for exactly one caller,
+    // so a reload storm cannot start duplicate fan-outs.
+    if app.request_sync_check() {
+        tracing::info!("first client connected: checking repos for out-of-date state");
+    }
+
     let mut broadcast_rx = app.broadcast.subscribe();
 
     // Actions execute on a dedicated worker so this select loop never blocks
@@ -258,6 +267,9 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     // Broadcast a `running` entry up front so every client sees the command
     // was entered even while a slow pull/push is still in flight.
     let action = msg.action;
+    // `action` is moved into the blocking task below; keep the tag for the
+    // post-success bookkeeping.
+    let result_action = action.clone();
     let placeholder = crate::git::placeholder_command(&action);
     let log_seq = app.registry.start_log_entry(tab_id, placeholder);
 
@@ -282,6 +294,17 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
         Ok((Ok(()), _)) => {
             if needs_watcher_reset {
                 let _ = app.watcher_resets.send(reset_path);
+            }
+            // A successful Fetch or Pull proves the network is reachable, so
+            // re-arm the remote-sync probe for this tab: without it, a machine
+            // that was offline when the 10-minute ceiling expired would show a
+            // stale badge until the daemon restarted. No inline check — the next
+            // ticker pass picks it up.
+            if matches!(
+                result_action,
+                crate::git::types::GitAction::Fetch | crate::git::types::GitAction::Pull
+            ) {
+                app.registry.reset_settled(tab_id);
             }
         }
         Ok((Err(e), _)) => tracing::error!("action failed: {e}"),
@@ -318,7 +341,7 @@ mod tests {
     use crate::server::registry::TabRegistry;
     use crate::server::{run_server, AppState};
     use crate::test_support::{
-        app_for, connect_with_retry, init_repo, recv_state, recv_state_until,
+        app_for, connect_with_retry, init_repo, recv_state, recv_state_until, wait_for_snapshot,
     };
 
     #[test]
@@ -348,6 +371,111 @@ mod tests {
         assert_eq!(
             super::resolve_tab_repo(&registry, Some(0), "SearchHistory"),
             Some((0, std::path::PathBuf::from("/tmp/x")))
+        );
+    }
+
+    #[test]
+    fn only_the_first_client_connect_releases_the_sync_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+
+        assert!(
+            !app.sync_requested(),
+            "a daemon that has never been opened must not spend a round trip"
+        );
+        assert!(app.request_sync_check(), "the first client wins the race");
+        assert!(
+            !app.request_sync_check(),
+            "a second browser tab reloading must not kick a duplicate fan-out"
+        );
+        assert!(app.sync_requested(), "the request is sticky once made");
+    }
+
+    #[tokio::test]
+    async fn first_client_connect_releases_the_sync_ticker() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+
+        let app = app_for(dir.path());
+        assert!(!app.sync_requested(), "run_server alone must not trigger it");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _initial = recv_state(&mut ws).await;
+
+        wait_for_snapshot(
+            &app.registry,
+            "the first connect to release the sync ticker",
+            std::time::Duration::from_secs(5),
+            |_| app.sync_requested(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn first_client_connect_prompts_the_out_of_date_badge() {
+        let (dir, _bare, advance) = crate::test_support::repo_with_remote();
+        // The remote moves before anyone connects, so the very first pass must
+        // see it: this also proves the connect triggers a pass immediately
+        // rather than leaving the badge a full 30s tick away.
+        advance(dir.path());
+
+        let app = app_for(dir.path());
+        tokio::spawn(crate::server::sync_ticker(app.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let badged = recv_state_until(&mut ws, |s| s.tabs[0].state.out_of_date).await;
+
+        assert!(badged.tabs[0].state.out_of_date);
+        // Two clients connecting in a row must not restart the probe for a tab
+        // that has already settled.
+        let mut second = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _initial = recv_state(&mut second).await;
+        assert!(app.registry.is_settled(0));
+    }
+
+    #[tokio::test]
+    async fn manual_fetch_rearms_the_sync_probe() {
+        let (dir, _bare, advance) = crate::test_support::repo_with_remote();
+        let app = app_for(dir.path());
+        crate::server::refresh_all(&app).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+
+        // Settle the tab the way a real session does: one conclusive answer.
+        app.registry.mark_settled(0);
+        advance(dir.path());
+
+        // A Fetch proves the network is reachable, so the check must be re-armed
+        // — otherwise the badge stays stale until the daemon restarts.
+        ws.send(Message::Text(r#"{"tab":0,"action":"Fetch"}"#.into()))
+            .await
+            .unwrap();
+        crate::test_support::wait_for_snapshot(
+            &app.registry,
+            "Fetch to re-arm the sync probe",
+            std::time::Duration::from_secs(10),
+            |_| !app.registry.is_settled(0),
+        )
+        .await;
+
+        // The probe is not run inline; the next ticker pass picks it up.
+        assert!(
+            !app.registry.snapshot().tabs[0].state.out_of_date,
+            "the badge must not appear before a probe has run"
         );
     }
 

@@ -36,11 +36,12 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
 * **`src/git/`**: Git engine subsystem.
   * **`types.rs`**: Shared data models (`RepoState`, `FileChange`, `GitStatus`, `GitAction`) — single source of truth for both UI events and WebSocket JSON payloads.
   * **`mod.rs`**: Invokes local `git` CLI subcommands using `std::process::Command`.
+  * **`sync.rs`**: Remote-sync probe for the out-of-date badge. `check_remote_sync(repo)` compares a live `git ls-remote <remote> refs/heads/<branch>` against the cached `refs/remotes/<upstream>` and returns `SyncOutcome` (`InSync` / `OutOfDate` / `NoRemote` / `Unreachable`). Read-only by construction — it never fetches, never merges, and bypasses `execute_action_logged` so `ls-remote` never shows up in a tab's transcript. `run_with_timeout` is a 20s watchdog that sets `GIT_TERMINAL_PROMPT=0` + `GIT_SSH_COMMAND=ssh -oBatchMode=yes`, kills the whole process group, and bounds the pipe drain. Failures are typed (`SyncErrorKind::Unreachable` / `TimedOut` / `Local`): transport errors stay retryable, local errors settle at once. Offline must never produce a badge.
   * **`watcher.rs`**: Watches the repository root recursively (a single recursive watch also covers `.git/`) using `notify` with a 200ms debouncer.
 * **`src/krust.rs`**: Best-effort auto-launcher for the `krust` web terminal daemon on startup. `krust_is_up()` TCP-probes `127.0.0.1:3000`; `find_krust_binary()` resolves `$KRUST_BIN` first, then scans `$PATH` for `krust`/`krust.exe`; `ensure_krust()` spawns it detached if it is down and available. Never fatal — missing binary just leaves the terminal dock buttons hidden.
 * **`src/server/`**: Embedded Axum web server subsystem.
-  * **`mod.rs`**: Sets up HTTP endpoints, background refresh loops, and WebSocket routing.
-  * **`websocket.rs`**: Processes inbound WebSocket actions and broadcasts state updates to connected clients.
+  * **`mod.rs`**: Sets up HTTP endpoints, background refresh loops, and WebSocket routing. Also owns `sync_ticker` (see below).
+  * **`websocket.rs`**: Processes inbound WebSocket actions and broadcasts state updates to connected clients. Calls `AppState::request_sync_check()` right after the first snapshot is sent — that `AtomicBool::swap` plus `Arc<Notify>` wake-up is what starts the sync ticker, which stays dormant (zero probes) until a client actually connects.
   * **`registry.rs`**: `TabRegistry` / `WebState` shared workspace: tab allocation, revision counters for stale-frame suppression, broadcast fan-out, log sequencing.
   * **`static_files.rs`**: Serves embedded static web assets using `rust-embed`.
 * **`src/ui/`**: Native desktop GUI built on `Iced`.
@@ -48,6 +49,12 @@ cargo build --release --features desktop   # Build the desktop + web UI binary
   * **`remote.rs`**: Remote-mode client (HTTP/WS) used by the desktop GUI to talk to an external daemon and receive sync updates.
   * **`components/`**: View panels (`header.rs`, `staging.rs`, `commit.rs`, `history.rs`, `actions.rs`, `diff.rs`).
 * **`web/dist/`**: THE ONLY web UI source — hand-maintained `index.html` / `style.css` / `app.js` with no package.json or build step, embedded at compile time via `rust-embed`. Contains the left view dock (Dashboard/`F`/`L` + krust terminal views) and all client-side view routing (`activeView`, `showView()`, `?view=` deep-link). JS edits are reviewed manually — there is **no node/deno/bun** on the dev box for syntax checking; use the python3 brace/quote tokenizer (see §4).
+
+### Remote-sync ticker — key facts
+* **What it is**: a 30s `tokio::select!` over an interval + `Arc<Notify>` in `src/server/mod.rs`. Each pass probes only *unsettled* tabs (per-tab settled set in `TabRegistry`, outside `WebState`, pruned on tab close), staggers the git calls by `tab.id % 8` × 250ms, and publishes `RepoState::out_of_date`.
+* **Trigger**: first WebSocket client connect per daemon process. `run_server` spawns the ticker already dormant — an idle daemon with no clients never touches the network.
+* **Settling**: `InSync` / `OutOfDate` / `NoRemote` settle a tab; `Unreachable` retries every 30s until a 10-minute ceiling, then settles with the badge **off**. A successful `Fetch`/`Pull` calls `reset_settled` to re-arm. Never auto-pulls.
+* **Badge surfaces**: web `↑` on the tab chip (`renderTabBar` in `web/dist/app.js`, styled by `#tabs .sync-badge`). The iced desktop deliberately has no badge — the field is available at `src/ui/state.rs:505` if that changes.
 
 ### krust (web terminal) integration — key facts
 * **What it is**: Grit embeds the external `krust` web-terminal daemon as two dock views (`term-1` / `term-2`), each an `<iframe>` pointing at `http://localhost:3000/?s=<session>&dir=<repo>` with the xterm terminal library. Requires krust (`~/Projects/krust`, port 3000, `KRUST_PORT` env override) to be installed and running; Grit auto-starts it if missing (see `src/krust.rs`), otherwise the `T` buttons stay hidden.

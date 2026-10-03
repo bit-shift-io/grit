@@ -2,7 +2,7 @@
 //!
 //! Compiled only under `cfg(test)`; registered in `main.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -99,4 +99,90 @@ pub async fn recv_state_until(
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for matching state"))
+}
+
+/// Work repo with one commit plus a bare local-path origin, wired up so `main`
+/// tracks `origin/main` — no `push` against the remote, only a local `fetch`.
+///
+/// Returns the work tempdir (the bare origin lives inside it), the bare repo
+/// path, and a closure that advances the origin's `main` without the work repo
+/// fetching it: the state a colleague's push leaves behind.
+pub fn repo_with_remote() -> (tempfile::TempDir, PathBuf, impl Fn(&Path)) {
+    let dir = tempfile::tempdir().unwrap();
+    init_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "v1\n").unwrap();
+    commit_all(dir.path(), "initial");
+
+    let bare = dir.path().join("origin.git");
+    let git = |cwd: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    git(dir.path(), &["init", "-q", "--bare", "origin.git"]);
+    git(
+        &bare,
+        &[
+            "fetch",
+            "-q",
+            dir.path().to_str().unwrap(),
+            "refs/heads/main:refs/heads/main",
+        ],
+    );
+    git(
+        dir.path(),
+        &["remote", "add", "origin", bare.to_str().unwrap()],
+    );
+    git(dir.path(), &["fetch", "-q", "origin"]);
+    git(dir.path(), &["config", "branch.main.remote", "origin"]);
+    git(dir.path(), &["config", "branch.main.merge", "refs/heads/main"]);
+
+    let remote = bare.clone();
+    let advance = move |work: &Path| {
+        std::fs::write(work.join("a.txt"), "v2\n").unwrap();
+        commit_all(work, "second");
+        std::process::Command::new("git")
+            .args([
+                "fetch",
+                "-q",
+                work.to_str().unwrap(),
+                "refs/heads/main:refs/heads/main",
+            ])
+            .current_dir(&remote)
+            .output()
+            .unwrap();
+    };
+
+    (dir, bare, advance)
+}
+
+/// Polls `pred` against the registry snapshot until it holds, or panics after
+/// `timeout`. The async counterpart to asserting on a background task's
+/// eventual effect.
+pub async fn wait_for_snapshot(
+    registry: &TabRegistry,
+    what: &str,
+    timeout: Duration,
+    pred: impl Fn(&WebState) -> bool,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let snapshot = registry.snapshot();
+        if pred(&snapshot) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

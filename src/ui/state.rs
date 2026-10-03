@@ -821,6 +821,7 @@ mod tests {
             scripts: vec![],
             remote_branches: vec![],
             stashes: vec![],
+            out_of_date: false,
         }
     }
 

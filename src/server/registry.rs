@@ -55,6 +55,11 @@ pub struct TabRegistry {
     /// Bumped on every publish so observers can detect mutations that
     /// happened while they were busy (e.g. a status refresh mid-flight).
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Tab ids whose remote-sync probe has reached a conclusive answer. Absent
+    /// means "still owes a probe", which is also the state every tab starts in.
+    /// Kept out of [`WebState`] because it is daemon bookkeeping the clients
+    /// never see, and must not churn the broadcast revision.
+    settled: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<usize>>>,
 }
 
 impl Clone for TabRegistry {
@@ -66,6 +71,7 @@ impl Clone for TabRegistry {
             next_id: std::sync::Arc::clone(&self.next_id),
             next_log_seq: std::sync::Arc::clone(&self.next_log_seq),
             revision: std::sync::Arc::clone(&self.revision),
+            settled: std::sync::Arc::clone(&self.settled),
         }
     }
 }
@@ -81,6 +87,7 @@ impl TabRegistry {
             next_id: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_log_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            settled: std::sync::Arc::default(),
         }
     }
 
@@ -197,6 +204,9 @@ impl TabRegistry {
                 None => false,
             }
         });
+        if removed.is_some() {
+            self.reset_settled(id);
+        }
         removed
     }
 
@@ -304,6 +314,48 @@ impl TabRegistry {
         });
     }
 
+    /// True when this tab's remote-sync probe has already reached a
+    /// conclusive answer and must not be probed again this session.
+    pub fn is_settled(&self, tab_id: usize) -> bool {
+        self.with_settled(|settled| settled.contains(&tab_id))
+    }
+
+    /// Records a conclusive sync answer for `tab_id`. Idempotent.
+    pub fn mark_settled(&self, tab_id: usize) {
+        self.with_settled(|settled| {
+            settled.insert(tab_id);
+        });
+    }
+
+    /// Re-arms the probe for `tab_id`, e.g. after a manual Fetch or Pull
+    /// proved the network is reachable. The next tick picks it up.
+    pub fn reset_settled(&self, tab_id: usize) {
+        self.with_settled(|settled| {
+            settled.remove(&tab_id);
+        });
+    }
+
+    /// Sorted ids of every settled tab; used by the ticker's bookkeeping tests
+    /// and when diagnosing which tabs have already been probed.
+    pub fn settled_tabs(&self) -> Vec<usize> {
+        self.with_settled(|settled| {
+            let mut ids: Vec<usize> = settled.iter().copied().collect();
+            ids.sort_unstable();
+            ids
+        })
+    }
+
+    /// Runs `f` against the shared settled set. A panicking holder poisons the
+    /// mutex; the set is a plain `HashSet` of ids, so recovering with the inner
+    /// value is safe.
+    fn with_settled<T>(&self, f: impl FnOnce(&mut std::collections::HashSet<usize>) -> T) -> T {
+        let mut settled = self
+            .settled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut settled)
+    }
+
     fn alloc_log_seq(&self) -> u64 {
         self.next_log_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -340,6 +392,7 @@ mod tests {
                 changes: vec![],
                 history: vec![],
                 scripts: vec![],
+                out_of_date: false,
             },
             log: Vec::new(),
         }
@@ -392,6 +445,7 @@ mod tests {
             changes: vec![],
             history: vec![],
             scripts: vec![],
+            out_of_date: false,
         };
         registry.update_state(1, fresh.clone());
         let state = registry.snapshot();
@@ -623,6 +677,7 @@ mod tests {
             changes: vec![],
             history: vec![],
             scripts: vec![],
+            out_of_date: false,
         };
         registry.update_state(0, fresh);
         assert_eq!(
@@ -639,5 +694,109 @@ mod tests {
         assert_eq!(TabRegistry::clamp_active_index(1, 3), 1);
         assert_eq!(TabRegistry::clamp_active_index(0, 0), 0, "empty workspace");
         assert_eq!(TabRegistry::clamp_active_index(9, 1), 0);
+    }
+
+    // --- remote sync settled flags ---
+
+    fn two_tab_registry() -> TabRegistry {
+        let registry = TabRegistry::new();
+        registry.set(WebState {
+            active: 0,
+            tabs: vec![sample_tab(0, "a"), sample_tab(1, "b")],
+            revision: 0,
+        });
+        registry
+    }
+
+    #[test]
+    fn tabs_start_unsettled() {
+        let registry = two_tab_registry();
+
+        // Absent means "not checked yet": the ticker owes both tabs a probe.
+        assert!(!registry.is_settled(0));
+        assert!(!registry.is_settled(1));
+        assert!(!registry.is_settled(99), "unknown tabs are unsettled too");
+    }
+
+    #[test]
+    fn settling_one_tab_leaves_the_others_alone() {
+        let registry = two_tab_registry();
+
+        registry.mark_settled(0);
+
+        assert!(registry.is_settled(0));
+        assert!(!registry.is_settled(1));
+    }
+
+    #[test]
+    fn settling_is_idempotent() {
+        let registry = two_tab_registry();
+
+        registry.mark_settled(1);
+        registry.mark_settled(1);
+
+        assert!(registry.is_settled(1));
+    }
+
+    #[test]
+    fn reset_re_arms_a_settled_tab() {
+        let registry = two_tab_registry();
+        registry.mark_settled(0);
+
+        // What a successful manual Fetch/Pull does.
+        registry.reset_settled(0);
+
+        assert!(!registry.is_settled(0));
+        registry.reset_settled(0);
+        assert!(!registry.is_settled(0), "resetting twice is harmless");
+    }
+
+    #[test]
+    fn clones_share_one_settled_set() {
+        let registry = two_tab_registry();
+        let clone = registry.clone();
+
+        clone.mark_settled(1);
+
+        assert!(
+            registry.is_settled(1),
+            "the ticker and the websocket handler hold different clones"
+        );
+    }
+
+    #[test]
+    fn removing_a_tab_drops_its_settled_flag() {
+        let registry = two_tab_registry();
+        registry.mark_settled(0);
+        registry.mark_settled(1);
+
+        assert!(registry.remove_tab(0).is_some());
+
+        // A leaked entry would be harmless today (ids are never reused) but
+        // would grow without bound over a long session.
+        assert_eq!(registry.settled_tabs(), vec![1]);
+    }
+
+    #[test]
+    fn removing_an_unknown_tab_touches_no_settled_flag() {
+        let registry = two_tab_registry();
+        registry.mark_settled(0);
+
+        assert!(registry.remove_tab(99).is_none());
+        assert_eq!(registry.settled_tabs(), vec![0]);
+    }
+
+    #[test]
+    fn settled_flags_survive_a_poisoned_lock() {
+        let registry = two_tab_registry();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.settled.lock().unwrap();
+            panic!("simulated panic");
+        }));
+        assert!(poisoned.is_err(), "setup: the lock must actually poison");
+
+        registry.mark_settled(0);
+
+        assert!(registry.is_settled(0));
     }
 }

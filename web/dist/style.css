@@ -102,6 +102,15 @@ main { flex: 1; min-width: 0; min-height: 0; }
 #tabs .tab-name.active,
 #tabs .tab-view-btn.active { font-weight: 700; }
 #tabs .tab-name.dirty { font-style: italic; }
+/* Remote-is-ahead hint. Purely decorative: it rides along inside the tab
+   button, so clicking it just selects the tab like the name does. */
+#tabs .sync-badge {
+  margin-left: 0.25rem;
+  font-size: 0.85em;
+  line-height: 1;
+  color: var(--sync-badge, #b8860b);
+  cursor: default;
+}
 #tabs .tab.new-tab {
   font-weight: 700;
   font-size: 1.2rem;
@@ -502,6 +511,7 @@ main { flex: 1; min-width: 0; min-height: 0; }
     --log-rule: rgba(128, 128, 128, 0.2);
     --log-prompt: #7ec8a2;
     --log-failed: #ff8a80;
+    --sync-badge: #e0b34d;
   }
 }
 .commit-row { padding: 0; }

@@ -44,6 +44,9 @@ pub fn get_repository_status(repo_path: &Path) -> Result<RepoState, GitError> {
         changes: changes_res?,
         history: history_res?,
         scripts: scripts_res,
+        // Overwritten by `refresh_tab`; a bare status collection cannot know
+        // anything about the remote.
+        out_of_date: false,
     })
 }
 

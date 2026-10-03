@@ -46,9 +46,10 @@ ids come from one monotonic allocator and are never reused within a session.
     ├── git/                 # Git Engine subsystem
     │   ├── mod.rs           # Git CLI command execution logic and status queries
     │   ├── types.rs         # Core data models (RepoState, GitStatus, FileChange, GitAction)
+    │   ├── sync.rs          # Remote-sync probe: ls-remote vs cached remote-tracking ref
     │   └── watcher.rs       # Debounced recursive repo-root FS monitoring
     ├── server/              # Embedded Axum Web Server subsystem
-    │   ├── mod.rs           # Axum router setup, AppState, boot/sync loops, /browse /files /commit
+    │   ├── mod.rs           # Axum router, AppState, boot/sync loops, remote-sync ticker, REST handlers
     │   ├── registry.rs      # TabRegistry: single-writer tab list + watch channel + id allocator
     │   ├── websocket.rs     # WS protocol dispatch, shared open_repo_tab/close_tab_by_id ops
     │   └── static_files.rs  # Embedded asset server using rust-embed
@@ -99,6 +100,18 @@ ids come from one monotonic allocator and are never reused within a session.
 * **`mod.rs`**: invokes the local `git` CLI via `std::process::Command`
   (`get_repository_status`, `get_file_diff`, `get_file_pair`, `get_commit_summary`,
   `execute_action`), wrapping stderr into structured `GitError`s.
+* **`sync.rs`**: the read-only remote-sync probe. `check_remote_sync(repo)` compares
+  the live `git ls-remote <remote> refs/heads/<branch>` SHA against the cached
+  `refs/remotes/<upstream>` ref and returns a `SyncOutcome` (`InSync`,
+  `OutOfDate`, `NoRemote`, `Unreachable`) — never `fetch`ing, so it cannot move
+  refs or start a merge. It runs the git process through `run_with_timeout`, a
+  20 s watchdog that disables credential prompts (`GIT_TERMINAL_PROMPT=0`,
+  `GIT_SSH_COMMAND=ssh -oBatchMode=yes`), kills the whole process group on
+  timeout, and bounds the pipe drain. Failures come back as a typed
+  `SyncErrorKind` (`Unreachable` / `TimedOut` / `Local`) so the ticker can tell
+  "try again" from "stop asking" — a local error (no upstream configured, bad
+  ref) settles immediately, a transport error does not. Probes deliberately
+  bypass `execute_action_logged`, keeping `ls-remote` out of tab transcripts.
 * **`watcher.rs`**: one recursive watch per repository covering the working tree
   and `.git` (the root watch subsumes `.git`; a separate `.git` watch would
   duplicate every event) with a 200 ms debouncer. Events are filtered before
@@ -148,9 +161,9 @@ ids come from one monotonic allocator and are never reused within a session.
 ### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
 * **`routes`**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
   `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
-  the add-repo form), `/filetree?tab=&path=` (file browser listing), `/filecontent?tab=&path=&raw=`
-  (lazy preview content; `raw` serves literal file bytes), `/filesearch?tab=&q=` (case-insensitive
-  file name search), `/apps?path=` (external editor apps for a file), `/*` embedded static assets.
+  the add-repo form), `/` and `/{*path}` embedded static assets. (The old
+  `/filetree`, `/filecontent`, `/filesearch` and `/apps` handlers are gone — the
+  file browser moved into the `folio` dock and editors into Grit actions.)
 * **Rollup ARIA hardening**: All `.section-title` elements must have `role="button"`,
   `tabindex="0"`, and `aria-expanded` initialized at wire time. Initial state is
   expanded (`aria-expanded="true"`), and arrow direction is controlled via CSS
@@ -166,7 +179,25 @@ ids come from one monotonic allocator and are never reused within a session.
   does NOT run the sync loop itself — `run_server(listener, app, refresh_rx)`
   spawns `sync_loop` (broadcasting snapshots to every WS client on
   registry/watcher events), and `run()` wires boot → `create_listener` →
-  run_server. `refresh_tab` re-validates that the path still contains `.git`
+  run_server.
+* **Remote-sync ticker** (`sync_ticker`, also spawned by `run_server`): a
+  `tokio::select!` over a 30 s interval and an `Arc<Notify>` wake-up. It starts
+  **dormant** — no probes at all until `AppState::request_sync_check()` is
+  called, which happens once per daemon process on the first WebSocket connect
+  (`websocket.rs`, after the initial snapshot has been sent so the badge cannot
+  arrive before the tab list renders). The `AtomicBool` is swapped, not
+  load-tested-then-stored, so concurrent browser tabs racing a reload kick off
+  exactly one run. Each pass probes every *unsettled* tab, fanning the git calls
+  out with `spawn_blocking` and staggering them over 8 × 250 ms slots so N tabs
+  do not hit one remote at once. `SyncBudget` owns the retry bookkeeping: the
+  first answer is `InSync` / `OutOfDate` / `NoRemote` (settle, badge on or off)
+  or `Unreachable` (retry in 30 s); a tab that stays unreachable for 10 minutes
+  is settled with the badge **off**, so being offline can never raise a false
+  alarm. `TabRegistry`'s per-tab settled set (kept outside `WebState`, and
+  pruned for closed tabs) is what makes this once-per-tab rather than
+  once-per-tick. A successful Fetch or Pull re-arms the tab
+  (`reset_settled`), because a fetch proves the network is back; the check then
+  runs on the next pass instead of inline. `refresh_tab` re-validates that the path still contains `.git`
   before shelling out.
 * **`create_listener(port)`** binds with `SO_REUSEADDR` so an immediate
   close-and-restart can rebind the port even with lingering TIME_WAIT sockets.
@@ -273,9 +304,9 @@ main.rs
         └── Spawn Tokio runtime → server::run(registry)
               ├── boot(): restore-from-config-if-empty → watch_reconciler +
               │     persist task + background initial refresh (→ refresh_rx)
-              ├── run_server(): spawns sync_loop, then Axum routes
-              │     (/health /ws /files /commit /browse /filetree
-              │      /filecontent /filesearch /apps /*)
+              ├── run_server(): spawns sync_loop + the dormant remote-sync
+              │     ticker, then Axum routes
+              │     (/health /ws /files /commit /browse /+ static assets)
               └── background task: krust::ensure_krust() (best-effort)
       ELSE (GUI):
         ├── Probe GET /health on 127.0.0.1:<port>
@@ -306,6 +337,17 @@ User opens/closes a repo (desktop button OR web WS message)
   → broadcast (same pipeline as above)
 The desktop does NOT watch the filesystem; it mirrors these updates purely
 through sync broadcasts (`WebTabsSync` / registry subscription).
+```
+
+### Remote-Sync Probe (out-of-date badge)
+```
+first WS connect → AppState::request_sync_check() [swap → Notify]
+  → ticker pass (then every 30 s while any tab is unsettled)
+  → per tab: git ls-remote <remote> refs/heads/<branch>  (20 s watchdog)
+     vs cached refs/remotes/<upstream>
+  → InSync / OutOfDate / NoRemote → settle tab → publish RepoState.out_of_date
+  → Unreachable → stay unsettled, badge untouched, retry in 30 s
+  → Fetch/Pull success → reset_settled → next pass re-checks (badge clears)
 ```
 
 ### Git Action Dispatch
@@ -368,7 +410,8 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/git/mod.rs` | Git CLI invocation + structured `GitError` |
 | `src/git/watcher.rs` | Debounced recursive repo-root watcher |
 | `src/server/registry.rs` | `TabRegistry`: watch channel, monotonic ids, `WebState`/`WebTab` |
-| `src/server/mod.rs` | Router, `boot()`, sync loop, persist task, `/browse` `/files` `/commit` handlers |
+| `src/server/mod.rs` | Router, `boot()`, sync loop, remote-sync ticker, persist task, `/browse` `/files` `/commit` handlers |
+| `src/git/sync.rs` | `SyncOutcome`/`SyncError`, `run_with_timeout` watchdog, `check_remote_sync` |
 | `src/server/websocket.rs` | WS protocol, shared `open_repo_tab`/`close_tab_by_id` ops |
 | `src/server/static_files.rs` | rust-embed asset serving |
 | `src/krust.rs` | Best-effort krust terminal-daemon auto-launch (`ensure_krust`, `find_krust_binary`) |

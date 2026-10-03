@@ -1051,6 +1051,16 @@ function renderTabBar(state) {
     }
     nameBtn.textContent = tab.name;
     nameBtn.title = tab.name;
+    // Remote is ahead of the last fetch. Non-interactive: the Pull button is
+    // the action, this is only a hint that one is warranted.
+    if (tab.state.out_of_date) {
+      const badge = document.createElement("span");
+      badge.className = "sync-badge";
+      badge.textContent = "↑";
+      badge.title = "Remote has commits you do not have — pull";
+      nameBtn.appendChild(badge);
+      nameBtn.title = `${tab.name} — remote has new commits`;
+    }
     nameBtn.dataset.tabId = tab.id;
     nameBtn.dataset.view = "dashboard";
     group.appendChild(nameBtn);
@@ -1643,7 +1653,7 @@ function sessionIdFor(sess) {
 }
 
 function krustFrameSrc(sess, sid) {
-  return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}&r=2d`;
+  return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}`;
 }
 
 function ensureKrustFrame(sess) {

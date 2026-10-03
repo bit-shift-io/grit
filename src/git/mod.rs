@@ -1,3 +1,4 @@
+pub mod sync;
 pub mod types;
 pub mod watcher;
 

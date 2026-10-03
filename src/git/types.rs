@@ -100,6 +100,12 @@ pub struct RepoState {
     pub stashes: Vec<StashEntry>,
     #[serde(default)]
     pub scripts: Vec<ScriptEntry>,
+    /// Set when the remote tip no longer matches the cached remote-tracking
+    /// ref for the current branch's upstream. Computed out of band by
+    /// `src/git/sync.rs`; `false` also covers "not checked yet" and "remote
+    /// unreachable", so the UI must never read it as an authoritative signal.
+    #[serde(default)]
+    pub out_of_date: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +264,7 @@ mod tests {
                 name: "build.sh".to_string(),
                 rel_path: "scripts/build.sh".to_string(),
             }],
+            out_of_date: true,
         };
 
         let json = serde_json::to_string(&state).unwrap();
@@ -286,6 +293,25 @@ mod tests {
         // Accepts anything string-like; the wire shape must stay stable.
         let owned = CommitSummary::error(String::from("boom"));
         assert_eq!(owned.message, "boom");
+    }
+
+    #[test]
+    fn repostate_round_trips_out_of_date() {
+        let state = RepoState {
+            out_of_date: true,
+            ..RepoState::default()
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: RepoState = serde_json::from_str(&json).unwrap();
+        assert!(parsed.out_of_date, "flag must survive the wire");
+
+        // Payloads from older daemons predate the flag; absence must mean
+        // "nothing to show" rather than a false alarm.
+        let older: RepoState =
+            serde_json::from_str(r#"{"current_branch":"","branches":[],"changes":[],"history":[]}"#)
+                .unwrap();
+        assert!(!older.out_of_date, "missing field must default false");
+        assert!(!RepoState::default().out_of_date);
     }
 
     #[test]
