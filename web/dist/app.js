@@ -376,7 +376,7 @@ function render(state) {
   renderBranches(tab);
   renderStashes(tab);
   renderLog(tab);
-  renderActionActivity(tab);
+  renderActivityIndicators(tab);
   settlePendingCommit(state);
   renderFileBrowser(tab);
 
@@ -825,12 +825,16 @@ function renderLog(tab) {
   }
 }
 
-// Drives the spinner/red cross in the Actions rollup bar and, on failure,
-// reveals the transcript. The newest log entry is authoritative: a `running`
-// placeholder is always appended last and revised in place while the action
-// runs, then `finish_log_entry` replaces it with fresh seqs once it completes.
-function renderActionActivity(tab) {
-  const el = document.getElementById("actions-activity");
+// Drives the spinner/red cross in the Actions and Changes rollup bars and, on
+// failure, reveals the transcript. One shared state rather than one per rollup:
+// every button on the dashboard — the commit bar and per-file stage controls
+// included — feeds the same transcript, so a spinner that appeared only in the
+// rollup a button did not live in would be feedback the user has to look away
+// to find. The newest log entry is authoritative: a `running` placeholder is
+// always appended last and revised in place while the action runs, then
+// `finish_log_entry` replaces it with fresh seqs once it completes.
+function renderActivityIndicators(tab) {
+  const indicators = document.querySelectorAll("[data-activity]");
   let newest = null;
   for (const entry of tab.log || []) {
     if (!newest || entry.seq > newest.seq) newest = entry;
@@ -842,25 +846,27 @@ function renderActionActivity(tab) {
     surfacedFailures.set(tab.id, newest ? newest.seq : 0);
   }
 
-  el.classList.remove("running", "failed");
-  if (!newest) {
-    el.hidden = true;
-    return;
-  }
-  el.hidden = false;
-  el.title = newest.command;
-
-  if (newest.status === "running") {
-    el.classList.add("running");
-    return;
-  }
-  if (newest.status === "failed") {
-    el.classList.add("failed");
-    el.title = `${newest.command} failed — see the Log panel`;
-    if (newest.seq > surfacedFailures.get(tab.id)) {
-      surfacedFailures.set(tab.id, newest.seq);
-      revealFailedCommand();
+  for (const el of indicators) {
+    el.classList.remove("running", "failed");
+    if (!newest) {
+      el.hidden = true;
+      continue;
     }
+    el.hidden = false;
+    el.title = newest.command;
+    if (newest.status === "running") {
+      el.classList.add("running");
+    } else if (newest.status === "failed") {
+      el.classList.add("failed");
+      el.title = `${newest.command} failed — see the Log panel`;
+    }
+  }
+
+  // Decided once, outside the loop: with two indicators an in-loop guard would
+  // consume the failure on the first element and leave the second guessing.
+  if (newest && newest.status === "failed" && newest.seq > surfacedFailures.get(tab.id)) {
+    surfacedFailures.set(tab.id, newest.seq);
+    revealFailedCommand();
   }
 }
 

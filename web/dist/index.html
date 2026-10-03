@@ -12,7 +12,7 @@
   <div class="app-layout">
     <main>
        <section id="actions" class="section" style="display: none;">
-     <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="actions-body"><span>Actions<span id="actions-activity" class="activity" hidden></span></span> <span class="arrow"></span></h2>
+     <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="actions-body"><span>Actions<span class="activity" data-activity hidden></span></span> <span class="arrow"></span></h2>
      <div class="section-body" id="actions-body">
       <div class="action-row">
         <button id="pull-btn" title="Fetch remote changes and merge them into the current branch">Pull</button>
@@ -57,7 +57,7 @@
       </div>
     </section>
     <section id="repo-view" class="section" style="display: none;">
-      <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="repo-view-body"><span>Changes <span id="overview" class="muted"></span></span><span class="arrow"></span></h2>
+      <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="repo-view-body"><span>Changes <span id="overview" class="muted"></span><span class="activity" data-activity hidden></span></span><span class="arrow"></span></h2>
       <div class="section-body" id="repo-view-body">
         <div class="commit-bar">
           <input id="commit-msg" type="text" placeholder="Commit message">
