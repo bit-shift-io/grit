@@ -91,6 +91,15 @@ let awaitingNewTab = false;
 let browser = { dir: null, parent: null, seeding: false };
 // Client-local view state: entries with seq <= this are hidden by "Clear Log".
 let clearedUpToSeq = 0;
+// Highest log seq already accounted for per tab, keyed by tab id. Seeded with
+// the tab's current maximum the first time it is seen, so opening the page does
+// not replay the whole backlog, and advanced past each failure we surface, so
+// one failure is surfaced exactly once no matter how many frames follow.
+const surfacedFailures = new Map();
+// A commit-family action whose outcome git has not confirmed yet: the message
+// as sent, the tab it was sent to, and the newest log seq at the moment of the
+// click. Entries after that seq are this action's transcript.
+let pendingCommit = null;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
 let activeView = "dashboard"; // Default view
@@ -279,6 +288,18 @@ function handleStateMessage(event) {
   for (const id of state.tabs.map((t) => t.id)) {
     knownTabIds.add(id);
   }
+  // Tab ids are never reused within a session, so a closed tab's entry can go
+  // for good: a repo reopened later arrives under a fresh id and re-seeds.
+  // Compared against the live tabs, not `knownTabIds` — that one accumulates
+  // every id ever seen and would make this prune unreachable.
+  for (const id of surfacedFailures.keys()) {
+    if (!state.tabs.some((t) => t.id === id)) surfacedFailures.delete(id);
+  }
+  // A commit aimed at a tab that no longer exists can never resolve, and its
+  // message would sit in the box looking unsent.
+  if (pendingCommit && !state.tabs.some((t) => t.id === pendingCommit.tabId)) {
+    pendingCommit = null;
+  }
   lastState = state;
   if (state.revision === lastRevision) {
     return;
@@ -355,6 +376,8 @@ function render(state) {
   renderBranches(tab);
   renderStashes(tab);
   renderLog(tab);
+  renderActionActivity(tab);
+  settlePendingCommit(state);
   renderFileBrowser(tab);
 
   const changesEl = document.getElementById("changes");
@@ -799,6 +822,109 @@ function renderLog(tab) {
   }
   if (nearBottom) {
     logEl.scrollTop = logEl.scrollHeight;
+  }
+}
+
+// Drives the spinner/red cross in the Actions rollup bar and, on failure,
+// reveals the transcript. The newest log entry is authoritative: a `running`
+// placeholder is always appended last and revised in place while the action
+// runs, then `finish_log_entry` replaces it with fresh seqs once it completes.
+function renderActionActivity(tab) {
+  const el = document.getElementById("actions-activity");
+  let newest = null;
+  for (const entry of tab.log || []) {
+    if (!newest || entry.seq > newest.seq) newest = entry;
+  }
+
+  if (!surfacedFailures.has(tab.id)) {
+    // First frame for this tab: adopt whatever it already has silently, so
+    // failures from before this page load do not hijack the viewport.
+    surfacedFailures.set(tab.id, newest ? newest.seq : 0);
+  }
+
+  el.classList.remove("running", "failed");
+  if (!newest) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.title = newest.command;
+
+  if (newest.status === "running") {
+    el.classList.add("running");
+    return;
+  }
+  if (newest.status === "failed") {
+    el.classList.add("failed");
+    el.title = `${newest.command} failed — see the Log panel`;
+    if (newest.seq > surfacedFailures.get(tab.id)) {
+      surfacedFailures.set(tab.id, newest.seq);
+      revealFailedCommand();
+    }
+  }
+}
+
+// Unfolds the Log rollup and scrolls the failing command into view, so a failed
+// action cannot pass unnoticed. Reuses the same collapse class and ARIA pairing
+// as the click handler on `.section-title`.
+function revealFailedCommand() {
+  const section = document.getElementById("log-section");
+  const title = section.querySelector(".section-title");
+  if (section.classList.contains("collapsed")) {
+    section.classList.remove("collapsed");
+    title.setAttribute("aria-expanded", "true");
+  }
+  // The transcript only exists on the dashboard. Every action button lives
+  // there too, but one can still be in flight when the user switches views.
+  if (section.style.display === "none") {
+    showView("dashboard");
+  }
+  // Must follow renderLog, which rebuilds the entries this scrolls.
+  const logEl = document.getElementById("log");
+  logEl.scrollTop = logEl.scrollHeight;
+  section.scrollIntoView({ block: "nearest" });
+}
+
+// Reads the commit outcome out of the transcript entries that landed after the
+// click: "success", "failed", or null while the action is still in flight.
+//
+// `commitCommand` is the exact line `action_argv` will produce for
+// `["commit", "-m", message]` — `format_argv` does not quote its arguments, so
+// the comparison is a plain string equality. Matching exactly rather than on a
+// `git commit ` prefix is what keeps two rapid clicks from crediting the second
+// message with the first action's verdict.
+//
+// `running` entries are skipped so the `&&`-joined preview placeholder — which
+// is the whole line, `git commit -m ...` for a plain Commit — is never mistaken
+// for a verdict. Any earlier failure is terminal too: `add -A` is the only step
+// before the commit, so if it failed there is nothing to clear.
+function commitOutcome(entries, commitCommand) {
+  for (const entry of entries) {
+    if (entry.status === "running") continue;
+    if (entry.command === commitCommand) {
+      return entry.status === "success" ? "success" : "failed";
+    }
+    if (entry.status === "failed") return "failed";
+  }
+  return null;
+}
+
+// Clears the commit box only once the commit itself landed. Resolved against
+// every tab, not just the active one, so a commit that finishes while another
+// tab is selected still clears the box when it lands.
+function settlePendingCommit(state) {
+  if (!pendingCommit) return;
+  const tab = state.tabs.find((t) => t.id === pendingCommit.tabId);
+  if (!tab) return;
+  const entries = (tab.log || []).filter((e) => e.seq > pendingCommit.afterSeq);
+  const outcome = commitOutcome(entries, `git commit -m ${pendingCommit.message}`);
+  if (!outcome) return;
+  const message = pendingCommit.message;
+  pendingCommit = null;
+  // Only ever clear what we sent: the user may have typed a new message, or
+  // switched tabs and started typing in this box, while git was working.
+  if (outcome === "success" && commitMsg.value.trim() === message) {
+    commitMsg.value = "";
   }
 }
 
@@ -1363,21 +1489,28 @@ document.getElementById("remove-tab-btn").onclick = () => {
 };
 
 const commitMsg = document.getElementById("commit-msg");
-document.getElementById("stage-commit-push-btn").onclick = () => {
-  if (!commitMsg.value.trim()) return;
-  sendAction({ CommitAllPush: commitMsg.value.trim() });
-  commitMsg.value = "";
-};
-document.getElementById("commit-btn").onclick = () => {
-  if (!commitMsg.value.trim()) return;
-  sendAction({ Commit: commitMsg.value.trim() });
-  commitMsg.value = "";
-};
-document.getElementById("commit-push-btn").onclick = () => {
-  if (!commitMsg.value.trim()) return;
-  sendAction({ CommitPush: commitMsg.value.trim() });
-  commitMsg.value = "";
-};
+
+// Sends a commit-family action, holding the message in `pendingCommit` instead
+// of clearing the box outright. Whether the message was consumed is git's call,
+// not ours: a failed `add -A` or `commit` means it was never used and has to
+// survive for a retry, while a committed message must be cleared so the next one
+// starts from empty.
+function sendCommitAction(build) {
+  const message = commitMsg.value.trim();
+  if (!message) return;
+  const tab = lastState ? activeTab(lastState) : null;
+  pendingCommit = {
+    message,
+    tabId: tab ? tab.id : null,
+    afterSeq: tab ? Math.max(0, ...(tab.log || []).map((e) => e.seq)) : 0,
+  };
+  sendAction(build(message));
+}
+
+document.getElementById("stage-commit-push-btn").onclick = () =>
+  sendCommitAction((m) => ({ CommitAllPush: m }));
+document.getElementById("commit-btn").onclick = () => sendCommitAction((m) => ({ Commit: m }));
+document.getElementById("commit-push-btn").onclick = () => sendCommitAction((m) => ({ CommitPush: m }));
 document.getElementById("discard-all-btn").onclick = () => {
   if (confirm("Discard all uncommitted changes?")) {
     sendAction("DiscardAll");
