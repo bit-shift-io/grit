@@ -28,14 +28,39 @@ pub fn encode_client_message(tab: Option<usize>, action: &GitAction) -> String {
 /// single mutation point for adding tabs; both the WebSocket handler and
 /// the desktop GUI route through it so ids come from one allocator.
 ///
-/// The repository directory must exist and contain `.git`; the name is
-/// derived from the folder when empty or "new".
+/// If `url` is given, the repository is cloned from that URL into `path`
+/// (which may be a parent directory git will populate). Otherwise `path`
+/// must be an existing git repository.
 pub async fn open_repo_tab(
     registry: &crate::server::registry::TabRegistry,
     name: String,
     path: String,
+    url: Option<String>,
 ) -> Result<usize, String> {
-    let repo_path = crate::git::types::validate_open_repo_input(&path)?;
+    let repo_path = if let Some(url) = url {
+        let target = std::path::PathBuf::from(&path);
+        std::fs::create_dir_all(&target)
+            .map_err(|e| format!("failed to create target directory: {e}"))?;
+        // Clone the URL into the target directory. If the target exists
+        // and is non-empty git will fail; that's fine — the user chose
+        // the location.
+        let target_clone = target.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["clone", &url, &target_clone.display().to_string()]);
+            cmd.output()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("failed to spawn git clone: {e}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr).trim().to_string();
+            return Err(format!("clone failed: {stderr}"));
+        }
+        target
+    } else {
+        crate::git::types::validate_open_repo_input(&path)?
+    };
     let tab_name = if name.is_empty() || name == "new" {
         repo_path
             .file_name()
@@ -78,21 +103,23 @@ pub fn close_tab_by_id(registry: &crate::server::registry::TabRegistry, id: usiz
     }
 }
 
-/// Parses the NewTab JSON payload into (name, path).
-fn parse_new_tab_payload(payload: &str) -> (String, String) {
+/// Parses the NewTab JSON payload into (name, path, optional url).
+fn parse_new_tab_payload(payload: &str) -> (String, String, Option<String>) {
     if payload.starts_with('{') {
         #[derive(serde::Deserialize)]
         struct NewTabPayload {
             name: String,
             path: String,
+            #[serde(default)]
+            url: Option<String>,
         }
         if let Ok(parsed) = serde_json::from_str::<NewTabPayload>(payload) {
-            (parsed.name, parsed.path)
+            (parsed.name, parsed.path, parsed.url)
         } else {
-            ("new".to_string(), String::new())
+            ("new".to_string(), String::new(), None)
         }
     } else {
-        (payload.to_string(), String::new())
+        (payload.to_string(), String::new(), None)
     }
 }
 
@@ -221,10 +248,10 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     if let crate::git::types::GitAction::NewTab(payload) = &msg.action {
-        let (name, path) = parse_new_tab_payload(payload);
+        let (name, path, url) = parse_new_tab_payload(payload);
         // The "+" form lives entirely in each client's local UI state;
         // NewTab only ever appends a fully validated repository tab.
-        match open_repo_tab(&app.registry, name, path).await {
+        match open_repo_tab(&app.registry, name, path, url).await {
             Ok(new_id) => crate::server::refresh_tab(app, new_id).await,
             Err(reason) => tracing::debug!("NewTab rejected: {reason}"),
         }
@@ -986,7 +1013,7 @@ mod tests {
         let registry = TabRegistry::new();
 
         assert_eq!(
-            super::open_repo_tab(&registry, String::new(), String::new())
+            super::open_repo_tab(&registry, String::new(), String::new(), None)
                 .await
                 .unwrap_err(),
             "Folder path is required"
@@ -995,7 +1022,7 @@ mod tests {
 
         let plain = tempfile::tempdir().unwrap();
         assert!(
-            super::open_repo_tab(&registry, String::new(), plain.path().display().to_string())
+            super::open_repo_tab(&registry, String::new(), plain.path().display().to_string(), None)
                 .await
                 .unwrap_err()
                 .contains("Not a git repository")
@@ -1007,6 +1034,7 @@ mod tests {
             &registry,
             "my project".to_string(),
             repo.path().display().to_string(),
+            None,
         )
         .await
         .unwrap();
@@ -1017,7 +1045,7 @@ mod tests {
         assert_eq!(state.tabs[0].repo_path, repo.path().display().to_string());
 
         // Name is derived from the folder when empty or "new".
-        let second = super::open_repo_tab(&registry, String::new(), repo.path().display().to_string())
+        let second = super::open_repo_tab(&registry, String::new(), repo.path().display().to_string(), None)
             .await
             .unwrap();
         let state = registry.snapshot();

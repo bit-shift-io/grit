@@ -145,18 +145,41 @@ function getTabNameFromPath(path) {
   return name.replace(/-/g, " ");
 }
 
+function getTabNameFromUrl(url) {
+  let clean = url.trim();
+  // Handle SSH URLs: git@github.com:user/repo.git or git@github.com:user/repo
+  if (clean.startsWith("git@")) {
+    // Extract after the colon: user/repo.git
+    const afterColon = clean.split(":")[1] || "";
+    // Remove .git suffix and take the last path segment
+    const repoName = afterColon.replace(/\.git$/, "").replace(/\/.*$/, "");
+    return repoName || null;
+  }
+  // Handle HTTPS URLs: https://github.com/user/repo.git
+  try {
+    const parsed = new URL(clean);
+    const path = parsed.pathname || "";
+    const repoName = path.replace(/\.git$/, "").replace(/^\/+\//, "").split("/").pop();
+    return repoName || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // ======================================
 // Add Repo Form
 // ======================================
 function setupAddRepoForm(tab) {
   const nameInput = document.getElementById("new-repo-name");
   const pathInput = document.getElementById("new-repo-path");
+  const urlInput = document.getElementById("new-repo-url");
   const errorEl = document.getElementById("new-repo-error");
 
   if (nameInput.dataset.tabId !== String(tab.id)) {
     nameInput.dataset.tabId = String(tab.id);
     nameInput.value = "";
     pathInput.value = "";
+    urlInput.value = "";
     delete nameInput.dataset.userSet;
     errorEl.style.display = "none";
     browser.dir = null;
@@ -171,6 +194,7 @@ function setupAddRepoForm(tab) {
   const cancelBtn = document.getElementById("cancel-repo-btn");
 
   nameInput.oninput = () => { nameInput.dataset.userSet = "true"; };
+  urlInput.oninput = () => { urlInput.dataset.userSet = "true"; };
 
   // The path and name fields follow the browser's current folder so the
   // user can just hit "Open Repository" without a separate select step.
@@ -178,6 +202,17 @@ function setupAddRepoForm(tab) {
     pathInput.value = dir;
     if (!nameInput.dataset.userSet) {
       nameInput.value = getTabNameFromPath(dir);
+    }
+  }
+
+  // Update name from URL when URL changes and name hasn't been manually set
+  function updateNameFromUrl() {
+    const url = urlInput.value.trim();
+    if (!nameInput.dataset.userSet && url) {
+      const derivedName = getTabNameFromUrl(url);
+      if (derivedName) {
+        nameInput.value = derivedName;
+      }
     }
   }
 
@@ -230,16 +265,28 @@ function setupAddRepoForm(tab) {
     }
   };
 
+  urlInput.oninput = () => {
+    updateNameFromUrl();
+  };
+
   openBtn.onclick = () => {
     const path = pathInput.value.trim();
-    if (!path) {
-      errorEl.textContent = "Please select a directory";
+    const url = urlInput.value.trim();
+    if (!path && !url) {
+      errorEl.textContent = "Please select a directory or enter a URL";
       errorEl.style.display = "block";
       return;
     }
     errorEl.style.display = "none";
     awaitingNewTab = true;
-    sendAction({ NewTab: JSON.stringify({ name: nameInput.value.trim(), path }) });
+    const payload = {
+      name: nameInput.value.trim(),
+      path,
+    };
+    if (url) {
+      payload.url = url;
+    }
+    sendAction({ NewTab: JSON.stringify(payload) });
   };
 
   cancelBtn.onclick = () => {
@@ -1541,6 +1588,7 @@ document.getElementById("tabs").addEventListener("click", (event) => {
   if (!isNaN(tabId)) {
     activeTabId = tabId;
     updateUrlTab(activeTabId);
+    showAddForm = false;
     if (btn.classList.contains("tab-name")) {
       setView("dashboard");
     } else if (btn.classList.contains("tab-view-btn")) {

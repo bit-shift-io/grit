@@ -431,7 +431,7 @@ impl GritApp {
             Some(registry) => Task::perform(
                 async move {
                     Message::OpenRepoResult(
-                        crate::server::websocket::open_repo_tab(&registry, name, path).await,
+                        crate::server::websocket::open_repo_tab(&registry, name, path, None).await,
                     )
                 },
                 |m| m,
@@ -763,6 +763,7 @@ pub fn run(mode: GuiMode, repo_path: PathBuf, open_explicit: bool) -> iced::Resu
                                             &registry,
                                             String::new(),
                                             repo_path.display().to_string(),
+                                            None,
                                         )
                                         .await,
                                     )
@@ -936,6 +937,7 @@ mod tests {
             &registry,
             "My Repo".to_string(),
             repo_dir.path().display().to_string(),
+            None,
         )
         .await
         .unwrap();

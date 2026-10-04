@@ -204,7 +204,8 @@ ids come from one monotonic allocator and are never reused within a session.
 * **`websocket.rs`**: parses `ClientMessage { tab: Option<usize>, action }`.
   Git actions execute against the target tab's repo then trigger a refresh;
   tab mutations go through the extracted shared ops:
-  * `open_repo_tab(&registry, name, path) -> Result<usize, String>` — validates
+  * `open_repo_tab(&registry, name, path, url) -> Result<usize, String>` — when
+    `url` is given, clones the remote into `path` first; otherwise validates
     tilde expansion, directory existence, and `.git` presence; allocates a fresh id;
     appends; sets `active` to it.
   * `close_tab_by_id(&registry, id) -> bool` — removes any tab (repo files on disk
