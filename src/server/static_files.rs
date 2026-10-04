@@ -1,7 +1,7 @@
 //! Embedded static asset serving (single-binary web UI).
 
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode, HeaderName};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
@@ -25,6 +25,9 @@ pub async fn serve_static(request: Request) -> Response {
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+                    (HeaderName::from_static("query-string"), HeaderValue::from_str(&format!("?t={}",
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))
+                        .unwrap_or_else(|_| HeaderValue::from_static(""))),
                 ],
                 file.data,
             )
