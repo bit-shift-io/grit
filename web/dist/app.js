@@ -384,8 +384,6 @@ function render(state) {
   const actionsSection = document.getElementById("actions");
   const branchesSection = document.getElementById("branches-section");
   const stashesSection = document.getElementById("stashes-section");
-  const filesSection = document.getElementById("files-section");
-  const termView1 = document.getElementById("view-term-1");
 
   if (showAddForm || state.tabs.length === 0) {
     updateUrlTab(null);
@@ -396,8 +394,8 @@ function render(state) {
     actionsSection.style.display = "none";
     branchesSection.style.display = "none";
     stashesSection.style.display = "none";
-    filesSection.style.display = "none";
-    termView1.style.display = "none";
+    setDockVisible("files-section", false);
+    setDockVisible("view-term-1", false);
     document.body.classList.remove("view-dashboard", "view-files", "view-term-1");
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
@@ -796,8 +794,7 @@ function ensureFolioFrame() {
 }
 
 function renderFileBrowser(tab) {
-  const section = document.getElementById("files-section");
-  section.style.display = activeView === "files" ? "block" : "none";
+  setDockVisible("files-section", activeView === "files");
   ensureFolioFrame();
 }
 
@@ -1747,6 +1744,14 @@ document.getElementById("create-stash-btn").onclick = () => {
 
 //#region View dock (Dashboard / Files / Log / Terminals)
 
+// Dock views hold cross-origin iframes and are never taken out of the layout —
+// see the `.term-view` note in style.css. Visibility is therefore a class
+// toggle, not a `display` one: the embedded document keeps its box, its
+// animation frames and its renderer while it is off screen.
+function setDockVisible(id, visible) {
+  document.getElementById(id).classList.toggle("is-active", visible);
+}
+
 function showView(view) {
   activeView = view;
   updateUrlView(view);
@@ -1757,8 +1762,8 @@ function showView(view) {
   document.getElementById("stashes-section").style.display = dashboard ? "block" : "none";
   document.getElementById("history-section").style.display = dashboard ? "block" : "none";
   document.getElementById("log-section").style.display = dashboard ? "block" : "none";
-  document.getElementById("files-section").style.display = view === "files" ? "block" : "none";
-  document.getElementById("view-term-1").style.display = view === "term-1" ? "block" : "none";
+  setDockVisible("files-section", view === "files");
+  setDockVisible("view-term-1", view === "term-1");
   for (const v of ["dashboard", "files", "term-1"]) {
     document.body.classList.toggle(`view-${v}`, v === view);
   }

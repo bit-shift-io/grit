@@ -6,13 +6,33 @@ body { margin: 0; padding: 1rem; height: 100vh; box-sizing: border-box; display:
   display: flex;
   gap: 0.75rem;
 }
-main { flex: 1; min-width: 0; min-height: 0; }
+main { flex: 1; min-width: 0; min-height: 0; position: relative; }
 /* The tab bar's `margin-bottom` owns the gap above the first thing on the page;
    everything below it is spaced by `--stack-gap`. Without this, a rollup that
    happens to be first in the markup would push its view down further than the
    view whose first element is not a rollup. */
 main > :first-child { margin-top: 0; }
-.term-view { padding: 0; height: 100%; overflow: hidden; }
+/* Dock views hold cross-origin iframes (krust, folio) and must never leave the
+   layout. Hiding one with `display: none` takes the container out of layout, so
+   the embedded document has no box: its canvas measures 0x0, its
+   requestAnimationFrame stops firing and its timers are clamped to ~1s, and a
+   renderer whose drawable went to 0x0 can lose its WebGL context. A terminal
+   that stops being rendered comes back blank and stops updating, which a
+   refresh then "fixes" by building the frame over. They stay laid out at full
+   size for the whole session; only visibility and interactivity are toggled,
+   neither of which disturbs the embedded document. */
+.term-view {
+  position: absolute;
+  inset: 0;
+  padding: 0;
+  overflow: hidden;
+  visibility: hidden;
+  pointer-events: none;
+}
+.term-view.is-active {
+  visibility: visible;
+  pointer-events: auto;
+}
 .krust-frame,
 .folio-frame {
   display: block;
