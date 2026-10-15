@@ -99,6 +99,70 @@ terms. Detected once per tab per session.
   Retry-until-answered is strictly more reliable because only a real
   `ls-remote` attempt proves all five.
 
+# Notes: Tab Badge Overlays (Sync + Terminal Activity)
+
+> Follow-on to the sync badge above: replace the inline `↑` text hint with an
+> overlay badge, and reuse the badge system to mark a terminal with new output.
+
+## Goal
+
+The out-of-date hint becomes a graphic overlay (up arrow in a round circle)
+instead of the `↑` span appended to the tab name text, and the same overlay
+system marks the terminal button when the terminal has produced output since
+the user last looked at it.
+
+## Decisions (confirmed 2026-10-15)
+
+- **Terminal change detection = push from krust over `postMessage`.** No
+  polling endpoint, no second observer WebSocket. The krust client page
+  (`client/res/server.html`, embedded into the krust binary at build time)
+  already owns the terminal WebSocket and an output byte counter (`bytesIn`,
+  server.html:723), so a throttled activity ping to `parent` is plain JS —
+  no wasm rebuild, no new HTTP route. Grit listens with
+  `window.addEventListener("message")` and checks `event.origin` against the
+  `KRUST_BASE` origin (grit:5000 vs krust:3000 are cross-origin).
+
+- **Scope = live session only.** Grit has one krust iframe whose session id is
+  derived from the active repo (`sessionIdFor`, app.js:1868) and recycles the
+  old session via `GET /reset` when the active repo changes
+  (`ensureKrustFrame`, app.js:1904). So "new output" is tracked for the
+  session currently bound to the iframe; the badge shows on that tab's `T`
+  button while the terminal view is hidden. Pings are ignored while the term
+  view is active (typing echoes output), and the badge clears when the view is
+  shown or the iframe rebinds to another session.
+
+- **Reload-safe by construction.** The iframe only loads when the terminal view
+  is opened, and the history replay that floods `bytesIn` lands while the view
+  is active — so those pings are ignored and produce no false badge.
+
+- **Badge geometry = the old dock's.** Absolute, top-right, `translate(30%,
+  -30%)`, round, `pointer-events: none` so a click still selects the tab.
+  Sync: amber `--sync-badge` circle with a white `↑` on the tab name.
+  Terminal: plain green dot (`rgba(46,125,50,.85)`, the dock's krust green),
+  no glyph, on the `T` button.
+
+## Implemented
+
+- krust `client/res/server.html`: `pingParentActivity()` at the end of
+  `handleWsData` — throttled to 250ms, targeted at
+  `new URL(document.referrer).origin` (falls back to `*`), no-op when the page
+  is not framed.
+- grit `web/dist/app.js`: `termUnseenSid` state, `sessionIdForRepo()` (per-tab
+  session id for badge matching), `liveSessionId()` (reads the iframe's `?s=`),
+  `handleKrustActivity()` (origin-checked listener). Badge appended in
+  `renderTabBar`; cleared in `showView` (term view shown) and
+  `ensureKrustFrame` (session rebind recycles the old one).
+- grit `web/dist/style.css`: `#tabs .tab-badge` / `-sync` / `-term` replace the
+  old inline `.sync-badge`; `.tab-name` and `.tab-view-btn` gained
+  `position: relative`.
+
+## Deployment
+
+- Both changes take effect only after a rebuild: grit embeds `web/dist/*` via
+  rust-embed, krust embeds `server.html`.
+- The pings need the new krust binary; grit's listener tolerates an old krust
+  (no pings, no badge) — so the features degrade independently.
+
 ## Open Questions
 
 - Badge placement: tab chip only, or also the branch label in the header?

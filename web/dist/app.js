@@ -1238,7 +1238,7 @@ function renderTabBar(state) {
     // the action, this is only a hint that one is warranted.
     if (tab.state.out_of_date) {
       const badge = document.createElement("span");
-      badge.className = "sync-badge";
+      badge.className = "tab-badge tab-badge-sync";
       badge.textContent = "↑";
       badge.title = "Remote has commits you do not have — pull";
       nameBtn.appendChild(badge);
@@ -1268,6 +1268,15 @@ function renderTabBar(state) {
     termBtn.title = "Terminal";
     termBtn.dataset.tabId = tab.id;
     termBtn.dataset.view = "term-1";
+    // Unseen-output dot: only the session currently bound to the krust
+    // iframe can accumulate output while it is off screen, and the ping
+    // names that session — see handleKrustActivity.
+    if (termUnseenSid !== null && termUnseenSid === sessionIdForRepo(tab.repo_path || "", KRUST_SESSIONS["term-1"])) {
+      const badge = document.createElement("span");
+      badge.className = "tab-badge tab-badge-term";
+      badge.title = "New terminal output since you last looked";
+      termBtn.appendChild(badge);
+    }
     group.appendChild(termBtn);
 
     tabsEl.appendChild(group);
@@ -1777,6 +1786,9 @@ function showView(view) {
   const sess = KRUST_SESSIONS[view];
   if (sess) {
     ensureKrustFrame(sess);
+    // The user is looking at the terminal: any pending unseen-output mark
+    // for the session now on screen is stale by definition.
+    termUnseenSid = null;
     const frame = document.getElementById(sess.iframe);
     if (frame && frame.getAttribute("src")) {
       try { frame.contentWindow.focus(); } catch (e) { /* cross-origin focus is best-effort */ }
@@ -1829,6 +1841,8 @@ document.addEventListener("keydown", (event) => {
 //#region krust terminal integration
 
 let krustAvailable = false;
+// Session id with unseen terminal output, or null. See handleKrustActivity.
+let termUnseenSid = null;
 
 function currentRepoPath() {
   if (!lastState || lastState.tabs.length === 0) return "";
@@ -1847,9 +1861,41 @@ function repoScope(path) {
   return base + "-" + Math.abs(h).toString(36);
 }
 
-function sessionIdFor(sess) {
-  return `grit-${repoScope(currentRepoPath())}-term-${sess.n}`;
+function sessionIdForRepo(path, sess) {
+  return `grit-${repoScope(path)}-term-${sess.n}`;
 }
+
+function sessionIdFor(sess) {
+  return sessionIdForRepo(currentRepoPath(), sess);
+}
+
+// The session the krust iframe is currently bound to — the only one that can
+// produce unseen output for this page. Returns null before the first visit.
+function liveSessionId() {
+  const frame = document.getElementById(KRUST_SESSIONS["term-1"].iframe);
+  const src = frame && frame.getAttribute("src");
+  if (!src) return null;
+  const m = /[?&]s=([^&]+)/.exec(src);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+// Unseen terminal output: krust's client page pings the parent (throttled to
+// 250ms) whenever its session emits PTY bytes. Krust runs on :3000 and grit
+// on :5000, so the origin check below is what makes this trustworthy — only
+// pings that actually came from krust count.
+function handleKrustActivity(event) {
+  if (event.origin !== new URL(KRUST_BASE).origin) return;
+  const data = event.data;
+  if (!data || data.type !== "krust:activity") return;
+  // The terminal is on screen: output is expected, not news.
+  if (activeView === "term-1") return;
+  const sid = liveSessionId();
+  if (!sid || sid === termUnseenSid) return;
+  termUnseenSid = sid;
+  if (lastState) renderTabBar(lastState);
+}
+
+window.addEventListener("message", handleKrustActivity);
 
 function krustFrameSrc(sess, sid) {
   return `${KRUST_BASE}/?s=${sid}&dir=${encodeURIComponent(currentRepoPath())}`;
@@ -1868,6 +1914,9 @@ function ensureKrustFrame(sess) {
       try { fetch(`${KRUST_BASE}/reset?session_id=${encodeURIComponent(oldSid)}`, { mode: "cors" }); } catch (e) {}
     }
   }
+  // Rebinding to another repo's session recycles the old one, so a pending
+  // unseen-output mark for it can never be cleared by visiting it again.
+  termUnseenSid = null;
   frame.setAttribute("src", krustFrameSrc(sess, sid));
 }
 

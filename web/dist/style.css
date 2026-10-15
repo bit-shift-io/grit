@@ -163,6 +163,7 @@ main > :first-child { margin-top: 0; }
   padding: 0;
   cursor: pointer;
   font: inherit;
+  position: relative;
 }
 #tabs .tab-view-btn {
   background: none;
@@ -172,20 +173,46 @@ main > :first-child { margin-top: 0; }
   cursor: pointer;
   font: inherit;
   opacity: 0.7;
+  position: relative;
 }
 #tabs .tab-name:hover,
 #tabs .tab-view-btn:hover { text-decoration: underline; }
 #tabs .tab-name.active,
 #tabs .tab-view-btn.active { font-weight: 700; }
 #tabs .tab-name.dirty { font-style: italic; }
-/* Remote-is-ahead hint. Purely decorative: it rides along inside the tab
-   button, so clicking it just selects the tab like the name does. */
-#tabs .sync-badge {
-  margin-left: 0.25rem;
-  font-size: 0.85em;
-  line-height: 1;
-  color: var(--sync-badge, #b8860b);
-  cursor: default;
+/* Overlay badges pinned to a button's top-right corner — the geometry the
+   old view dock used. pointer-events: none keeps a click on a badge
+   behaving exactly like a click on the tab underneath. */
+#tabs .tab-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  transform: translate(30%, -30%);
+  min-width: 1.1rem;
+  height: 1.1rem;
+  line-height: 1.1rem;
+  padding: 0 0.25rem;
+  border-radius: 0.6rem;
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-align: center;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+/* Remote is ahead of the last fetch. Non-interactive: the Pull button is
+   the action, this is only a hint that one is warranted. */
+#tabs .tab-badge-sync { background: var(--sync-badge, #b8860b); }
+/* The terminal produced output since the user last looked. A plain dot, no
+   glyph, so it never reads as a count. */
+#tabs .tab-badge-term {
+  min-width: 0;
+  width: 0.6rem;
+  height: 0.6rem;
+  padding: 0;
+  border-radius: 50%;
+  background: rgba(46, 125, 50, 0.85);
+  transform: translate(25%, -25%);
 }
 #tabs .tab.new-tab {
   font-weight: 700;
