@@ -103,6 +103,14 @@ let pendingCommit = null;
 // Local-only view state: the "+" form never exists as a server-side tab.
 let showAddForm = false;
 let activeView = "dashboard"; // Default view
+// Captured once, before the initial showView("dashboard") below rewrites the
+// URL: updateUrlView("dashboard") deletes ?view, and once it is gone the first
+// state message cannot recover it — the dock iframe would then be left with no
+// src and the terminal would come up blank on first load only.
+const initialUrlView = (function () {
+  const v = new URL(window.location.href).searchParams.get("view");
+  return v && ["dashboard", "files", "term-1"].indexOf(v) !== -1 ? v : null;
+})();
 let historyQuery = "";
 let historySearchTimer = null;
 const knownTabIds = new Set();
@@ -318,9 +326,8 @@ function handleStateMessage(event) {
     activeTabId = null;
   }
   if (lastState === null) {
-    const urlView = new URL(window.location.href).searchParams.get("view");
-    if (urlView && ["dashboard", "files", "term-1"].indexOf(urlView) !== -1) {
-      activeView = urlView;
+    if (initialUrlView) {
+      activeView = initialUrlView;
     }
   }
   const newIds = state.tabs.map((t) => t.id).filter((id) => !knownTabIds.has(id));
