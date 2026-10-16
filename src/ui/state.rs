@@ -574,18 +574,19 @@ fn tab_button_style(
 ) -> impl Fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style {
     move |theme, _status| {
         let palette = theme.palette();
-        let mut style = iced::widget::button::Style::default();
-        style.background = Some(iced::Background::Color(if is_active {
-            palette.primary
-        } else {
-            palette.background
-        }));
-        style.text_color = if is_active {
-            palette.background
-        } else {
-            palette.text
-        };
-        style
+        iced::widget::button::Style {
+            background: Some(iced::Background::Color(if is_active {
+                palette.primary
+            } else {
+                palette.background
+            })),
+            text_color: if is_active {
+                palette.background
+            } else {
+                palette.text
+            },
+            ..iced::widget::button::Style::default()
+        }
     }
 }
 

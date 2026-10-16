@@ -18,7 +18,7 @@ pub use types::{
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +41,38 @@ impl fmt::Display for GitError {
 }
 
 impl std::error::Error for GitError {}
+
+/// Joins a client-supplied relative path onto `repo_path` without allowing it
+/// to escape the repository: absolute paths and `..` components are rejected,
+/// and an existing target is canonicalized so symlinks cannot point outside.
+/// Non-existent targets are returned as-is (callers decide if absence is fatal).
+pub(crate) fn contained_repo_path(repo_path: &Path, rel: &str) -> Result<PathBuf, GitError> {
+    let rel_path = Path::new(rel);
+    let mut out = repo_path.to_path_buf();
+    for comp in rel_path.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(GitError {
+                    message: format!("refusing path outside repository: {rel}"),
+                    stderr: String::new(),
+                    stdout: String::new(),
+                });
+            }
+        }
+    }
+    if let (Ok(canon_out), Ok(canon_repo)) = (out.canonicalize(), repo_path.canonicalize()) {
+        if !canon_out.starts_with(&canon_repo) {
+            return Err(GitError {
+                message: format!("refusing path outside repository: {rel}"),
+                stderr: String::new(),
+                stdout: String::new(),
+            });
+        }
+    }
+    Ok(out)
+}
 
 /// Per-entry cap so a chatty `push`/`clone` cannot flood the web UI log.
 const MAX_LOG_OUTPUT_BYTES: usize = 64 * 1024;

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::routing::get;
 use axum::Router;
 use tokio::sync::{broadcast, mpsc};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::git::sync::{check_remote_sync, SyncOutcome};
 use crate::git::types::RepoState;
@@ -125,7 +125,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _parts| {
+                    websocket::origin_is_allowed(origin.to_str().ok())
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
 }
 
 /// Recomputes the state of one repository tab on a blocking task.
@@ -977,6 +984,34 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    async fn cors_allow_origin_for(origin: &str) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let router = build_router(app_for(dir.path()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn cors_reflects_loopback_but_not_foreign_origin() {
+        assert_eq!(
+            cors_allow_origin_for("http://localhost:5000").await.as_deref(),
+            Some("http://localhost:5000")
+        );
+        assert_eq!(cors_allow_origin_for("http://evil.example").await, None);
     }
 
     #[tokio::test]

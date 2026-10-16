@@ -106,8 +106,18 @@ pub fn execute_action(repo_path: &Path, action: GitAction) -> Result<(), GitErro
     }
     match action {
         GitAction::DiscardUntracked(p) => {
-            let target = repo_path.join(&p);
-            std::fs::remove_file(&target).map_err(|e| GitError {
+            let target = contained_repo_path(repo_path, &p)?;
+            let meta = std::fs::symlink_metadata(&target).map_err(|e| GitError {
+                message: format!("failed to remove {}: {e}", p),
+                stderr: String::new(),
+                stdout: String::new(),
+            })?;
+            let result = if meta.is_dir() {
+                std::fs::remove_dir_all(&target)
+            } else {
+                std::fs::remove_file(&target)
+            };
+            result.map_err(|e| GitError {
                 message: format!("failed to remove {}: {e}", p),
                 stderr: String::new(),
                 stdout: String::new(),
@@ -282,6 +292,54 @@ mod tests {
             "got: {:?}",
             state.changes
         );
+    }
+
+    #[test]
+    fn discard_untracked_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("secret.txt");
+        fs::write(&victim, "keep me\n").unwrap();
+
+        let err = execute_action(
+            dir.path(),
+            GitAction::DiscardUntracked(victim.display().to_string()),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("outside") || err.message.contains("suspicious"), "got: {}", err.message);
+        assert!(victim.exists(), "file outside the repo must survive");
+    }
+
+    #[test]
+    fn discard_untracked_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        // Both tempdirs share a parent (the system temp dir), so `../<name>` from
+        // the repo reaches the sibling's file.
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("escape.txt");
+        fs::write(&victim, "keep me\n").unwrap();
+        let rel = format!(
+            "../{}/escape.txt",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+
+        assert!(execute_action(dir.path(), GitAction::DiscardUntracked(rel)).is_err());
+        assert!(victim.exists(), "traversal target must survive");
+    }
+
+    #[test]
+    fn discard_untracked_removes_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::write(dir.path().join("seed.txt"), "v\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::create_dir(dir.path().join("newdir")).unwrap();
+        fs::write(dir.path().join("newdir/inner.txt"), "x\n").unwrap();
+
+        execute_action(dir.path(), GitAction::DiscardUntracked("newdir".into())).unwrap();
+        assert!(!dir.path().join("newdir").exists(), "untracked dir removed recursively");
     }
 
     #[test]

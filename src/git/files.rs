@@ -35,7 +35,7 @@ pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
     );
     if let Ok(output) = untracked {
         if output.trim() == path {
-            let full_path = repo_path.join(path);
+            let full_path = contained_repo_path(repo_path, path)?;
             match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
                     let mut diff = format!(
@@ -65,9 +65,14 @@ pub fn get_file_diff(repo_path: &Path, path: &str) -> Result<String, GitError> {
 /// because the path does not exist in `HEAD`); any other failure is surfaced so
 /// the UI can distinguish \"untracked\" from a genuine read problem.
 pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError> {
+    let full = contained_repo_path(repo_path, path)?;
     let original = match run(git_command(repo_path).args(["show", &format!("HEAD:{path}")])) {
         Ok(output) => output,
-        Err(e) if e.stderr.contains("not in 'HEAD'") || e.stderr.contains("does not exist") => {
+        Err(e)
+            if e.stderr.contains("not in 'HEAD'")
+                || e.stderr.contains("does not exist")
+                || e.stderr.contains("invalid object name 'HEAD'") =>
+        {
             String::new()
         }
         Err(e) => {
@@ -78,7 +83,7 @@ pub fn get_file_pair(repo_path: &Path, path: &str) -> Result<FilePair, GitError>
             })
         }
     };
-    let current = match std::fs::read_to_string(repo_path.join(path)) {
+    let current = match std::fs::read_to_string(&full) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -160,6 +165,40 @@ mod tests {
         let pair = get_file_pair(dir.path(), "new.txt").unwrap();
         assert_eq!(pair.original, "");
         assert_eq!(pair.current, "brand new\n");
+    }
+
+    #[test]
+    fn get_file_pair_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let sibling = dir.path().parent().unwrap().join("grit-secret.txt");
+        fs::write(&sibling, "top secret\n").unwrap();
+
+        let err = get_file_pair(dir.path(), "../grit-secret.txt").unwrap_err();
+        assert!(err.message.contains("outside repository"), "got: {}", err.message);
+        let _ = fs::remove_file(&sibling);
+    }
+
+    #[test]
+    fn get_file_pair_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let err = get_file_pair(dir.path(), "/etc/hostname").unwrap_err();
+        assert!(err.message.contains("outside repository"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn get_file_pair_allows_nested_path_and_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        fs::write(dir.path().join("a/b/c.txt"), "hi\n").unwrap();
+
+        let pair = get_file_pair(dir.path(), "a/b/c.txt").unwrap();
+        assert_eq!(pair.current, "hi\n");
+
+        let missing = get_file_pair(dir.path(), "a/b/nope.txt").unwrap();
+        assert_eq!(missing.current, "");
     }
 
     #[test]

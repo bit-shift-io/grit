@@ -95,6 +95,28 @@ mod tests {
             .await
             .unwrap();
         let js = String::from_utf8_lossy(&bytes);
+        // The entry module is ESM; the WebSocket connection layer now lives in
+        // common.js.
+        assert!(js.contains("import"));
+
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/common.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript"));
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let js = String::from_utf8_lossy(&bytes);
         assert!(js.contains("WebSocket"));
     }
 

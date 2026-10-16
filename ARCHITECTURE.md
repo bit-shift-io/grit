@@ -38,18 +38,32 @@ ids come from one monotonic allocator and are never reused within a session.
 ├── TASKS.md                 # Step-by-step roadmap for AI implementation
 ├── NOTES.md                 # Design notes and comparative stack evaluations
 ├── web/                     # Web UI source files (embedded at build time)
-│   └── dist/                # Pre-built HTML/CSS/JS frontend assets
+│   └── dist/                # Hand-maintained frontend assets — native ES modules, no bundler
+│       ├── index.html       # Single-page shell: tab strip, view dock, rollup sections, iframes
+│       ├── style.css        # All web styling
+│       ├── common.js        # Shared core: store, WS sync, rendering, tab bar, view routing hooks
+│       ├── diff.js          # Side-by-side file-diff viewer
+│       ├── terminal.js      # View-dock routing + krust/folio iframe integration
+│       └── app.js           # Entry module: imports the others, wires buttons, boots the client
 └── src/
     ├── main.rs              # Entrypoint parsing CLI args and routing execution mode
+    ├── actions.rs           # Project Actions subsystem: discover + fire-and-forget launch repo scripts
+    ├── folio.rs             # Best-effort auto-launch of the folio file-explorer daemon
     ├── krust.rs             # Best-effort auto-launch of the krust terminal daemon
     ├── shared_config.rs     # Shared persistence: config.json load/save/restore/prune
+    ├── test_support.rs      # Shared test helpers (cfg(test)): daemon boot, WS streams, tempdirs
     ├── git/                 # Git Engine subsystem
-    │   ├── mod.rs           # Git CLI command execution logic and status queries
+    │   ├── mod.rs           # Git CLI command execution logic, structured errors, re-exports
     │   ├── types.rs         # Core data models (RepoState, GitStatus, FileChange, GitAction)
+    │   ├── status.rs        # Status, branch, stash, and working-tree change collection
+    │   ├── actions.rs       # Action dispatch, argv tables, shell previews, repository reclone
+    │   ├── files.rs         # File-diff helpers shared by the desktop GUI and the web diff view
+    │   ├── history.rs       # History and commit-summary collection (git log, stats, changed files)
     │   ├── sync.rs          # Remote-sync probe: ls-remote vs cached remote-tracking ref
     │   └── watcher.rs       # Debounced recursive repo-root FS monitoring
     ├── server/              # Embedded Axum Web Server subsystem
-    │   ├── mod.rs           # Axum router, AppState, boot/sync loops, remote-sync ticker, REST handlers
+    │   ├── mod.rs           # AppState, boot/sync loops, remote-sync ticker, router wiring
+    │   ├── handlers.rs      # HTTP handlers: git queries, diffs, health, folder-browser picker
     │   ├── registry.rs      # TabRegistry: single-writer tab list + watch channel + id allocator
     │   ├── websocket.rs     # WS protocol dispatch, shared open_repo_tab/close_tab_by_id ops
     │   └── static_files.rs  # Embedded asset server using rust-embed
@@ -158,10 +172,12 @@ ids come from one monotonic allocator and are never reused within a session.
   `persist_web_state`, `restore_web_state` (with `prune_dead_tabs` filtering
   paths whose `.git` no longer exists). The server is the sole writer of this file.
 
-### 3.4 Axum Web Server (`src/server/mod.rs`, `websocket.rs`, `static_files.rs`)
+### 3.4 Axum Web Server (`src/server/mod.rs`, `handlers.rs`, `websocket.rs`, `static_files.rs`)
 * **`routes`**: `/health`, `/ws` (WebSocket), `/files?tab=&path=` (file diff/pair),
   `/commit?tab=&hash=` (commit summary), `/browse` (server-side folder listing for
-  the add-repo form), `/` and `/{*path}` embedded static assets. (The old
+  the add-repo form), `/` and `/{*path}` embedded static assets. The router is
+  wired in `mod.rs`; the tab-scoped git/diff/health/browse handlers live in
+  `src/server/handlers.rs`. (The old
   `/filetree`, `/filecontent`, `/filesearch` and `/apps` handlers are gone — the
   file browser moved into the `folio` dock and editors into Grit actions.)
 * **Rollup ARIA hardening**: All `.section-title` elements must have `role="button"`,
@@ -261,10 +277,14 @@ hidden when no scripts exist. The web UI exposes the same launcher inside
 
 ### 3.7 Krust Terminal Dock (`src/krust.rs`, `web/dist`)
 * **What it is**: the web UI renders an embedded `krust` web-terminal daemon as
-  two dock views (`term-1` / `term-2`), each a full-height `<iframe>` at
+  a single dock view (`term-1`), a full-height `<iframe>` at
   `http://localhost:3000/?s=<session>&dir=<repo>` backed by an xterm.js client.
   The krust server lives OUTSIDE this repo (`~/Projects/krust`); Grit only
   auto-launches it and shells cross-origin against it.
+* **Dock & views**: the per-tab dock offers the tab name (Dashboard), `F`
+  (files, the folio iframe) and `T` (terminal, `term-1`); the `F`/`T` buttons
+  are hidden while their daemon is down. `L` is **not** a dock button — Log is a
+  collapsible rollup section (`#log-section`) in `index.html`.
 * **Auto-launch** (`src/krust.rs`, `ensure_krust()`): spawned from
   `server::run` on a background Tokio task, best-effort and never fatal.
   `krust_is_up()` TCP-probes `127.0.0.1:3000` (400 ms timeout); only when the
@@ -280,9 +300,6 @@ hidden when no scripts exist. The web UI exposes the same launcher inside
   iframe to the new repo's session and fire-and-forget
   `GET /reset?session_id=<old>` to kill the abandoned PTY. The `dir=` query
   param makes each session start-shell inside that repo.
-* **Reset button**: each terminal view has a hover `Reset` overlay that calls
-  krust's `GET /reset?session_id=<sid>` (kills the PTY child + removes the
-  session) and reloads the iframe with a `&r=<ts>` cache-buster.
 * **Probing & availability**: `probeKrust()` (`KRUST_PROBE_MS=5000` cadence)
   fetches krust's `/` with `mode:"cors"`; when down, the `T` dock buttons hide
   and an active terminal view is force-switched back to the Dashboard.
@@ -361,7 +378,7 @@ UI interaction (desktop OR web) → GitAction → std::process::Command("git" ..
 
 ## 5. Architectural Invariants & Key Rules
 
-1. **Single-Binary Portability**: no external static files, node runtimes, or sidecar daemons in release mode; all web assets embed via `rust-embed`. The JS stays tooling-free (no bundler).
+1. **Single-Binary Portability**: no external static files, node runtimes, or sidecar daemons in release mode; all web assets embed via `rust-embed`. The JS stays tooling-free (native ES modules, no bundler, no build step).
 2. **Unified Data Structures**: desktop UI, WS payloads, and persisted config all derive from the models in `src/git/types.rs` + `registry::{WebState, WebTab}`.
 3. **Single Writer**: only registry operations mutate the tab list; clients are renderers + operation requesters. Ids are allocated once and never reused.
 4. **Non-Blocking UI Thread**: all `git` execution and filesystem work runs on Tokio tasks / background threads; the Iced thread only renders.
@@ -419,6 +436,11 @@ Integration tests boot real daemons on ephemeral ports with isolated
 | `src/ui/state.rs` | `GritApp` pure-client state, `run()`, subscriptions, tests |
 | `src/ui/remote.rs` | Connect-mode WebSocket client (`run_client`/`send_op`) |
 | `src/ui/components/` | Desktop widget panels (header/staging/diff/commit/history/actions) |
-| `web/dist/app.js` | Web client: selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), view dock routing, krust terminal integration |
+| `web/dist/index.html` | Single-page shell: tab strip, view dock, rollup sections, folio/krust iframes |
+| `web/dist/style.css` | All web styling |
+| `web/dist/app.js` | Entry module (native ES): selection invariant, "+" form mode, deep-links (`?t=`, `?view=`), button wiring |
+| `web/dist/common.js` | Shared web core: store, WS sync, rendering, tab bar, view-routing hooks |
+| `web/dist/diff.js` | Side-by-side file-diff viewer |
+| `web/dist/terminal.js` | View-dock routing + krust/folio iframe integration |
 | `TASKS.md` | Original build roadmap (historical) |
 | `NOTES.md` | Design rationale |

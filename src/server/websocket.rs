@@ -2,7 +2,7 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
 
@@ -123,7 +123,34 @@ fn parse_new_tab_payload(payload: &str) -> (String, String, Option<String>) {
     }
 }
 
-pub async fn ws_handler(ws: WebSocketUpgrade, State(app): State<AppState>) -> Response {
+/// True when a WebSocket handshake's Origin is acceptable. A missing Origin is
+/// allowed: the desktop remote client and the test harness are native and never
+/// send one. A browser Origin is allowed only for a loopback host, which is the
+/// whole point of the check — any other site's page in the user's browser is a
+/// CSWSH attempt.
+pub(crate) fn origin_is_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin else { return true };
+    let host_port = origin.split("://").nth(1).unwrap_or("");
+    let host_port = host_port.split('/').next().unwrap_or("");
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    if !origin_is_allowed(origin) {
+        return (axum::http::StatusCode::FORBIDDEN, "forbidden origin").into_response();
+    }
     ws.on_upgrade(move |socket| handle_websocket(socket, app))
 }
 
@@ -398,6 +425,52 @@ mod tests {
         assert_eq!(
             super::resolve_tab_repo(&registry, Some(0), "SearchHistory"),
             Some((0, std::path::PathBuf::from("/tmp/x")))
+        );
+    }
+
+    #[test]
+    fn origin_is_allowed_accepts_loopback_and_missing() {
+        assert!(super::origin_is_allowed(None), "native client sends no Origin");
+        assert!(super::origin_is_allowed(Some("http://localhost:5000")));
+        assert!(super::origin_is_allowed(Some("http://127.0.0.1:5000")));
+        assert!(super::origin_is_allowed(Some("http://[::1]:5000")));
+    }
+
+    #[test]
+    fn origin_is_allowed_rejects_foreign_and_lookalike() {
+        assert!(!super::origin_is_allowed(Some("http://evil.example")));
+        assert!(!super::origin_is_allowed(Some("https://localhost.evil.com")));
+        assert!(!super::origin_is_allowed(Some("https://127.0.0.1.evil.com")));
+        assert!(!super::origin_is_allowed(Some("null")), "file:// / sandboxed origins are null");
+    }
+
+    #[tokio::test]
+    async fn websocket_rejects_foreign_origin_but_accepts_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app, rx);
+
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::Request as HttpRequest;
+
+        let build = |origin: &str| {
+            let mut req: HttpRequest<()> = format!("ws://{addr}/ws").into_client_request().unwrap();
+            req.headers_mut()
+                .insert("origin", origin.parse().unwrap());
+            req
+        };
+
+        assert!(
+            tokio_tungstenite::connect_async(build("http://evil.example")).await.is_err(),
+            "foreign origin must be refused"
+        );
+        assert!(
+            tokio_tungstenite::connect_async(build("http://localhost:5000")).await.is_ok(),
+            "loopback origin must be accepted"
         );
     }
 

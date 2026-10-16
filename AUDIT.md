@@ -1,328 +1,193 @@
-# Codebase Audit
+# Codebase Audit — Grit
 
-Two independent audits are recorded in this file. Their scopes do not overlap,
-so both are kept:
-
-- **Part 1 — Build & Dependency Audit** (2026-09-27): Rust crate-graph
-  reduction. **Completed** — see `TASKS.md` Part 1 for the applied changes and
-  the measured before/after crate counts.
-- **Part 2 — Web UI Audit: Grit vs Tally**: front-end modularisation of the
-  monolithic `web/dist/app.js`. **Open** — see `TASKS.md` Part 2.
+**Audit Target:** `grit` — Fast, native, single-binary Git client (Rust / Iced / Axum)  
+**Date:** 2026-10-16  
+**Auditor:** AI Agent Pair-Programmer (Google Antigravity)  
+**Scope:** Full-stack comprehensive audit: Compilation & Clippy health, Dependency & Binary size, Security & Sandboxing, Architecture & Concurrency invariants, Web UI (`web/dist/`), and Documentation integrity.
 
 ---
 
-## Part 1 — Build & Dependency Audit (completed)
+## 1. Executive Summary & Health Scorecard
 
-**Audit Target:** `grit` — fast, native, single-binary Git client (Rust / Iced / Axum)
-**Date:** 2026-09-27
-**Focus:** Build-time optimisation via dependency graph reduction (primary), plus general health sweep
+The Grit codebase is in exceptionally strong engineering health. Recent refactoring efforts resolved previously identified build breakages (such as the desktop test compilation issue at HEAD `3544d39`) and achieved dramatic crate-graph reductions across both web-only and desktop targets. The Rust implementation is 100% safe Rust (zero `unsafe` blocks), contains zero `panic!` invocations in production code, has zero TODO/FIXME markers, and maintains strict non-blocking UI and single-writer concurrency invariants.
 
----
+However, this audit identified **two significant security vulnerabilities** in the web daemon layer (an unconstrained path traversal in file deletion and missing Origin validation on the WebSocket endpoint), **two frontend integration bugs** with external companion tools (`krust` and `folio`), **one compiler warning** in the desktop clippy pass, and notable **documentation drift** in `ARCHITECTURE.md` and `AGENTS.md`.
 
-### Executive Summary
+### Health Scorecard
 
-The Rust code itself is in very good shape: **zero compiler warnings** on the web-only and desktop
-builds, **zero unreferenced public items**, **zero TODO/FIXME/HACK/XXX markers**, and no
-commented-out code or stray debug statements. The previous audit's findings (innerHTML injection,
-dead CSS ids, orphan `CONTEXT.md`, silent `get_file_pair` failures) have all been resolved.
-
-The real cost lives entirely in `Cargo.toml`. The web-only build resolves **1123 crates**; the
-desktop build resolves **19524 crates**. Roughly **38% of each graph is removable with no change in
-observable behaviour** — almost all of it from features and optional machinery that the code never
-touches. `target/` has reached **12 GB**.
-
-The three worst offenders are all "declared but unused":
-
-1. **`iced`'s `linux-theme-detection`** — pulls `ashpd` → `zbus` (a full D-Bus stack), `x11rb`, and
-   `sctk-adwaita`, while `src/ui/state.rs:770` hardcodes `.theme(iced::Theme::Dark)`. **6995 crates.**
-2. **`iced`'s `wgpu`** — the entire GPU backend (wgpu-core/naga/wgpu-hal) for a UI built only from
-   `button`/`column`/`row`/`rule`/`text`/`text_input`/`pick_list`. No canvas, no image, no SVG.
-   **3844 crates.**
-3. **`tower-http`'s `fs` + `trace` features** — the code imports exactly one symbol from
-   `tower-http`: `CorsLayer` at `src/server/mod.rs:14`. Assets are served from the embedded
-   `rust-embed` bundle instead. **133 crates.**
-
-All numbers below are *measured*, not estimated: each configuration was applied to a scratch copy of
-the manifest and resolved with `cargo tree --no-dedupe`, then diffed against baseline.
+| Area | Status | Notes |
+| :--- | :---: | :--- |
+| **Compiler (`cargo check`)** | **PASS** | 0 warnings on default web-only and `--features desktop --all-targets` |
+| **Clippy (`cargo clippy`)** | **WARN** | 0 warnings on default build; **1 warning** on desktop (`field_reassign_with_default`) |
+| **Test Suite (`cargo test`)** | **PASS** | **191 web / 219 desktop tests passing**, 0 failed |
+| **Memory & Type Safety** | **EXCELLENT** | **0 `unsafe` blocks**, 0 production `panic!`, only 11 justified unwraps |
+| **Dependencies & Build Graph** | **OPTIMIZED** | **705 crates** (web-only, -37%) / **12,071 crates** (desktop, -38%) |
+| **Security & Sandboxing** | **NEEDS WORK** | Path traversal in `DiscardUntracked`; missing WebSocket Origin validation |
+| **Web Frontend (`web/dist/`)** | **FUNCTIONAL** | Valid JS (`node --check` clean), safe DOM (0 `innerHTML`), but 2 dock/probe bugs |
+| **Documentation Fidelity** | **DRIFT** | Omissions in `ARCHITECTURE.md` tree; stale references in `AGENTS.md` |
 
 ---
 
-### Key Metrics
+## 2. Key Codebase Metrics
 
-| Metric | Value |
-| :--- | :--- |
-| Rust LOC (`src/`) | 9099 across 28 files |
-| Crates, web-only build | **1123** → **701** achievable (**-38%**) |
-| Crates, desktop build | **19524** → **12529** achievable (**-37%**) |
-| `target/` size | **12 GB** |
-| Unused / orphan files | 0 |
-| Dead functions or exports | 0 |
-| Commented-out code / debug logs | 0 (`eprintln!` ×2 in `main.rs`, `mod.rs` — both intentional user-facing errors) |
-| Open TODOs / FIXMEs | 0 |
-| Compiler warnings | 0 (web-only **and** desktop) |
-| **Blocking build error** | **1** — `cargo check --features desktop --all-targets` fails (see §4) |
-
----
-
-### Findings & Recommendations
-
-#### 1. Dependency Removal — Web-Only Build (default `cargo build`)
-
-Ranked by crates eliminated. Every row is independently applicable.
-
-| # | Change | Crates saved | Code refs | Effort |
-| :--- | :--- | :--- | :--- | :--- |
-| 1 | `tower-http` → `default-features = false, features = ["cors"]` | **-133** | 1 (`CorsLayer`, `server/mod.rs:14`) | Trivial |
-| 2 | `futures-util` → `default-features = false, features = ["std", "sink"]` | **-91** | 11 | Trivial |
-| 3 | `tokio` → replace `features = ["full"]` with the explicit list | **-77** | 139 | Trivial |
-| 4 | Drop `freedesktop-desktop-entry` entirely | **-50** | 4 | Medium |
-| 5 | `tracing-subscriber` → drop `env-filter` | **-36** | 1 (`fmt::init`) | Trivial |
-| 6 | Drop `clap` | **-27** | 1 (`Parser`) | Medium |
-| 7 | Align `tokio-tungstenite` to `0.29` (dedupe) | -6 distinct | dev + `ui/remote.rs` | Trivial |
-| 8 | Drop `dirs` | -4 | 2 | Trivial |
-| | **Combined** | **-422** | | |
-
-**Row 1 detail.** `fs` and `trace` are dead. `src/server/static_files.rs` serves everything from
-`rust_embed`; there is no `ServeDir` anywhere. `TraceLayer` is never imported. `fs` drags in
-`tokio-util` + `http-range-header`; `trace` drags in `http-body-util` + `tracing` plumbing.
-
-**Row 3 detail.** Only these tokio modules are referenced: `net`, `sync`, `time`, `io`, `runtime`,
-`macros`. `full` additionally compiles `process`, `signal`, `fs`, `sync` extras, and the
-multi-threaded scheduler surface grit never touches. Suggested:
-`features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"]` — **but verify**:
-`src/git/watcher.rs` uses `notify`, not `tokio::fs`, and git itself runs through `std::process::Command`
-(per `AGENTS.md` §3.3), so `process`/`fs`/`signal` should be droppable. Needs a `cargo check` to confirm.
-
-**Row 4 detail — the highest-value code change.** `freedesktop-desktop-entry` is used for exactly
-one job: scanning installed `.desktop` files for `Categories=…TerminalEmulator` to discover terminal
-emulators (`src/actions.rs:290-342`, `707-708`). That is a plain INI scan over
-`~/.local/share/applications` and `/usr/share/applications`, and this repo *already* hand-rolls the
-same `.desktop` parsing in `decode_entry` at `src/actions.rs:707`. The crate costs 50 crates and,
-worse, pulls **`gettext-sys` — a C library that is compiled and linked during every build**. Removing
-it means writing one ~40-line INI scanner. Note that the priority order in `desktop_file_terminals()`
-already comes from the iteration order, so no behavioural loss is expected.
-
-**Row 5 detail.** `tracing_subscriber::fmt::init()` is the only call. `env-filter` pulls
-`regex` + `matchers` + `aho-corasick`. Combined with row 4 (which removes the *other* `regex` source),
-the whole regex stack disappears from the graph — that is why rows 4+5 together are worth -80, not
--86. Use `default-features = false, features = ["fmt", "ansi"]`.
-
-**Row 6 detail.** `clap` exists to parse three flags (`--headless`, `--port`, `--path`) plus
-`--version`/`--help`, declared at `src/main.rs:18-32`. 27 crates for that. Hand-rolling costs ~50
-lines and loses nothing the UI uses. Keep in mind two `#[test]`s at `main.rs:144-157` assert on
-`Cli::parse_from`, so they need rewriting alongside.
-
-**Row 7 detail.** `axum 0.8` resolves `tokio-tungstenite 0.29`, while the manifest pins `0.30` for
-both the `desktop` optional dep and the dev-dep. Result: **two complete copies** of the websocket
-stack compile. Dropping to `0.29` removes `tungstenite 0.30`, `tokio-tungstenite 0.30`, `sha1 0.11`,
-`chacha20`, `rand 0.10`, and `rand_core 0.10`, collapsing the duplicated `sha1`/`digest`/`block-buffer`
-stack from two generations to one. `src/ui/remote.rs:9` imports `tokio_tungstenite::tungstenite::Message`,
-which becomes the *same* type `axum::extract::ws` uses — so it gets simpler, not harder.
-
-**Row 8 detail.** Two calls: `dirs::home_dir()` (`folio.rs:81`) and `dirs::config_dir()`
-(`shared_config.rs:26`). Both are `$HOME` and `$XDG_CONFIG_HOME`/`.config` respectively — ~6 lines
-of `std::env` code.
-
-**Not a win — recorded so it is not re-attempted.** Switching `rfd` from its default
-`["xdg-portal", "async-std"]` to `["xdg-portal", "tokio"]` removes `async-fs` and `async-net` but
-*adds* 7 crates back through `ashpd`'s tokio integration. Net **+7**. It does eliminate a redundant
-second async runtime from the graph, which is worth something for binary size and clarity, but it
-will not speed up the build. Also worth noting: `rfd::FileDialog::pick_folder()` at
-`src/ui/state.rs:213` is a **blocking** call wrapped in `Task::perform`, i.e. it blocks an iced
-runtime worker. `rfd::AsyncFileDialog` is the correct API there — a correctness issue, not a build one.
-
-#### 2. Dependency Removal — Desktop Build (`--features desktop`)
-
-| # | Change | Crates saved | Justification |
-| :--- | :--- | :--- | :--- |
-| 1 | Drop iced's `linux-theme-detection` | **-6995** | `ashpd`→`zbus` (D-Bus), `x11rb`, `sctk-adwaita` — all to auto-detect a theme the app hardcodes as Dark (`ui/state.rs:770`) |
-| 2 | Drop iced's `wgpu`, keep `tiny-skia` | **-3844** | Text/file-list UI; no `canvas`, `image`, or `svg` widget is used anywhere |
-| 3 | Optionally drop `wayland` | **-1884** | Only if the dev box and users are X11-only |
-| | **Combined (1+2)** | **-6995** → 12529 crates (**-36%**) | |
-
-This is a one-line change to `Cargo.toml`:
-
-```toml
-iced = { version = "0.14", optional = true, default-features = false,
-         features = ["tiny-skia", "crisp", "web-colors", "thread-pool",
-                     "x11", "wayland", "tokio"] }
-```
-
-`crisp` and `wayland` are neutral in crate count (measured identical either way) but are cheap to
-keep and avoid gratuitous breakage. Add `linux-theme-detection` back later only if the app ever
-respects the system theme — and then remove the hardcoded `Theme::Dark` at the same time.
-
-#### 3. Documentation Drift
-
-| File | Issue | Recommendation |
+| Metric | Measured Value | Comparison / Target |
 | :--- | :--- | :--- |
-| `ARCHITECTURE.md:13` | Claims desktop UI uses "native rendering (`wgpu` / `winit`)" | Update if `wgpu` is dropped in favour of `tiny-skia` |
-| `ARCHITECTURE.md:17` | Lists `clap` as the "CLI Engine" | Update if `clap` is removed |
-| `ARCHITECTURE.md:19` | Lists `tracing-subscriber` alongside `tracing` | Note the reduced feature set once trimmed |
-| `AGENTS.md:25` | Says the default build "excludes `iced`/`rfd`" — still accurate, but the directory map omits `src/folio.rs` entirely | Add `folio.rs` to the §2 directory map (it is the `folio` file-explorer auto-launcher, the sibling of `krust.rs`) |
-| `NOTES.md`, `TODO.md` | Historical planning docs for the now-removed in-process file browser (`src/git/files.rs:1-3` documents the removal) | Mark as historical or archive, so they stop describing a system that no longer exists |
-
-#### 4. Build Breakage — Requires a Fix
-
-| File | Issue | Severity | Recommended Action |
-| :--- | :--- | :--- | :--- |
-| `src/ui/state.rs:802` | `cargo check --features desktop --all-targets` **fails**: `error[E0063]: missing fields 'remote_branches' and 'stashes' in initializer of types::RepoState`. The `repo_state()` test helper was not updated when those fields were added to `RepoState` (`src/git/types.rs`). Working tree is clean, so this is committed at HEAD (`3544d39`). | **High** — the entire desktop test target does not compile, so no desktop test has run since those fields landed | Add `remote_branches: vec![]` and `stashes: vec![]` to the literal at `ui/state.rs:802` |
-
-Note that plain `cargo check --features desktop` (no `--all-targets`) passes, which is why this can
-hide. `cargo test` (web-only) also passes, which is why CI-style default runs miss it.
-
-#### 5. Code Structure & Complexity Smells
-
-| File | Issue | Context | Suggested Refactor |
-| :--- | :--- | :--- | :--- |
-| `src/ui/state.rs:184` | `update()` is **173 lines** — a single flat `match` over every `Message` variant | Largest function in the repo by 2×; every new message lengthens it further | Split into `handle_tab_message` / `handle_git_message` / `handle_dialog_message` sub-dispatchers |
-| `src/git/mod.rs:163` | `run_streamed()` is **95 lines** with 4 sequential fallback strategies | Hard to reason about which git error is swallowed | Extract one `try_diff(repo, args) -> Option<String>` helper per strategy |
-| `src/server/websocket.rs:170` | `SplitSink<WebSocket, Message>` passed as a bare generic parameter instead of `&mut` in one signature, while sibling code uses `&mut` | Inconsistent; invites aliasing mistakes | Normalise to `&mut` |
-| `src/git/history.rs:13-16, 173-176` | 9 `unwrap_or_default()` calls in git-output parsing | Acceptable here — git log formats vary and a lenient parse is correct — but worth a comment stating that intent so it is not "fixed" later | Add one explanatory comment per parse function |
-
-#### 6. Comment Quality — Clean
-
-No stale comments, no commented-out blocks, no `dbg!`. The module docs in `src/git/files.rs:1-3`
-and `src/folio.rs:1-13` are accurate and usefully explain *why* code was removed. This is a
-well-maintained codebase on the documentation front.
+| **Rust Source LOC (`src/`)** | **10,958 lines** (28 files) | Cleanly divided into git, server, and ui modules |
+| **Frontend LOC (`web/dist/`)** | **2,739 lines** (4 files) | `app.js` (1,885), `style.css` (732), `index.html` (119) |
+| **Total Codebase LOC** | **13,879 lines** (32 files) | Single self-contained repository |
+| **Crates, Web-only (`cargo tree`)** | **705 crates** | Down from 1,123 crates baseline (-37.2%) |
+| **Crates, Desktop (`--features desktop`)** | **12,071 crates** | Down from 19,524 crates baseline (-38.2%) |
+| **`target/` Directory Size** | **16 GB** | Accumulated debug and release build artifacts |
+| **Production `unsafe` blocks** | **0** | 100% Safe Rust |
+| **Production `panic!` calls** | **0** | Verified via AST grep across all non-test modules |
+| **Open TODO / FIXME / HACK markers** | **0** | Clean repository hygiene |
+| **Non-test `unwrap()` / `expect()`** | **11** | Strictly limited to piped stdio handles and thread scopes |
 
 ---
 
-### Top Priority Action Plan
+## 3. Detailed Findings
 
-1. **[High]** Fix the desktop test build break at `src/ui/state.rs:802` — add the two missing
-   `RepoState` fields. Nothing else can be validated on `--features desktop` until this lands.
-2. **[High]** Apply the four trivial manifest changes that need no code edits: `tower-http` →
-   cors-only, `futures-util` → `default-features = false`, `tokio` off `full`, `tracing-subscriber`
-   off `env-filter`, and `tokio-tungstenite` → `0.29`. **~330 crates gone from the default build**
-   for a one-file diff.
-3. **[High]** Drop `iced`'s `linux-theme-detection` and `wgpu` in favour of `tiny-skia`. **-6995
-   crates (-36%)** on the desktop build, with no change to any UI behaviour.
-4. **[Medium]** Hand-roll the `.desktop` `TerminalEmulator` scan in `src/actions.rs` and delete
-   `freedesktop-desktop-entry`, eliminating the `gettext-sys` C build. ~40 lines of INI parsing,
-   and the repo already does this once at `actions.rs:707`.
-5. **[Medium]** Replace `clap` with a hand-rolled parser for the three flags in `src/main.rs`, and
-   drop `dirs` for two `std::env` lookups. Rewrite the two `Cli::parse_from` tests at `main.rs:144`.
-6. **[Medium]** Split `GritApp::update` (`src/ui/state.rs:184`, 173 lines) and
-   `run_streamed` (`src/git/mod.rs:163`, 95 lines).
-7. **[Low]** Update `ARCHITECTURE.md:13,17,19` and add `src/folio.rs` to the `AGENTS.md` §2 map;
-   archive `NOTES.md` / `TODO.md`.
-8. **[Low]** Switch `rfd::FileDialog` → `rfd::AsyncFileDialog` at `src/ui/state.rs:213` to stop
-   blocking an iced runtime worker on a modal dialog.
+### 3.1 Security & Sandboxing (High Priority)
 
----
+#### [SEC-01] Path Traversal & Arbitrary File Deletion in `DiscardUntracked`
+* **Severity:** **HIGH**
+* **Location:** [`src/git/actions.rs:108-115`](file:///home/bronson/Projects/grit/src/git/actions.rs#L108-L115)
+* **Description:**  
+  When handling `GitAction::DiscardUntracked(p)`, the code constructs a target path via `repo_path.join(&p)` and calls `std::fs::remove_file(&target)`.
+  1. In Rust standard library, `Path::join` replaces the entire path if the argument `p` is an absolute path (e.g., `Path::new("/home/user/repo").join("/etc/hosts")` yields `PathBuf::from("/etc/hosts")`).
+  2. If `p` contains relative directory traversals (`../../`), `join` traverses out of the repository directory.
+  3. Unlike `src/actions.rs::launch()`, which enforces strict containment checks (`starts_with('/')`, `contains("..")`, `canonical.starts_with(&canonical_repo)`), `DiscardUntracked` performs **no containment verification**.
+  4. Furthermore, if `p` points to an untracked directory rather than a file, `std::fs::remove_file` fails with `EISDIR`.
+* **Recommendation:**  
+  Validate that `p` is neither absolute nor contains traversal components, resolve its canonical path, verify `canonical.starts_with(&canonical_repo)`, and handle directories with `std::fs::remove_dir_all`.
 
-### Verification Notes
+#### [SEC-02] Permissive CORS & Missing WebSocket Origin Validation (CSWSH)
+* **Severity:** **HIGH**
+* **Location:** [`src/server/mod.rs:128`](file:///home/bronson/Projects/grit/src/server/mod.rs#L128) and [`src/server/websocket.rs:88`](file:///home/bronson/Projects/grit/src/server/websocket.rs#L88)
+* **Description:**  
+  The HTTP server sets `CorsLayer::permissive()`, allowing any web origin to read REST responses. More critically, the WebSocket upgrade route `/ws` performs **no check on the HTTP `Origin` header**.
+  Because WebSockets are exempt from standard browser Same-Origin Policy (SOP), any malicious website visited in the user's browser (e.g. `https://malicious-site.example`) can open a WebSocket connection to `ws://localhost:5000/ws`. Upon connection:
+  - The attacker receives real-time JSON dumps of all open repositories, local paths, commits, and file changes.
+  - The attacker can send arbitrary `GitAction` commands, including `DiscardUntracked` (deleting files), `DiscardAll` (resetting uncommitted work), `RunScript` (executing repo scripts), or `CommitAllPush`.
+* **Recommendation:**  
+  Reject WebSocket upgrades whose `Origin` header does not match `localhost`, `127.0.0.1`, or the configured daemon address.
 
-- **Measured, not estimated.** Every crate-count figure was produced by copying `Cargo.toml`,
-  `Cargo.lock`, `src/`, and `web/` to a scratch directory, applying the candidate change, and running
-  `cargo tree --prefix none --no-dedupe`. The project's real `Cargo.toml` was never modified.
-- Counts are `--no-dedupe` line totals, so a change that shifts a version *within* an existing crate
-  (e.g. `rand 0.9` → `rand 0.10`) can move the total slightly while still removing distinct crates.
-  Where the line count and the distinct-crate set disagreed, the distinct-crate set is reported —
-  see the `tokio-tungstenite` and `rfd` rows.
-- Baseline established at commit `3544d39` with a clean working tree.
-- Suggested post-change gate: `cargo check`, `cargo check --features desktop --all-targets`
-  (currently broken — see §4), `cargo test`, and `cargo test --features desktop`.
-- Per `AGENTS.md`, do not restart the user's running `krust`/`grit` daemons; state what needs
-  restarting instead. Note also that `web/dist/*` is embedded at compile time, so a rebuild is
-  required for any frontend change to take effect.
+#### [SEC-03] Arbitrary File Read in REST `/files` Handler
+* **Severity:** **MEDIUM**
+* **Location:** [`src/server/handlers.rs:61-64`](file:///home/bronson/Projects/grit/src/server/handlers.rs#L61-L64) and [`src/git/files.rs:81`](file:///home/bronson/Projects/grit/src/git/files.rs#L81)
+* **Description:**  
+  The `/files?tab=X&path=Y` endpoint delegates to `get_file_pair`, which executes `std::fs::read_to_string(repo_path.join(path))`. If `path` is an absolute path or contains traversal sequences, any arbitrary text file readable by the daemon process on the host can be read and returned via HTTP JSON.
+* **Recommendation:**  
+  Sanitize `path` against path traversal and verify that the target path remains inside `repo_path`.
 
 ---
 
-## Part 2 — Web UI Audit: Grit vs Tally (open)
+### 3.2 Frontend & UI Integration (`web/dist/`)
 
-### Summary
+#### [FE-01] Broken Krust Terminal Button Hiding (`.krust-btn` Class Missing)
+* **Severity:** **MEDIUM**
+* **Location:** [`web/dist/app.js:1258-1268`](file:///home/bronson/Projects/grit/web/dist/app.js#L1258-L1268) & [`web/dist/app.js:1865`](file:///home/bronson/Projects/grit/web/dist/app.js#L1865)
+* **Description:**  
+  In `app.js`, `probeKrust()` periodically probes `http://localhost:3000/` and attempts to hide terminal buttons when Krust is unavailable:
+  ```javascript
+  document.querySelectorAll(".krust-btn").forEach((btn) => {
+    btn.style.display = ok ? "" : "none";
+  });
+  ```
+  However, in `renderTabBar()`, the terminal button is created with:
+  ```javascript
+  const termBtn = document.createElement("button");
+  termBtn.className = "tab-view-btn"; // Does NOT include krust-btn!
+  ```
+  Because the class `.krust-btn` is never attached to `termBtn`, the query matches zero elements. As a result, the `T` button is **always displayed**, even when Krust is not installed or not running, violating the specification in `AGENTS.md`.
+* **Recommendation:**  
+  Add `termBtn.classList.add("krust-btn")` in `renderTabBar()`.
 
-Grit's web UI is functional and correct, but its `app.js` (1688 lines) is a single monolithic file that mixes concerns. Tally demonstrates a cleaner approach with modular JS files, better architectural documentation, and clearer separation of concerns. The refactor is worthwhile as an incremental improvement to maintainability, especially if the web UI will evolve further.
+#### [FE-02] Missing Folio File Explorer Button Toggle
+* **Severity:** **LOW**
+* **Location:** [`web/dist/app.js:804-811`](file:///home/bronson/Projects/grit/web/dist/app.js#L804-L811)
+* **Description:**  
+  While `probeFolio()` detects if Folio is running on port 4000 and falls back to `dashboard` if inactive, it never toggles the visibility or active state of the "F" (Files) tab button in the tab bar.
+* **Recommendation:**  
+  Add a `.folio-btn` class to `filesBtn` and toggle its display or disabled styling based on `folioAvailable`.
 
-### Current State (Grit)
+#### [FE-03] Dead `keydown` Event Listener
+* **Severity:** **LOW**
+* **Location:** [`web/dist/app.js:1811-1815`](file:///home/bronson/Projects/grit/web/dist/app.js#L1811-L1815)
+* **Description:**  
+  An empty global `keydown` listener exists at the bottom of `app.js`:
+  ```javascript
+  document.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    const tag = event.target && event.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  });
+  ```
+  This is orphan boilerplate from previous keyboard shortcut experiments and performs no actions.
+* **Recommendation:**  
+  Remove the dead event listener or implement the intended shortcuts.
 
-**Files:**
-- `web/dist/app.js`: 1688 lines - everything in one file (WebSocket, state, rendering, diff/LCS, history, branches/stashes, terminals, etc.)
-- `web/dist/style.css`: 663 lines - single stylesheet
-- `web/dist/index.html`: Single SPA with all sections, uses `?view=` for routing (dashboard/files/term-1)
-- Embedded via `rust-embed` at compile time, hand-maintained, no build step
+#### [FE-04] Monolithic `app.js` Architecture
+* **Severity:** **INFORMATIONAL / MAINTAINABILITY**
+* **Location:** [`web/dist/app.js`](file:///home/bronson/Projects/grit/web/dist/app.js) (1,885 lines)
+* **Description:**  
+  All frontend concerns (WebSocket transport, state management, diff alignment algorithms, folder picker, commit/branch/stash actions, and iframe docks) are combined in one global script. While functional, modularizing into ES modules (`common.js`, `diff.js`, `terminal.js`, `app.js`) without a bundler will significantly improve maintainability and testability.
 
-**Strengths:**
-- Good sectioning with clear headers (`// ======================================`)
-- Solid state management: single-expansion invariant (`expanded`), revision tracking to suppress redundant renders, caching (`pairCache`, `commitCache`)
-- Clean view switching with deep links and proper focus handling for iframes (krust/folio)
-- Robust reconnection logic with exponential backoff, handles page visibility changes
-- Well-structured folder browser for repo selection
+---
 
-**Weaknesses:**
-- **Monolithic file**: All concerns mixed together (connection, DOM, business logic, algorithms). Hard to navigate and modify safely.
-- **Size**: 1688 lines is large enough that changes in one area risk side effects in others.
-- **Limited architectural documentation**: Fewer "why" comments explaining invariants compared to Tally. Design constraints aren't explicitly documented at file/module level.
-- **Mixed responsibilities**: Diff/LCS algorithm (~150-200 lines), WebSocket handling, state management, and DOM rendering all co-located.
-- **No module boundaries**: Everything shares global scope, making future testing or extraction harder.
+### 3.3 Rust Compiler & Clippy Analysis
 
-### Comparison with Tally
+#### [RUST-01] Clippy Warning: `field_reassign_with_default`
+* **Severity:** **LOW / CODE HYGIENE**
+* **Location:** [`src/ui/state.rs:577-588`](file:///home/bronson/Projects/grit/src/ui/state.rs#L577-L588)
+* **Description:**  
+  `cargo clippy --features desktop --all-targets` emits:
+  ```text
+  warning: field assignment outside of initializer for an instance created with Default::default()
+     --> src/ui/state.rs:578:9
+  ```
+  `let mut style = iced::widget::button::Style::default();` followed by field overwrites should be initialized directly within the struct literal.
+* **Recommendation:**  
+  Construct `iced::widget::button::Style` in a single expression using struct update syntax.
 
-Tally (`~/Projects/tally/web/dist/`):
-- Modular split: `common.js` (126 lines) for shared utilities (`getJson`, `showNotice`, rollup wiring) + page-specific modules (`dashboard.js`, `forms.js`, `reports.js`, editor domain in `app.js`).
-- Excellent architectural comments explaining *why* (e.g. "server is the only source of truth", "edits are staged", invariants documented upfront).
-- CSS split (`base.css`, `grid.css`) by concern.
-- Per-page JS modules loaded as needed.
+---
 
-Grit is a more complex SPA (live WebSocket state, tabs, terminals, file browser) so single HTML page is appropriate. But modularization is still beneficial.
+### 3.4 Concurrency, Threading & Subsystem Architecture
 
-### What to Adopt from Tally
+* **UI Non-blocking Invariant:** **VERIFIED**. All git commands are strictly dispatched through `tokio::task::spawn_blocking` in both the server and desktop UI layers. The Iced UI thread remains completely non-blocking.
+* **Single Writer Invariant:** **VERIFIED**. The `TabRegistry` in `src/server/registry.rs` remains the single authority for tab state and ID allocation. Both desktop and web clients receive state snapshots and submit action requests.
+* **Process Watchdog & Leaks:** **VERIFIED**. `src/git/sync.rs::run_with_timeout` cleanly manages subprocesses by isolating them in POSIX process groups (`process_group(0)`) and terminating process trees (`kill -9 -<pid>`), preventing orphaned grandchildren from holding pipes.
+* **Watch Churn Protection:** **VERIFIED**. `src/git/watcher.rs` debounces filesystem events with a 200ms delay, filtering out transient `.git` lock churn.
 
-1. **Shared utilities module** - Extract common helpers (like Tally's `common.js`) for reusability and single source of truth.
-2. **Architectural documentation style** - Add file-level comments explaining key invariants and design decisions ("why", not just "what").
-3. **Separation of concerns** - Split large self-contained areas (especially diff rendering, which is pure-ish logic) into focused modules.
-4. **Clear module boundaries** - Even without bundlers, ES modules or at least logical separation improves maintainability.
+---
 
-### Recommended Refactoring Plan
+### 3.5 Documentation Drift
 
-**Priority: Incremental, low-risk changes that preserve behavior.**
+| Document | Stated Content | Actual Codebase Reality | Severity |
+| :--- | :--- | :--- | :---: |
+| [`ARCHITECTURE.md:42-66`](file:///home/bronson/Projects/grit/ARCHITECTURE.md#L42-L66) | Directory map omits key files | Omits `src/actions.rs`, `src/folio.rs`, `src/test_support.rs`, `src/server/handlers.rs`, and git submodules (`actions.rs`, `files.rs`, `history.rs`, `status.rs`) | **Medium** |
+| [`AGENTS.md:§2`](file:///home/bronson/Projects/grit/AGENTS.md) | "two dock views (`term-1` / `term-2`)" | Only one terminal view (`term-1`) exists in `index.html` and `app.js` | **Low** |
+| [`AGENTS.md:§2`](file:///home/bronson/Projects/grit/AGENTS.md) | "Reset overlay button on each terminal view" | No Reset overlay button exists in `index.html` or `app.js` | **Low** |
+| [`AGENTS.md:§2`](file:///home/bronson/Projects/grit/AGENTS.md) | "left view dock (Dashboard/`F`/`L` + krust)" | No `L` dock button exists; Log is an expandable rollup section | **Low** |
+| [`AGENTS.md:§4`](file:///home/bronson/Projects/grit/AGENTS.md) | "no node/deno/bun on the dev box" | Node.js is installed at `/usr/bin/node` (`node --check` works) | **Informational** |
 
-#### 1. Extract `common.js` (utils + shared helpers) - Low risk, high value
-Create `web/dist/common.js` with shared utilities:
-- DOM helpers and utilities (isBlank, sameValue equivalents if useful, or keep as-is)
-- Section/rollup helpers (`toggleSection`, ARIA state management)
-- URL update helpers (`updateUrlView`, `updateUrlTab`)
-- Message sending helpers (`sendAction`, `sendRaw`)
-- General utilities used across modules
+---
 
-#### 2. Extract `diff.js` - Medium risk isolation, very high value
-Largest self-contained chunk (~150-200 lines). Contains:
-- `showDiff()`, `renderFilePair()`, `splitLines()`, `alignLines()`, `renderSideBySide()`, `renderDiffRow()`, `renderChunk()`
+## 4. Prioritized Action Plan
 
-This is mostly pure logic + DOM construction. Extracting it makes the main file smaller and the complex LCS algorithm easier to reason about and modify.
-
-#### 3. Extract feature modules - Medium effort, high value
-Split remaining concerns into focused modules. Suggested split (load in order or as ES modules):
-- `core.js` - Constants, WebSocket (openSocket, reconnect, sendRaw), global state, `handleStateMessage`, initial setup
-- `tabs.js` - Tab bar rendering (`renderTabBar`), add-repo form (`setupAddRepoForm`, folder browser), tab management
-- `views.js` - View switching (`showView`, `setView`, `updateUrlView`, `updateUrlTab`), dock logic, external service probes (krust/folio)
-- `changes.js` - Staging/commit UI (`appendChangeRow`, `renderScriptRunner`, commit actions), discard operations
-- `diff.js` - As above
-- `history.js` - History rendering (`renderHistory`), search, recent commits
-- `branches-stashes.js` - Branches/stashes rendering and event handlers
-- `log.js` - Log rendering (`renderLog`), clear log
-- `terminals.js` - krust/folio frame management (`ensureKrustFrame`, `ensureFolioFrame`, session handling)
-
-#### 4. Update HTML to load modules - Required if splitting
-Options:
-- **ES modules** (cleanest): Change to `<script type="module" src="/main.js"></script>` and use `import` statements. Works in modern browsers, no build step needed.
-- **Ordered script tags**: Load in dependency order (common.js first, then core, then others, then app/main). Simpler if avoiding modules, but globals-based.
-
-ES modules are preferred and align better with maintainability.
-
-#### 5. Add architectural comments - Low effort, high value
-Add file-level header comments to key modules following Tally's style, documenting:
-- Purpose and responsibilities
-- Key invariants (e.g. "exactly one active view at all times", "single expanded section", "revision-based render suppression", "server is source of truth via WebSocket pushes")
-- Design decisions that constrain future changes
-
-#### 6. Minor CSS split (optional) - Nice to have
-Could split `style.css` into `base.css`, `layout.css`, `components.css`, `terminals.css` for easier navigation, but not critical.
-
-### Verdict
-
-**Yes, worth refactoring.** Recommend incremental approach: start with diff.js extraction + adding architectural comments (low risk), then extract common utilities, then gradually split other modules. This improves maintainability without rewriting working code.
-
-The biggest wins are reducing cognitive load, making the complex diff logic easier to work with in isolation, and matching Tally's clearer documentation practices.
+1. **[Security - High] Sanitize `GitAction::DiscardUntracked`**:
+   Add path traversal checks to `src/git/actions.rs`, ensuring the canonical path stays within the repository root before deletion.
+2. **[Security - High] Enforce WebSocket Origin Checking**:
+   In `src/server/websocket.rs`, inspect the `Origin` header during handshake and reject non-local origins to eliminate Cross-Site WebSocket Hijacking.
+3. **[Security - Medium] Contain `/files` Path Resolution**:
+   Validate query paths in `src/server/handlers.rs` before reading disk files.
+4. **[Bugfix - Medium] Fix Krust Button Toggle**:
+   Add class `krust-btn` to the terminal button in `web/dist/app.js:1259` so `probeKrust()` can properly hide/show it.
+5. **[Code Hygiene - Low] Resolve Desktop Clippy Warning**:
+   Update `tab_button_style` in `src/ui/state.rs:577` to initialize `Style` directly.
+6. **[Code Hygiene - Low] Drop Dead `keydown` Listener**:
+   Remove lines 1811-1815 in `web/dist/app.js`.
+7. **[Documentation - Low] Synchronize `ARCHITECTURE.md` and `AGENTS.md`**:
+   Update file trees and correct terminal/dock descriptions.
+8. **[Maintainability - Future] Frontend Modularization**:
+   Split `web/dist/app.js` into focused ES modules (utils, diff, git-actions, terminals).
