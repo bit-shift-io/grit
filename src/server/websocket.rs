@@ -38,7 +38,8 @@ pub async fn open_repo_tab(
     url: Option<String>,
 ) -> Result<usize, String> {
     let repo_path = if let Some(url) = url {
-        let target = std::path::PathBuf::from(&path);
+        let expanded_path = crate::git::types::expand_tilde(&path);
+        let target = std::path::PathBuf::from(&expanded_path);
         std::fs::create_dir_all(&target)
             .map_err(|e| format!("failed to create target directory: {e}"))?;
         // Clone the URL into the target directory. If the target exists

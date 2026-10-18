@@ -62,7 +62,7 @@ export function getTabNameFromUrl(url) {
     // Extract after the colon: user/repo.git
     const afterColon = clean.split(":")[1] || "";
     // Remove .git suffix and take the last path segment
-    const repoName = afterColon.replace(/\.git$/, "").replace(/\/.*$/, "");
+    const repoName = afterColon.replace(/\.git$/, "").split("/").pop();
     return repoName || null;
   }
   // Handle HTTPS URLs: https://github.com/user/repo.git
