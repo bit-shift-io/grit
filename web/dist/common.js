@@ -440,6 +440,17 @@ function setupAddRepoForm(tab) {
 // ======================================
 function handleStateMessage(event) {
   const state = JSON.parse(event.data);
+  // Out-of-band rejection frame (e.g. a failed clone). Surface it on the add
+  // form instead of waiting for a tab that will never arrive.
+  if (state.error) {
+    store.awaitingNewTab = false;
+    const errorEl = document.getElementById("new-repo-error");
+    if (errorEl) {
+      errorEl.textContent = state.error;
+      errorEl.style.display = "block";
+    }
+    return;
+  }
   // Invariant: exactly one active view at all times — a real tab whenever
   // any exist, otherwise the client-local "+" form (activeTabId === null).
   if (state.tabs.length > 0) {
@@ -461,6 +472,9 @@ function handleStateMessage(event) {
       store.activeTabId = target.id;
       store.awaitingNewTab = false;
       store.showAddForm = false;
+      // A freshly opened tab always lands on its dashboard, regardless of the
+      // view the previous tab was left on (same as clicking a tab name).
+      store.activeView = "dashboard";
     }
   }
   for (const id of state.tabs.map((t) => t.id)) {

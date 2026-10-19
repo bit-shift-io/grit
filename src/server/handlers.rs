@@ -154,27 +154,29 @@ pub(crate) struct BrowseResponse {
     entries: Vec<BrowseEntry>,
 }
 
+/// Default directory the folder picker starts in (and where a bare,
+/// relative folder name is resolved): `~/Projects` / `~/projects` when it
+/// exists, otherwise `$HOME`. `None` when neither is available.
+pub(crate) fn default_browse_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let projects = home.as_ref().and_then(|h| {
+        ["projects", "Projects"]
+            .iter()
+            .map(|name| h.join(name))
+            .find(|p| p.is_dir())
+    });
+    projects.or_else(|| home.filter(|p| p.is_dir()))
+}
+
 /// Lists subdirectories of a folder so the web UI can offer a path picker.
 pub(crate) async fn browse_handler(
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
 ) -> Json<BrowseResponse> {
     let requested = query.path.as_deref().map(expand_tilde);
     let home = std::env::var("HOME").ok().map(PathBuf::from);
-    let projects_dir = home
-        .as_ref()
-        .and_then(|h| {
-            for name in ["projects", "Projects"] {
-                let p = h.join(name);
-                if p.is_dir() {
-                    return Some(p);
-                }
-            }
-            None
-        });
     let dir = requested
         .filter(|p| p.is_dir())
-        .or(projects_dir)
-        .or_else(|| home.clone().filter(|p| p.is_dir()))
+        .or_else(default_browse_dir)
         .unwrap_or_else(|| PathBuf::from("/"));
 
     let mut entries = Vec::new();

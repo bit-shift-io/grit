@@ -38,13 +38,32 @@ pub async fn open_repo_tab(
     url: Option<String>,
 ) -> Result<usize, String> {
     let repo_path = if let Some(url) = url {
-        let expanded_path = crate::git::types::expand_tilde(&path);
-        let target = std::path::PathBuf::from(&expanded_path);
+        // The chosen directory is the *parent*: the repository lands in a
+        // new folder inside it named after the tab (which defaults to the
+        // repo name derived from the URL). A directory already ending in
+        // that name — or in the URL's repo name — is treated as the target
+        // itself, so typing the full destination still works. A bare
+        // relative name resolves under the picker's default root.
+        let mut parent = crate::git::types::expand_tilde(&path);
+        if parent.is_relative() {
+            if let Some(root) = crate::server::handlers::default_browse_dir() {
+                parent = root.join(parent);
+            }
+        }
+        let folder = clone_folder_name(&name, &url);
+        let url_name = repo_name_from_url(&url);
+        let already_named = parent
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|leaf| leaf == folder || leaf == url_name)
+            .unwrap_or(false);
+        let target = if already_named {
+            parent
+        } else {
+            parent.join(&folder)
+        };
         std::fs::create_dir_all(&target)
             .map_err(|e| format!("failed to create target directory: {e}"))?;
-        // Clone the URL into the target directory. If the target exists
-        // and is non-empty git will fail; that's fine — the user chose
-        // the location.
         let target_clone = target.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut cmd = std::process::Command::new("git");
@@ -101,6 +120,34 @@ pub fn close_tab_by_id(registry: &crate::server::registry::TabRegistry, id: usiz
             tracing::warn!("CloseTab ignored: unknown tab id {}", id);
             false
         }
+    }
+}
+
+/// Picks the folder for a freshly cloned repository: the tab name when the
+/// user supplied one, otherwise the repository name parsed from the URL.
+fn clone_folder_name(name: &str, url: &str) -> String {
+    let trimmed = name.trim();
+    if !trimmed.is_empty() && trimmed != "new" {
+        return trimmed.to_string();
+    }
+    repo_name_from_url(url)
+}
+
+/// Best-effort repository name from a clone URL. Handles scp-like SSH
+/// (`git@host:org/repo.git`), scheme URLs (`https://…/repo.git`), and local
+/// paths; falls back to `repo` so a clone always has a destination.
+fn repo_name_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let after_colon = trimmed.rsplit(':').next().unwrap_or(trimmed);
+    let last = after_colon
+        .rsplit(|c| c == '/' || c == '\\')
+        .find(|seg| !seg.is_empty())
+        .unwrap_or("");
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        "repo".to_string()
+    } else {
+        name.to_string()
     }
 }
 
@@ -183,10 +230,18 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
     // until the command exited. The worker consumes one action at a time to
     // preserve per-client ordering.
     let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // The worker owns no socket handle, so client-facing failures (e.g. a
+    // rejected NewTab) travel back on this channel and the select loop below
+    // — which owns `sender` — forwards them.
+    let (error_tx, mut error_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let worker_app = app.clone();
     let worker = tokio::spawn(async move {
         while let Some(text) = action_rx.recv().await {
-            handle_client_text(&worker_app, &text).await;
+            if let Some(error) = handle_client_text(&worker_app, &text).await {
+                if error_tx.send(error).is_err() {
+                    break;
+                }
+            }
         }
     });
 
@@ -210,6 +265,11 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
+            Some(message) = error_rx.recv() => {
+                if !push_error(&mut sender, message).await {
+                    break;
+                }
+            }
         }
     }
 
@@ -220,11 +280,15 @@ async fn handle_websocket(socket: WebSocket, app: AppState) {
 }
 
 /// Parses and runs one inbound client action; malformed payloads are logged
-/// and dropped rather than tearing down the connection.
-async fn handle_client_text(app: &AppState, text: &str) {
+/// and dropped rather than tearing down the connection. Returns `Some(error)`
+/// when the action was rejected and the client should be told why.
+async fn handle_client_text(app: &AppState, text: &str) -> Option<String> {
     match serde_json::from_str::<ClientMessage>(text) {
         Ok(msg) => dispatch_and_refresh(app, msg).await,
-        Err(e) => tracing::debug!("ignoring malformed action: {e}"),
+        Err(e) => {
+            tracing::debug!("ignoring malformed action: {e}");
+            None
+        }
     }
 }
 
@@ -237,6 +301,17 @@ async fn push_state(
     let Ok(text) = serde_json::to_string(&state) else {
         return true;
     };
+    sender.send(Message::Text(text.into())).await.is_ok()
+}
+
+/// Sends one out-of-band error frame so the client can surface a rejected
+/// action instead of waiting forever for state that never arrives. Returns
+/// false only when the peer is gone.
+async fn push_error(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: String,
+) -> bool {
+    let text = serde_json::json!({ "error": message }).to_string();
     sender.send(Message::Text(text.into())).await.is_ok()
 }
 
@@ -265,32 +340,39 @@ fn resolve_tab_repo(
     Some((tab_id, repo_path))
 }
 
-async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
+async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) -> Option<String> {
     if matches!(msg.action, crate::git::types::GitAction::CloseTab) {
         let Some(target_id) = msg.tab else {
             tracing::debug!("CloseTab ignored: no tab id provided");
-            return;
+            return None;
         };
         close_tab_by_id(&app.registry, target_id);
-        return;
+        return None;
     }
 
     if let crate::git::types::GitAction::NewTab(payload) = &msg.action {
         let (name, path, url) = parse_new_tab_payload(payload);
         // The "+" form lives entirely in each client's local UI state;
         // NewTab only ever appends a fully validated repository tab.
-        match open_repo_tab(&app.registry, name, path, url).await {
-            Ok(new_id) => crate::server::refresh_tab(app, new_id).await,
-            Err(reason) => tracing::debug!("NewTab rejected: {reason}"),
-        }
-        return;
+        return match open_repo_tab(&app.registry, name, path, url).await {
+            Ok(new_id) => {
+                crate::server::refresh_tab(app, new_id).await;
+                None
+            }
+            Err(reason) => {
+                tracing::debug!("NewTab rejected: {reason}");
+                // Report the failure so the client can display it instead of
+                // waiting forever for a tab that never arrives.
+                Some(reason)
+            }
+        };
     }
 
     if let crate::git::types::GitAction::SearchHistory(query) = &msg.action {
         let Some((tab_id, repo_path)) =
             resolve_tab_repo(&app.registry, msg.tab, "SearchHistory")
         else {
-            return;
+            return None;
         };
         let query = query.clone();
         let results = tokio::task::spawn_blocking(move || {
@@ -307,16 +389,16 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
         // update_tab_history already mutated the registry, which broadcasts a
         // fresh frame. Do NOT refresh_tab here: get_repository_status resets
         // history to the default window, clobbering the search results.
-        return;
+        return None;
     }
 
     let Some(tab_id) = msg.tab else {
         tracing::debug!("ignoring action without a tab id");
-        return;
+        return None;
     };
     let Some(repo_path) = app.registry.repo_path_for(tab_id) else {
         tracing::debug!("ignoring action for unknown tab {}", tab_id);
-        return;
+        return None;
     };
 
     // Broadcast a `running` entry up front so every client sees the command
@@ -383,6 +465,7 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) {
     }
 
     crate::server::refresh_tab(app, tab_id).await;
+    None
 }
 
 #[cfg(test)]
@@ -426,6 +509,77 @@ mod tests {
         assert_eq!(
             super::resolve_tab_repo(&registry, Some(0), "SearchHistory"),
             Some((0, std::path::PathBuf::from("/tmp/x")))
+        );
+    }
+
+    #[test]
+    fn clone_folder_name_prefers_then_derives_from_url() {
+        assert_eq!(super::clone_folder_name("my repo", "https://x/y.git"), "my repo");
+        assert_eq!(
+            super::repo_name_from_url("git@github.com:org/repo.git"),
+            "repo"
+        );
+        assert_eq!(super::repo_name_from_url("https://github.com/org/repo.git"), "repo");
+        assert_eq!(super::repo_name_from_url("ssh://git@host:22/org/repo.git"), "repo");
+        assert_eq!(super::repo_name_from_url("/tmp/foo/bar.git"), "bar");
+        assert_eq!(super::repo_name_from_url("https://github.com/org/repo/"), "repo");
+        assert_eq!(super::clone_folder_name("", "https://github.com/org/repo.git"), "repo");
+        assert_eq!(super::clone_folder_name("new", "https://github.com/org/repo.git"), "repo");
+    }
+
+    #[tokio::test]
+    async fn clone_url_lands_in_named_subfolder_of_the_chosen_directory() {
+        let origin = tempfile::tempdir().unwrap();
+        init_repo(origin.path());
+        std::fs::write(origin.path().join("a.txt"), "hello").unwrap();
+        crate::test_support::commit_all(origin.path(), "init");
+
+        // A non-empty parent, exactly like the default `~/Projects` pick.
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(parent.path().join("unrelated.txt"), "keep me").unwrap();
+
+        let registry = TabRegistry::new();
+        let id = super::open_repo_tab(
+            &registry,
+            "cloned".to_string(),
+            parent.path().display().to_string(),
+            Some(origin.path().display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        let dest = parent.path().join("cloned");
+        let state = registry.snapshot();
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].id, id);
+        assert_eq!(state.tabs[0].repo_path, dest.display().to_string());
+        assert!(dest.join(".git").is_dir(), "clone must create a git repo");
+        assert!(parent.path().join("unrelated.txt").exists(), "parent untouched");
+    }
+
+    #[tokio::test]
+    async fn clone_url_uses_full_path_when_directory_already_names_the_folder() {
+        let origin = tempfile::tempdir().unwrap();
+        init_repo(origin.path());
+        crate::test_support::commit_all(origin.path(), "init");
+
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("myrepo");
+
+        let registry = TabRegistry::new();
+        super::open_repo_tab(
+            &registry,
+            "myrepo".to_string(),
+            dest.display().to_string(),
+            Some(origin.path().display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(dest.join(".git").is_dir());
+        assert!(
+            !dest.join("myrepo").exists(),
+            "must not nest a second copy under the named folder"
         );
     }
 
@@ -861,6 +1015,7 @@ mod tests {
             .unwrap();
         }
 
+        let mut saw_error = false;
         for _ in 0..10 {
             let frame = tokio::time::timeout(
                 std::time::Duration::from_millis(60),
@@ -870,12 +1025,19 @@ mod tests {
             .ok()
             .flatten();
             if let Some(Ok(Message::Text(text))) = frame {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value.get("error").is_some() {
+                    // A rejected NewTab reports why instead of hanging the UI.
+                    saw_error = true;
+                    continue;
+                }
                 let s: crate::server::registry::WebState =
-                    serde_json::from_str(&text).unwrap();
+                    serde_json::from_value(value).unwrap();
                 assert_eq!(s.tabs.len(), 1, "pathless NewTab must not create tabs");
                 assert!(s.tabs.iter().all(|t| !t.repo_path.is_empty()));
             }
         }
+        assert!(saw_error, "a rejected NewTab must produce an error frame");
     }
 
     #[tokio::test]
