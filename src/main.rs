@@ -5,6 +5,7 @@ mod ui;
 mod krust;
 mod folio;
 mod shared_config;
+mod settings;
 pub mod actions;
 #[cfg(test)]
 mod test_support;
@@ -154,7 +155,9 @@ fn main() -> ExitCode {
             runtime.block_on(server::is_daemon_running(cli.port));
         let mode = match choose_gui(daemon_found, cli.port) {
             ui::state::GuiMode::Embedded(registry) => {
-                runtime.spawn(server::run(registry.clone(), cli.port));
+                let control =
+                    server::ServerControl::new(shared_config::load_config().host);
+                runtime.spawn(server::run(registry.clone(), cli.port, control));
                 ui::state::GuiMode::Embedded(registry)
             }
             remote => remote,
@@ -189,7 +192,8 @@ fn headless_registry(cli: &Cli, repo_path: PathBuf) -> server::registry::TabRegi
 fn serve_headless(cli: &Cli, repo_path: PathBuf) {
     let registry = headless_registry(cli, repo_path);
     let runtime = tokio::runtime::Runtime::new().expect("failed to start Tokio runtime");
-    runtime.block_on(server::run(registry, cli.port));
+    let control = server::ServerControl::new(shared_config::load_config().host);
+    runtime.block_on(server::run(registry, cli.port, control));
 }
 
 #[cfg(feature = "desktop")]

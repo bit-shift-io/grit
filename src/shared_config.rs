@@ -15,10 +15,41 @@ pub struct SavedTab {
     pub path: String,
 }
 
+/// Default bind host for the embedded web daemon: loopback only.
+pub fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+
 /// Full application configuration persisted in `config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GritConfig {
     pub tabs: Vec<SavedTab>,
+    /// Bind host for the embedded web daemon: `127.0.0.1` (loopback only) or
+    /// `0.0.0.0` (reachable from the LAN). The `serde(default)` is load-bearing:
+    /// without it a config written before this field existed fails to parse and
+    /// `load_config` hands back no tabs at all.
+    #[serde(default = "default_host")]
+    pub host: String,
+}
+
+impl Default for GritConfig {
+    fn default() -> Self {
+        GritConfig {
+            tabs: Vec::new(),
+            host: default_host(),
+        }
+    }
+}
+
+/// Guards every read-modify-write of `config.json` in this process.
+///
+/// Tab persistence (`persist_web_state`) rewrites the file on every registry
+/// change, and the settings endpoint rewrites it when the LAN toggle moves. Both
+/// load the file, edit one field, and write it back, so without one shared lock
+/// they can drop each other's change.
+pub fn config_write_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
 }
 
 /// Config folder: `$XDG_CONFIG_HOME/bitshift/grit`, else `$HOME/.config/bitshift/grit`.
@@ -64,41 +95,52 @@ pub fn load_tabs_from(path: &Path) -> Vec<SavedTab> {
 
 /// Loads the full config, or defaults when absent/invalid.
 pub fn load_config() -> GritConfig {
-    let path = match config_path() {
-        Some(p) => p,
-        None => return GritConfig { tabs: Vec::new() },
-    };
-    match fs::read(&path) {
+    config_path()
+        .map(|path| load_config_from(&path))
+        .unwrap_or_default()
+}
+
+/// Loads the full config from a specific file (defaults when absent/invalid).
+pub fn load_config_from(path: &Path) -> GritConfig {
+    match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             tracing::warn!("failed to parse config at {}: {e}", path.display());
-            GritConfig { tabs: Vec::new() }
+            GritConfig::default()
         }),
-        Err(_) => GritConfig { tabs: Vec::new() },
+        Err(_) => GritConfig::default(),
     }
 }
 
-/// Persists the full config, creating parent directories as needed.
-pub fn save_config(cfg: &GritConfig) {
-    if let Some(path) = config_path() {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                tracing::warn!("failed to create config folder {}: {e}", parent.display());
-                return;
+/// Persists the config to a specific file, creating parent directories as
+/// needed.
+///
+/// Takes no lock: every caller has to hold [`config_write_lock`] across its own
+/// read-modify-write, because the lock is not reentrant and a bare write alone
+/// would still lose a concurrent reader's edit.
+pub fn save_config_to(path: &Path, cfg: &GritConfig) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!("failed to create config folder {}: {e}", parent.display());
+            return;
+        }
+    }
+    match serde_json::to_vec_pretty(cfg) {
+        Ok(bytes) => {
+            if let Err(e) = fs::write(path, bytes) {
+                tracing::warn!("failed to save config to {}: {e}", path.display());
             }
         }
-        match serde_json::to_vec_pretty(cfg) {
-            Ok(bytes) => {
-                if let Err(e) = fs::write(&path, bytes) {
-                    tracing::warn!("failed to save config to {}: {e}", path.display());
-                }
-            }
-            Err(e) => tracing::warn!("failed to serialize config: {e}"),
-        }
+        Err(e) => tracing::warn!("failed to serialize config: {e}"),
     }
 }
 
 /// Converts a WebState to saved tabs and persists them.
 pub fn persist_web_state(state: &crate::server::registry::WebState) {
+    // The read and the write are one critical section: another writer (the
+    // settings endpoint moving `host`) must not land between them.
+    let _guard = config_write_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut cfg = load_config();
     cfg.tabs = state
         .tabs
@@ -110,7 +152,9 @@ pub fn persist_web_state(state: &crate::server::registry::WebState) {
             path: t.repo_path.clone(),
         })
         .collect();
-    save_config(&cfg);
+    if let Some(path) = config_path() {
+        save_config_to(&path, &cfg);
+    }
 }
 
 /// Returns true when the path points at an existing git repository.
@@ -206,6 +250,30 @@ mod tests {
         let path = dir.path().join("config.json");
         fs::write(&path, "not json").unwrap();
         assert!(load_tabs_from(&path).is_empty());
+    }
+
+    #[test]
+    fn config_without_host_keeps_tabs_and_defaults_to_loopback() {
+        // The whole feature hangs on this: a file written by an older grit has
+        // no `host`, and `load_config` returns EMPTY TABS on a parse failure.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        fs::write(&path, br#"{"tabs":[{"id":1,"name":"t","path":"/p"}]}"#).unwrap();
+        let cfg = load_config_from(&path);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.tabs.len(), 1);
+    }
+
+    #[test]
+    fn host_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cfg = GritConfig {
+            tabs: vec![],
+            host: "0.0.0.0".to_string(),
+        };
+        save_config_to(&path, &cfg);
+        assert_eq!(load_config_from(&path).host, "0.0.0.0");
     }
 
     #[test]

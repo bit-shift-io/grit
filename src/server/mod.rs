@@ -9,13 +9,12 @@ pub(crate) use handlers::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::git::sync::{check_remote_sync, SyncOutcome};
-use crate::git::types::RepoState;
 use crate::server::registry::{TabRegistry, WebState};
 
 /// Capacity of the state-broadcast channel fanning frames out to every
@@ -28,6 +27,9 @@ const DAEMON_PROBE_TIMEOUT_MS: u64 = 100;
 
 /// Listen backlog for the TCP listener (`socket.listen`).
 const LISTEN_BACKLOG: u32 = 1024;
+
+/// Default port for the embedded web daemon, matching the CLI default.
+pub const DEFAULT_PORT: u16 = 5000;
 
 /// Gap between remote-sync probe passes. Uniform rather than a backoff ladder:
 /// the first client connect is a strong enough signal that front-loaded retries
@@ -63,29 +65,152 @@ pub struct AppState {
     /// Wakes the ticker immediately when the probe is first requested, so the
     /// badge is not a whole `SYNC_TICK` away.
     sync_signal: Arc<tokio::sync::Notify>,
+    /// Where the daemon is listening and where it was asked to listen. Shared
+    /// with the rebind supervisor so the settings endpoint can move the bind.
+    pub control: Arc<ServerControl>,
+    /// Config file locations for grit, folio and krust.
+    pub settings_paths: crate::settings::SettingsPaths,
+    /// The host each service was last started with, so the settings page can
+    /// tell a saved change from an applied one.
+    pub baseline: Arc<crate::settings::Baseline>,
+    /// Ports the settings page reports.
+    pub ports: crate::settings::Ports,
+}
+
+/// Runtime control over the daemon's listening address.
+///
+/// The *desired* host is what the config (and the settings page) says; the
+/// *effective* host is what is actually bound. They differ only while a rebind
+/// is failing, which is why the bind error is carried here and not only logged.
+pub struct ServerControl {
+    desired: std::sync::Mutex<String>,
+    effective: std::sync::Mutex<String>,
+    bound: std::sync::Mutex<Option<std::net::SocketAddr>>,
+    last_error: std::sync::Mutex<Option<String>>,
+    changed: tokio::sync::Notify,
+}
+
+impl ServerControl {
+    /// A control whose desired and effective host both start at `initial`.
+    pub fn new(initial: String) -> Arc<Self> {
+        Arc::new(Self {
+            effective: std::sync::Mutex::new(initial.clone()),
+            desired: std::sync::Mutex::new(initial),
+            bound: std::sync::Mutex::new(None),
+            last_error: std::sync::Mutex::new(None),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// The default: loopback only. Used by the test/desktop constructors; the
+    /// daemon builds its control from the config file instead.
+    #[cfg(any(test, feature = "desktop"))]
+    pub fn loopback() -> Arc<Self> {
+        Self::new(crate::settings::LOOPBACK.to_string())
+    }
+
+    /// The host the settings page (or the config) last asked for.
+    pub fn desired(&self) -> String {
+        guard(&self.desired).clone()
+    }
+
+    /// The host currently bound.
+    pub fn effective(&self) -> String {
+        guard(&self.effective).clone()
+    }
+
+    /// The address actually bound, once the supervisor has bound one. Test-only:
+    /// the settings page reports hosts, not socket addresses.
+    #[cfg(test)]
+    pub fn bound(&self) -> Option<std::net::SocketAddr> {
+        *guard(&self.bound)
+    }
+
+    /// The last bind failure, cleared by the next successful bind.
+    pub fn last_error(&self) -> Option<String> {
+        guard(&self.last_error).clone()
+    }
+
+    /// Records the requested host and wakes the supervisor.
+    pub fn request_host(&self, host: String) {
+        *guard(&self.desired) = host;
+        self.changed.notify_one();
+    }
+
+    fn record_bound(&self, host: &str, addr: Option<std::net::SocketAddr>) {
+        *guard(&self.effective) = host.to_string();
+        *guard(&self.bound) = addr;
+    }
+
+    fn set_error(&self, error: Option<String>) {
+        *guard(&self.last_error) = error;
+    }
+
+    /// Resolves when [`ServerControl::request_host`] is called.
+    pub async fn wait_for_change(&self) {
+        self.changed.notified().await;
+    }
+}
+
+/// These locks only ever protect plain values, so a poisoned lock means another
+/// thread panicked mid-update; recovering the value is safe.
+fn guard<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl AppState {
     /// Test constructor; watcher resets are a daemon concern and simply go
-    /// nowhere here. Production paths go through [`boot`] / `with_watcher_resets`.
+    /// nowhere here. Production paths go through [`boot`] / [`AppState::with_control`].
     #[cfg(any(test, feature = "desktop"))]
     #[allow(dead_code)]
     pub fn new(registry: TabRegistry) -> Self {
         Self::with_watcher_resets(registry, mpsc::unbounded_channel().0)
     }
 
+    #[cfg(any(test, feature = "desktop"))]
     pub(crate) fn with_watcher_resets(
         registry: TabRegistry,
         watcher_resets: mpsc::UnboundedSender<PathBuf>,
     ) -> Self {
+        Self::with_control(registry, watcher_resets, ServerControl::loopback())
+    }
+
+    pub(crate) fn with_control(
+        registry: TabRegistry,
+        watcher_resets: mpsc::UnboundedSender<PathBuf>,
+        control: Arc<ServerControl>,
+    ) -> Self {
         let (broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let settings_paths = crate::settings::SettingsPaths::from_env();
+        let baseline = Arc::new(crate::settings::Baseline::capture(&settings_paths));
         Self {
             registry,
             broadcast,
             watcher_resets,
             sync_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_signal: Arc::default(),
+            control,
+            settings_paths,
+            baseline,
+            ports: crate::settings::Ports::for_grit_port(DEFAULT_PORT),
         }
+    }
+
+    /// Points the settings page at specific config files and re-captures the
+    /// restart baseline from them. Test-only: the daemon resolves them from the
+    /// environment.
+    #[cfg(test)]
+    pub fn with_settings(mut self, paths: crate::settings::SettingsPaths) -> Self {
+        self.baseline = Arc::new(crate::settings::Baseline::capture(&paths));
+        self.settings_paths = paths;
+        self
+    }
+
+    /// Overrides the ports the settings page reports.
+    pub fn with_ports(mut self, ports: crate::settings::Ports) -> Self {
+        self.ports = ports;
+        self
     }
 
     /// Releases the sync ticker, returning true only for the first caller.
@@ -112,23 +237,46 @@ impl AppState {
         self.sync_requested
             .load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Wakes the sync ticker out of band, so a tab that was just re-armed is
+    /// probed now instead of at the next tick.
+    pub fn wake_sync(&self) {
+        self.sync_signal.notify_one();
+    }
+
+    /// Takes the out-of-date badge down for `tab_id`, publishing only when the
+    /// value actually changes. A successful `git pull` leaves the branch at the
+    /// upstream tip and a `git fetch` refreshes the remote-tracking ref, so in
+    /// both cases "the remote is ahead of what we know" is already false.
+    pub fn clear_sync_badge(&self, tab_id: usize) {
+        self.registry.update_state_setting_sync(tab_id, false);
+    }
 }
 
 /// Builds the Axum router with health check and WebSocket endpoints.
 pub fn build_router(state: AppState) -> Router {
+    // Resolved once per router build. The supervisor rebuilds the router on
+    // every (re)bind, so this tracks the effective host as it moves.
+    let lan = crate::settings::is_lan(&state.control.effective());
     Router::new()
         .route("/health", get(health_handler))
         .route("/ws", get(websocket::ws_handler))
         .route("/files", get(files_handler))
         .route("/commit", get(commit_handler))
         .route("/browse", get(browse_handler))
+        // A literal path wins over the `/{*path}` static catch-all below.
+        .route(
+            "/settings",
+            get(settings_get_handler).post(settings_post_handler),
+        )
+        .route("/settings/restart", post(settings_restart_handler))
         .route("/", get(static_files::serve_static))
         .route("/{*path}", get(static_files::serve_static))
         .with_state(state)
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::predicate(|origin, _parts| {
-                    websocket::origin_is_allowed(origin.to_str().ok())
+                .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
+                    websocket::origin_is_allowed_for(origin.to_str().ok(), lan)
                 }))
                 .allow_methods(Any)
                 .allow_headers(Any),
@@ -152,18 +300,16 @@ pub async fn refresh_tab(app: &AppState, tab_id: usize) {
         tokio::task::spawn_blocking(move || crate::git::get_repository_status(&path)).await;
     match result {
         // `out_of_date` is owned by the remote sync checker, not by a status
-        // collection, so carry it across instead of clobbering it with the
-        // `false` that `get_repository_status` has to assume.
-        Ok(Ok(mut state)) => {
-            state.out_of_date = app
-                .registry
-                .snapshot()
-                .tabs
-                .iter()
-                .find(|tab| tab.id == tab_id)
-                .is_some_and(|tab| tab.state.out_of_date);
-            app.registry.update_state(tab_id, state)
-        }
+        // collection, so the registry carries it across instead of letting the
+        // `false` that `get_repository_status` has to assume clobber it.
+        //
+        // The carry happens under the registry's write lock, not via a snapshot
+        // read, so a badge write that lands mid-refresh cannot be lost. That
+        // interleaving is not deterministically reproducible in a test — there
+        // is no hook to hold the lock across the refresh — so the atomicity is
+        // covered by construction and by `update_state_keeping_sync`'s and
+        // `update_state_setting_sync`'s contract tests, not by a race test.
+        Ok(Ok(state)) => app.registry.update_state_keeping_sync(tab_id, state),
         Ok(Err(e)) => tracing::error!("repository status refresh failed for tab {tab_id}: {e}"),
         Err(e) => tracing::error!("repository status task panicked: {e}"),
     }
@@ -216,6 +362,10 @@ async fn refresh_and_broadcast_if_quiet(app: &AppState) {
 }
 
 /// Runs the Axum server on the given listener until it fails.
+///
+/// Test-only since the daemon moved to the rebind supervisor in [`run`], which
+/// spawns `sync_loop` exactly once and then serves through [`serve_listener`].
+#[cfg(test)]
 pub fn run_server(
     listener: tokio::net::TcpListener,
     app: AppState,
@@ -223,6 +373,23 @@ pub fn run_server(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         tokio::spawn(sync_loop(app.clone(), refresh_rx));
+        if let Err(e) = axum::serve(listener, build_router(app).into_make_service()).await {
+            tracing::error!("server error: {e}");
+        }
+    })
+}
+
+/// Serves the router on an already-bound listener, accepting until the returned
+/// handle is dropped or aborted.
+///
+/// Aborting stops accepting and releases the listener; connections already
+/// accepted keep running, because axum spawns a task per connection. That is
+/// what lets a rebind leave the settings page's own socket connected.
+pub(crate) fn serve_listener(
+    listener: tokio::net::TcpListener,
+    app: AppState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, build_router(app).into_make_service()).await {
             tracing::error!("server error: {e}");
         }
@@ -380,35 +547,23 @@ async fn sync_pass(app: &AppState, budget: &mut SyncBudget, now: std::time::Inst
             SyncPass::GaveUp => {
                 tracing::debug!("tab {tab_id} gave up on the sync probe");
                 app.registry.mark_settled(tab_id);
+                // A settled tab keeps no clock: if a manual Fetch/Pull re-arms
+                // it later, the fresh probe must get a fresh ceiling. Leaving
+                // the old entry behind made the re-armed probe read as already
+                // expired, so it settled without probing and the badge stuck.
+                budget.forget(tab_id);
             }
             SyncPass::Inconclusive => {}
             SyncPass::Answered(outcome) => {
                 if outcome.is_settled() {
                     app.registry.mark_settled(tab_id);
+                    budget.forget(tab_id);
                 }
-                if let Some(state) = sync_badge_state(app, tab_id, outcome.out_of_date()) {
-                    app.registry.update_state(tab_id, state);
-                }
+                app.registry
+                    .update_state_setting_sync(tab_id, outcome.out_of_date());
             }
         }
     }
-}
-
-/// The tab's state with `out_of_date` set, or `None` when it already holds that
-/// value — a no-op publish would churn the revision (and every client's render)
-/// once per tick for nothing.
-fn sync_badge_state(app: &AppState, tab_id: usize, out_of_date: bool) -> Option<RepoState> {
-    let state = app
-        .registry
-        .snapshot()
-        .tabs
-        .into_iter()
-        .find(|tab| tab.id == tab_id)?
-        .state;
-    (state.out_of_date != out_of_date).then_some(RepoState {
-        out_of_date,
-        ..state
-    })
 }
 
 /// What one tab's probe produced this pass.
@@ -448,6 +603,12 @@ impl SyncBudget {
 
     fn started_at(&mut self, tab_id: usize, now: std::time::Instant) -> std::time::Instant {
         *self.started.entry(tab_id).or_insert(now)
+    }
+
+    /// Drops the retry clock for a tab that just settled, so a later re-arm
+    /// starts a fresh ceiling instead of inheriting a spent one.
+    fn forget(&mut self, tab_id: usize) {
+        self.started.remove(&tab_id);
     }
 
     /// Drops bookkeeping for tabs that no longer exist.
@@ -496,9 +657,12 @@ pub(crate) async fn sync_ticker_with(
 }
 
 /// Boots shared daemon infrastructure: app state, watchers, and initial refresh.
-pub async fn boot(registry: TabRegistry) -> (AppState, mpsc::UnboundedReceiver<()>) {
+pub async fn boot(
+    registry: TabRegistry,
+    control: Arc<ServerControl>,
+) -> (AppState, mpsc::UnboundedReceiver<()>) {
     let (reset_tx, reset_rx) = mpsc::unbounded_channel::<PathBuf>();
-    let app = AppState::with_watcher_resets(registry, reset_tx);
+    let app = AppState::with_control(registry, reset_tx, control);
     let (refresh_tx, refresh_rx) = mpsc::unbounded_channel::<()>();
 
     // Restore tabs from persistent storage only if registry is empty.
@@ -580,21 +744,25 @@ pub async fn is_daemon_running(port: u16) -> bool {
 }
 
 /// Boots the full headless daemon: watcher, state sync, and HTTP server.
-pub async fn run(registry: TabRegistry, port: u16) {
-    let listener = match create_listener(port).await {
-        Ok(l) => l,
-        Err(e) => {
-            // Loud on stderr too: a silent exit here looks exactly like "the
-            // web UI never comes up" from the browser side.
-            eprintln!("error: failed to bind 127.0.0.1:{port}: {e}");
-            eprintln!("       is another Grit daemon already running on this port?");
-            tracing::error!("failed to bind 127.0.0.1:{port}: {e}");
-            return;
-        }
-    };
+///
+/// The listener is *supervised*, not bound once: moving the bind host is how
+/// the settings page turns LAN access on and off without dropping the page. A
+/// rebind that fails restores the previous address rather than leaving the
+/// daemon with no listener at all.
+pub async fn run(registry: TabRegistry, port: u16, control: Arc<ServerControl>) {
+    let initial = control.desired();
 
-    tracing::info!("Grit web daemon listening on http://127.0.0.1:{port}");
-    let (app, refresh_rx) = boot(registry).await;
+    // The startup bind stays fatal-loud, as it always was: a daemon that cannot
+    // reach its own port is more use stopping than pretending to run.
+    if let Err(e) = create_listener(&initial, port).await {
+        eprintln!("error: failed to bind {initial}:{port}: {e}");
+        eprintln!("       is another Grit daemon already running on this port?");
+        tracing::error!("failed to bind {initial}:{port}: {e}");
+        return;
+    }
+
+    let (app, refresh_rx) = boot(registry, control.clone()).await;
+    let app = app.with_ports(crate::settings::Ports::for_grit_port(port));
     // Files dock fallback root: the first open repository, else home.
     let default_root = app
         .registry
@@ -603,7 +771,6 @@ pub async fn run(registry: TabRegistry, port: u16) {
         .first()
         .map(|t| t.repo_path.clone())
         .filter(|p| !p.is_empty());
-    let handle = run_server(listener, app, refresh_rx);
     // Spin up folio (the file explorer our dock embeds) and krust (the web
     // terminal) if they're installed but not already running — fire-and-forget,
     // never fatal. Per-repo roots come from the iframe `?dir=` param.
@@ -611,13 +778,76 @@ pub async fn run(registry: TabRegistry, port: u16) {
         crate::folio::ensure_folio(default_root.as_deref().map(std::path::Path::new)).await;
         crate::krust::ensure_krust().await;
     });
-    handle.await.ok();
+    // Spawned once for the whole process, however many rebinds follow.
+    tokio::spawn(sync_loop(app.clone(), refresh_rx));
+
+    // The last host that actually bound. A failed switch leaves this alone, so
+    // the daemon can always fall back to an address that is known to work.
+    let mut bound_host = initial;
+
+    loop {
+        let desired = control.desired();
+        let listener = match create_listener(&desired, port).await {
+            Ok(l) => {
+                bound_host = desired;
+                control.set_error(None);
+                l
+            }
+            Err(e) => {
+                // Report the failure, then stay reachable on the old address
+                // rather than going dark until someone fixes the config.
+                control.set_error(Some(e.to_string()));
+                tracing::error!("failed to bind {desired}:{port}: {e}");
+                match create_listener(&bound_host, port).await {
+                    Ok(l) => l,
+                    Err(fallback_error) => {
+                        tracing::error!(
+                            "cannot fall back to {bound_host}:{port} either: {fallback_error}"
+                        );
+                        control.set_error(Some(fallback_error.to_string()));
+                        control.wait_for_change().await;
+                        continue;
+                    }
+                }
+            }
+        };
+        control.record_bound(&bound_host, listener.local_addr().ok());
+        tracing::info!("Grit web daemon listening on http://{bound_host}:{port}");
+
+        let mut handle = serve_listener(listener, app.clone());
+        tokio::select! {
+            _ = &mut handle => {}
+            _ = control.wait_for_change() => {}
+        }
+        handle.abort();
+        // Abort only *requests* cancellation; the listener is not released
+        // until the task actually drops, and rebinding the same port before
+        // then would fail. Waiting on the handle makes the release certain.
+        let _ = handle.await;
+    }
+}
+
+/// Parses a bind host. `localhost` is accepted as an alias for loopback so a
+/// hand-edited config cannot stop the daemon from starting.
+pub(crate) fn parse_host(host: &str) -> std::io::Result<std::net::Ipv4Addr> {
+    if host == "localhost" {
+        return Ok(std::net::Ipv4Addr::LOCALHOST);
+    }
+    host.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid bind host '{host}': {e}"),
+        )
+    })
 }
 
 /// SO_REUSEADDR lets an immediate close-and-restart rebind the port even
 /// while old client sockets still linger in TIME_WAIT.
-pub(crate) async fn create_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+pub(crate) async fn create_listener(
+    host: &str,
+    port: u16,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let addr = std::net::SocketAddr::from((parse_host(host)?, port));
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
@@ -894,6 +1124,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clear_sync_badge_publishes_false_only_when_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        app.registry.update_state(
+            0,
+            crate::git::types::RepoState { out_of_date: true, ..Default::default() },
+        );
+        app.clear_sync_badge(0);
+        assert!(!out_of_date(&app));
+
+        // Idempotent: a second call must not publish a new revision.
+        let revision = app.registry.revision();
+        app.clear_sync_badge(0);
+        assert_eq!(app.registry.revision(), revision);
+    }
+
+    #[test]
+    fn setting_the_sync_flag_leaves_the_rest_of_the_state_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        app.registry.update_state(
+            0,
+            crate::git::types::RepoState {
+                out_of_date: true,
+                current_branch: "topic".to_string(),
+                ..Default::default()
+            },
+        );
+
+        app.registry.update_state_setting_sync(0, false);
+
+        let state = app.registry.snapshot();
+        assert!(!state.tabs[0].state.out_of_date);
+        assert_eq!(
+            state.tabs[0].state.current_branch, "topic",
+            "clearing the badge must not write back a stale snapshot of the rest"
+        );
+
+        // Publish only when the value actually changes.
+        let revision = app.registry.revision();
+        app.registry.update_state_setting_sync(0, false);
+        assert_eq!(app.registry.revision(), revision);
+    }
+
+    #[test]
+    fn setting_the_sync_flag_ignores_an_unknown_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        let before = app.registry.revision();
+        app.registry.update_state_setting_sync(999, false);
+        assert_eq!(app.registry.revision(), before);
+    }
+
+    #[test]
+    fn settling_a_tab_forgets_its_budget_entry() {
+        let mut budget = SyncBudget::new(std::time::Duration::from_secs(600));
+        budget.started_at(7, std::time::Instant::now());
+        budget.forget(7);
+        assert!(!budget.started.contains_key(&7));
+    }
+
+    #[tokio::test]
+    async fn a_rearmed_tab_does_not_inherit_a_stale_give_up_clock() {
+        // The regression: a tab that earned its badge long ago, then had the
+        // remote fetched, must re-probe and clear — not give up on a clock left
+        // over from before the pull.
+        let (dir, _bare, advance) = repo_with_remote();
+        let app = app_for_repo(dir.path());
+        advance(dir.path());
+
+        let mut budget = SyncBudget::new(std::time::Duration::from_secs(600));
+        let first = std::time::Instant::now();
+        sync_pass(&app, &mut budget, first).await;
+        assert!(out_of_date(&app), "the first pass should earn the badge");
+        assert!(app.registry.is_settled(0));
+
+        // The tab sits settled well past the ceiling.
+        let later = first + std::time::Duration::from_secs(700);
+
+        // A pull re-arms it, and the remote it complained about is now fetched.
+        app.registry.reset_settled(0);
+        std::process::Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        sync_pass(&app, &mut budget, later).await;
+
+        assert!(
+            !out_of_date(&app),
+            "a re-armed probe gave up on a clock left over from before the pull"
+        );
+    }
+
+    #[test]
+    fn update_state_keeping_sync_keeps_the_current_badge_value() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        app.registry.update_state(
+            0,
+            crate::git::types::RepoState { out_of_date: true, ..Default::default() },
+        );
+
+        // A fresh status collection must never be allowed to own the flag.
+        app.registry.update_state_keeping_sync(
+            0,
+            crate::git::types::RepoState {
+                out_of_date: false,
+                current_branch: "topic".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let state = app.registry.snapshot();
+        assert!(state.tabs[0].state.out_of_date, "the ticker owns this flag");
+        assert_eq!(state.tabs[0].state.current_branch, "topic", "the rest must land");
+    }
+
+    #[test]
+    fn update_state_keeping_sync_ignores_an_unknown_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let app = app_for(dir.path());
+        let before = app.registry.revision();
+        app.registry
+            .update_state_keeping_sync(999, crate::git::types::RepoState::default());
+        assert_eq!(app.registry.revision(), before);
+    }
+
     #[tokio::test]
     async fn refresh_tab_preserves_out_of_date() {
     let dir = tempfile::tempdir().unwrap();
@@ -967,6 +1331,107 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
         assert!(!is_daemon_running(dead_port).await);
     }
 
+    /// Connects to whatever address the supervisor currently holds. Polls,
+    /// because a rebind records the address just before it starts accepting.
+    async fn connect_to_bound(control: &ServerControl) -> crate::test_support::WsStream {
+        for _ in 0..200 {
+            if let Some(addr) = control.bound() {
+                if let Ok((ws, _)) =
+                    tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await
+                {
+                    return ws;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the daemon never became reachable");
+    }
+
+    async fn wait_for_bound(control: &ServerControl) -> std::net::SocketAddr {
+        for _ in 0..200 {
+            if let Some(addr) = control.bound() {
+                return addr;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the supervisor never bound a listener");
+    }
+
+    async fn wait_for_effective(control: &ServerControl, host: &str) {
+        for _ in 0..200 {
+            if control.effective() == host {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the supervisor never switched to {host}");
+    }
+
+    async fn wait_for_error(control: &ServerControl) {
+        for _ in 0..200 {
+            if control.last_error().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the supervisor never recorded a bind error");
+    }
+
+    #[test]
+    fn parse_host_accepts_the_three_forms_and_rejects_garbage() {
+        assert_eq!(parse_host("127.0.0.1").unwrap().to_string(), "127.0.0.1");
+        assert_eq!(parse_host("0.0.0.0").unwrap().to_string(), "0.0.0.0");
+        assert_eq!(parse_host("localhost").unwrap().to_string(), "127.0.0.1");
+        assert!(parse_host("not-an-ip").is_err());
+    }
+
+    #[tokio::test]
+    async fn an_established_connection_survives_a_host_change() {
+        // The settings page is itself a live connection when the user flips
+        // grit's own toggle, so losing it would make the feature unusable.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let control = ServerControl::new("127.0.0.1".to_string());
+        let registry =
+            TabRegistry::with_single_tab(0, "repo".to_string(), dir.path().to_path_buf());
+        tokio::spawn(run(registry, 0, control.clone()));
+        let bound = wait_for_bound(&control).await;
+
+        let mut ws = connect_with_retry(&format!("ws://{bound}/ws")).await;
+        let _ = recv_state(&mut ws).await;
+
+        control.request_host("0.0.0.0".to_string());
+        wait_for_effective(&control, "0.0.0.0").await;
+
+        // Anything that publishes proves the socket lived through the switch:
+        // a dropped connection would end the stream and time this out.
+        ws.send(Message::Text(r#"{"tab":0,"action":"Pull"}"#.into()))
+            .await
+            .unwrap();
+        let _ = recv_state(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn failed_host_change_keeps_the_daemon_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        let control = ServerControl::new("127.0.0.1".to_string());
+        let registry =
+            TabRegistry::with_single_tab(0, "repo".to_string(), dir.path().to_path_buf());
+        tokio::spawn(run(registry, 0, control.clone()));
+        let _ = wait_for_bound(&control).await;
+
+        control.request_host("not-an-ip".to_string());
+        wait_for_error(&control).await;
+
+        // The bad host must be rejected without moving the daemon off loopback,
+        // and a *new* client must still get in: the failure this guards is a
+        // daemon left with no listener at all.
+        assert_eq!(control.effective(), "127.0.0.1");
+        let mut ws = connect_to_bound(&control).await;
+        let _ = recv_state(&mut ws).await;
+    }
+
     #[tokio::test]
     async fn ws_route_requires_websocket_upgrade() {
         let dir = tempfile::tempdir().unwrap();
@@ -1032,7 +1497,7 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
             "repo".to_string(),
             dir.path().to_path_buf(),
         );
-        let (app, refresh_rx) = boot(registry).await;
+        let (app, refresh_rx) = boot(registry, ServerControl::loopback()).await;
         let _server = run_server(listener, app.clone(), refresh_rx);
 
         let url = format!("ws://{addr}/ws");
@@ -1093,7 +1558,7 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
         let addr = listener.local_addr().unwrap();
 
         // Fresh machine: nothing is open (and thus watched) at boot.
-        let (app, refresh_rx) = boot(TabRegistry::new()).await;
+        let (app, refresh_rx) = boot(TabRegistry::new(), ServerControl::loopback()).await;
         let _server = run_server(listener, app.clone(), refresh_rx);
 
         let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
@@ -1172,7 +1637,7 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
             "repo".to_string(),
             dir.path().to_path_buf(),
         );
-        let (app, refresh_rx) = boot(registry).await;
+        let (app, refresh_rx) = boot(registry, ServerControl::loopback()).await;
         let _server = run_server(listener, app.clone(), refresh_rx);
 
         let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
@@ -1248,7 +1713,7 @@ async fn sync_loop_idles_when_refresh_channel_closes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let registry = TabRegistry::with_single_tab(0, "repo".to_string(), dir.path().to_path_buf());
-        let (app, refresh_rx) = boot(registry).await;
+        let (app, refresh_rx) = boot(registry, ServerControl::loopback()).await;
         let _server = run_server(listener, app.clone(), refresh_rx);
 
         let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;

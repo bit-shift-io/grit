@@ -773,6 +773,46 @@ button.danger:hover { background: #d93a30; }
 .browser-entry:hover { background: var(--row-hover, #ececec); }
 .browser-empty { padding: 0.5rem; }
 
+/* Settings page: the LAN toggles for grit, folio and krust. */
+.settings-view { margin-top: var(--stack-gap); }
+.settings-view h2 { margin: 0 0 0.25rem; font-size: 1.1rem; }
+.settings-service {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--tab-border, #ccc);
+}
+.settings-name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 7rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.settings-name input { width: 1.05rem; height: 1.05rem; margin: 0; }
+.settings-detail { font-size: 0.9rem; color: var(--muted, #888); }
+.settings-warn { color: var(--log-failed, #b3261e); }
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  padding: 0 0.75rem;
+}
+.settings-actions button {
+  background: var(--btn-bg, #eee);
+  border: 1px solid var(--btn-border, #ccc);
+  border-radius: 4px;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+/* The gear sits at the far right of the tab bar and is not part of a tab. */
+#tabs .settings-btn.active { font-weight: 700; }
+
 @media (max-width: 680px) {
   .app-layout { gap: 0.35rem; }
 }

@@ -188,6 +188,16 @@ pub(crate) fn origin_is_allowed(origin: Option<&str>) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+/// Origin policy for a daemon that may be bound to the LAN.
+///
+/// LAN access is an explicit opt-in, and once the daemon answers on the network
+/// a same-origin comparison has nothing meaningful left to check against — the
+/// client's own address is just a different machine. Loopback keeps the strict
+/// rule, which is what still stops a hostile page in the user's browser.
+pub(crate) fn origin_is_allowed_for(origin: Option<&str>, lan: bool) -> bool {
+    lan || origin_is_allowed(origin)
+}
+
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(app): State<AppState>,
@@ -196,7 +206,8 @@ pub async fn ws_handler(
     let origin = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok());
-    if !origin_is_allowed(origin) {
+    let lan = crate::settings::is_lan(&app.control.effective());
+    if !origin_is_allowed_for(origin, lan) {
         return (axum::http::StatusCode::FORBIDDEN, "forbidden origin").into_response();
     }
     ws.on_upgrade(move |socket| handle_websocket(socket, app))
@@ -435,13 +446,20 @@ async fn dispatch_and_refresh(app: &AppState, msg: ClientMessage) -> Option<Stri
             // A successful Fetch or Pull proves the network is reachable, so
             // re-arm the remote-sync probe for this tab: without it, a machine
             // that was offline when the 10-minute ceiling expired would show a
-            // stale badge until the daemon restarted. No inline check — the next
-            // ticker pass picks it up.
+            // stale badge until the daemon restarted.
+            //
+            // The badge comes down right here rather than at the next pass:
+            // the pull left the branch at the upstream tip and the fetch
+            // refreshed the remote-tracking ref, so "the remote is ahead of
+            // what we know" is already false. The woken ticker then re-probes
+            // and re-raises the badge only if the remote moved again meanwhile.
             if matches!(
                 result_action,
                 crate::git::types::GitAction::Fetch | crate::git::types::GitAction::Pull
             ) {
                 app.registry.reset_settled(tab_id);
+                app.clear_sync_badge(tab_id);
+                app.wake_sync();
             }
         }
         Ok((Err(e), _)) => tracing::error!("action failed: {e}"),
@@ -479,7 +497,8 @@ mod tests {
     use crate::server::registry::TabRegistry;
     use crate::server::{run_server, AppState};
     use crate::test_support::{
-        app_for, connect_with_retry, init_repo, recv_state, recv_state_until, wait_for_snapshot,
+        app_for, connect_with_retry, init_repo, recv_state, recv_state_until, repo_with_remote,
+        wait_for_snapshot,
     };
 
     #[test]
@@ -581,6 +600,19 @@ mod tests {
             !dest.join("myrepo").exists(),
             "must not nest a second copy under the named folder"
         );
+    }
+
+    #[test]
+    fn origin_is_allowed_for_accepts_any_when_lan_is_on() {
+        assert!(super::origin_is_allowed_for(Some("http://192.168.1.9:5000"), true));
+        assert!(super::origin_is_allowed_for(Some("http://evil.example"), true));
+    }
+
+    #[test]
+    fn origin_is_allowed_for_keeps_the_loopback_rule_when_lan_is_off() {
+        assert!(!super::origin_is_allowed_for(Some("http://192.168.1.9:5000"), false));
+        assert!(super::origin_is_allowed_for(Some("http://localhost:5000"), false));
+        assert!(super::origin_is_allowed_for(None, false));
     }
 
     #[test]
@@ -1232,6 +1264,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_successful_pull_clears_the_badge_immediately() {
+        // No sync ticker is spawned here: the clear has to come from the action
+        // itself, which is what makes the badge vanish on the click rather than
+        // a tick later.
+        let (dir, _bare, advance) = repo_with_remote();
+        advance(dir.path());
+        let app = app_for(dir.path());
+        app.registry.update_state(
+            0,
+            crate::git::types::RepoState { out_of_date: true, ..Default::default() },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let first = recv_state(&mut ws).await;
+        assert!(first.tabs[0].state.out_of_date, "the badge must start up");
+
+        ws.send(Message::Text(r#"{"tab":0,"action":"Pull"}"#.into()))
+            .await
+            .unwrap();
+
+        let after = recv_state_until(&mut ws, |s| !s.tabs[0].state.out_of_date).await;
+        assert!(!after.tabs[0].state.out_of_date);
+    }
+
+    #[tokio::test]
+    async fn a_failed_pull_leaves_the_badge_alone() {
+        let (dir, _bare, _advance) = repo_with_remote();
+        std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", "/nonexistent/grit-badge"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let app = app_for(dir.path());
+        app.registry.update_state(
+            0,
+            crate::git::types::RepoState { out_of_date: true, ..Default::default() },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let _server = run_server(listener, app.clone(), refresh_rx);
+
+        let mut ws = connect_with_retry(&format!("ws://{addr}/ws")).await;
+        let _ = recv_state(&mut ws).await;
+
+        ws.send(Message::Text(r#"{"tab":0,"action":"Pull"}"#.into()))
+            .await
+            .unwrap();
+
+        // Let the failing action run to completion before judging the badge.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        assert!(
+            app.registry.snapshot().tabs[0].state.out_of_date,
+            "a failed pull must not clear the badge"
+        );
+    }
+
+    #[tokio::test]
     async fn webstate_contains_tab_id_and_repo_path() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
@@ -1317,7 +1413,7 @@ mod tests {
         let app = app_for(dir.path());
         crate::server::refresh_all(&app).await;
 
-        let listener = crate::server::create_listener(0).await.unwrap();
+        let listener = crate::server::create_listener("127.0.0.1", 0).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (_refresh_tx, refresh_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let server = run_server(listener, app.clone(), refresh_rx);
@@ -1342,7 +1438,7 @@ mod tests {
         let listener = {
             let mut rebound = None;
             for _ in 0..100 {
-                match crate::server::create_listener(addr.port()).await {
+                match crate::server::create_listener("127.0.0.1", addr.port()).await {
                     Ok(l) => {
                         rebound = Some(l);
                         break;

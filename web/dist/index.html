@@ -11,6 +11,15 @@
   <nav id="tabs"></nav>
   <div class="app-layout">
     <main>
+      <section id="settings-view" class="settings-view" style="display: none;">
+        <h2>Settings</h2>
+        <p class="muted" id="settings-note"></p>
+        <div id="settings-services"></div>
+        <div class="settings-actions">
+          <button id="settings-restart-btn" type="button" style="display: none;">Restart krust &amp; folio</button>
+          <span id="settings-restart-result" class="muted"></span>
+        </div>
+      </section>
        <section id="actions" class="section" style="display: none;">
      <h2 class="section-title" role="button" tabindex="0" aria-expanded="true" aria-controls="actions-body"><span>Actions<span class="activity" data-activity hidden></span></span> <span class="arrow"></span></h2>
      <div class="section-body" id="actions-body">

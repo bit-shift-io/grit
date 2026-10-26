@@ -18,7 +18,7 @@ use std::time::Duration;
 
 /// The port the web UI expects folio on (folio's default; `--port` on the CLI
 /// overrides its own side, but this probe follows folio's default).
-const FOLIO_PORT: u16 = 4000;
+pub(crate) const FOLIO_PORT: u16 = 4000;
 
 /// True when something answers on `127.0.0.1:{FOLIO_PORT}`, i.e. folio (or
 /// some other service) is already bound there — in which case we won't spawn.

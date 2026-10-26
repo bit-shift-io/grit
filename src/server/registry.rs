@@ -164,7 +164,11 @@ impl TabRegistry {
         self.rx.clone()
     }
 
-    /// Updates the state of a single tab in place.
+    /// Replaces the whole state of a single tab, for tests that need to seed a
+    /// fixture. Production writes go through `update_state_keeping_sync` (a
+    /// status refresh) or `update_state_setting_sync` (the sync badge), both of
+    /// which carry the fields they do not own across under the write lock.
+    #[cfg(test)]
     pub fn update_state(&self, id: usize, state: RepoState) {
         self.modify(|current| {
             match current.tabs.iter_mut().find(|t| t.id == id) {
@@ -174,6 +178,26 @@ impl TabRegistry {
                 }
                 None => false,
             }
+        });
+    }
+
+    /// Applies a freshly collected status while leaving `out_of_date` to the
+    /// remote-sync checker. `get_repository_status` has to assume `false`, so
+    /// the current value is copied over under the same write lock as the write;
+    /// doing it with a snapshot read outside the lock let a badge update that
+    /// landed mid-refresh be clobbered.
+    ///
+    /// Publishes on every call, exactly like [`update_state`]: a refresh is
+    /// also the "the command you just ran finished" broadcast, so suppressing
+    /// the identical-state frame would strand clients that are waiting on it.
+    pub fn update_state_keeping_sync(&self, id: usize, mut state: RepoState) {
+        self.modify(|current| {
+            let Some(tab) = current.tabs.iter_mut().find(|t| t.id == id) else {
+                return false;
+            };
+            state.out_of_date = tab.state.out_of_date;
+            tab.state = state;
+            true
         });
     }
 
@@ -187,6 +211,23 @@ impl TabRegistry {
                 }
                 None => false,
             }
+        });
+    }
+
+    /// Sets only the remote-sync flag for a tab, with the "publish only when it
+    /// changes" behaviour the ticker wants. Comparing and writing in one locked
+    /// step is what keeps a badge update from racing a status refresh, and from
+    /// writing back a stale snapshot of everything else.
+    pub fn update_state_setting_sync(&self, id: usize, out_of_date: bool) {
+        self.modify(|current| {
+            let Some(tab) = current.tabs.iter_mut().find(|t| t.id == id) else {
+                return false;
+            };
+            if tab.state.out_of_date == out_of_date {
+                return false;
+            }
+            tab.state.out_of_date = out_of_date;
+            true
         });
     }
 

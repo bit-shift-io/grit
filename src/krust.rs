@@ -13,7 +13,7 @@ use std::time::Duration;
 
 /// The port the web UI expects krust on (krust's default; `KRUST_PORT` in
 /// krust overrides its own side, but this probe follows krust's default).
-const KRUST_PORT: u16 = 3000;
+pub(crate) const KRUST_PORT: u16 = 3000;
 
 /// True when something answers on `127.0.0.1:{KRUST_PORT}`, i.e. krust (or
 /// some other service) is already bound there — in which case we won't spawn.

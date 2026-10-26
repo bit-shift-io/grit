@@ -12,11 +12,15 @@ import {
   KRUST_SESSIONS,
   FOLIO_BASE,
 } from "./common.js";
+import { loadSettings } from "./settings.js";
 
 // ======================================
 // View dock + krust/folio integration
 // ======================================
 export function showView(view) {
+  // Captured before the assignment: the settings page refetches only when it is
+  // actually entered, and render() re-runs showView on every state frame.
+  const previous = store.activeView;
   store.activeView = view;
   updateUrlView(view);
   const dashboard = view === "dashboard";
@@ -26,11 +30,13 @@ export function showView(view) {
   document.getElementById("stashes-section").style.display = dashboard ? "block" : "none";
   document.getElementById("history-section").style.display = dashboard ? "block" : "none";
   document.getElementById("log-section").style.display = dashboard ? "block" : "none";
+  document.getElementById("settings-view").style.display = view === "settings" ? "block" : "none";
   setDockVisible("files-section", view === "files");
   setDockVisible("view-term-1", view === "term-1");
-  for (const v of ["dashboard", "files", "term-1"]) {
+  for (const v of ["dashboard", "files", "term-1", "settings"]) {
     document.body.classList.toggle(`view-${v}`, v === view);
   }
+  if (view === "settings" && previous !== "settings") loadSettings();
   const sess = KRUST_SESSIONS[view];
   if (sess) {
     ensureKrustFrame(sess);

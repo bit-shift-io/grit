@@ -18,6 +18,7 @@ import {
 } from "./common.js";
 import { toggleDiff, showDiff, stepDiffBlock } from "./diff.js";
 import { showView, setView, initTerminal } from "./terminal.js";
+import { initSettings } from "./settings.js";
 
 //#region Action wiring (buttons + delegated listeners)
 
@@ -75,8 +76,15 @@ document.getElementById("discard-all-btn").onclick = () => {
 };
 
 document.getElementById("tabs").addEventListener("click", (event) => {
-  const btn = event.target.closest("[data-tab-id], .new-tab");
-  if (!btn || !store.lastState) return;
+  const btn = event.target.closest("[data-tab-id], .new-tab, .settings-btn");
+  if (!btn) return;
+
+  // The gear is global: it works with or without a selected tab.
+  if (btn.classList.contains("settings-btn")) {
+    setView("settings");
+    return;
+  }
+  if (!store.lastState) return;
 
   // Handle "+" new tab button
   if (btn.classList.contains("new-tab")) {
@@ -269,6 +277,7 @@ function main() {
   registerCoreHandlers({ showView, showDiff });
   openSocket();
   initTerminal();
+  initSettings();
   showView("dashboard");
   renderTabBar({ tabs: [] });
 }

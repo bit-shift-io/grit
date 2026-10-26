@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -211,7 +212,116 @@ pub(crate) async fn browse_handler(
     })
 }
 
+/// Builds the settings snapshot off the runtime thread: it reads up to three
+/// config files from disk.
+async fn settings_response(app: &AppState) -> crate::settings::SettingsResponse {
+    let paths = app.settings_paths.clone();
+    let control = app.control.clone();
+    let baseline = app.baseline.clone();
+    let ports = app.ports;
+    match tokio::task::spawn_blocking(move || {
+        crate::settings::snapshot(&paths, &control, &baseline, ports)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            // Only reachable if the task panicked; read inline rather than
+            // failing a settings page that is otherwise fine.
+            tracing::error!("settings snapshot task panicked: {e}");
+            crate::settings::snapshot(
+                &app.settings_paths,
+                &app.control,
+                &app.baseline,
+                app.ports,
+            )
+        }
+    }
+}
 
+/// Rejects a mutating request whose browser Origin is not allowed.
+///
+/// CORS is not a guard on its own: the browser still *sends* a "simple"
+/// cross-site request and the effect happens — only the reply is hidden. So
+/// every route that changes something checks the origin itself, exactly as the
+/// WebSocket upgrade does. Native clients send no Origin and are unaffected.
+fn mutation_origin_ok(app: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    super::websocket::origin_is_allowed_for(
+        origin,
+        crate::settings::is_lan(&app.control.effective()),
+    )
+}
+
+/// Current LAN settings for grit, folio and krust.
+pub(crate) async fn settings_get_handler(
+    State(app): State<AppState>,
+) -> Json<crate::settings::SettingsResponse> {
+    Json(settings_response(&app).await)
+}
+
+/// Applies the requested LAN toggles: writes each service's config file, and
+/// moves grit's own listener without a restart.
+pub(crate) async fn settings_post_handler(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(update): Json<crate::settings::SettingsUpdate>,
+) -> Response {
+    if !mutation_origin_ok(&app, &headers) {
+        return (StatusCode::FORBIDDEN, "forbidden origin").into_response();
+    }
+    let paths = app.settings_paths.clone();
+    let control = app.control.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::settings::apply(&paths, &update, &control)
+    })
+    .await;
+    let status = match result {
+        Ok(Ok(())) => StatusCode::OK,
+        Ok(Err(e)) => {
+            tracing::error!("failed to apply settings: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        Err(e) => {
+            tracing::error!("settings apply task panicked: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (status, Json(settings_response(&app).await)).into_response()
+}
+
+/// Restarts krust and folio so their freshly written config takes effect.
+///
+/// Reported per service: restarting krust kills every live terminal shell,
+/// while restarting folio only blinks the files dock.
+///
+/// Takes a JSON body on purpose. Without one this is a "simple" request that a
+/// browser will send cross-site without a preflight, which would let any page
+/// the user has open kill their terminals; requiring a JSON content type means
+/// the CORS preflight runs first.
+pub(crate) async fn settings_restart_handler(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(_body): Json<serde_json::Value>,
+) -> Response {
+    if !mutation_origin_ok(&app, &headers) {
+        return (StatusCode::FORBIDDEN, "forbidden origin").into_response();
+    }
+    let mut results = serde_json::Map::new();
+    for service in crate::settings::Service::RESTARTABLE {
+        let (ok, error) = match crate::settings::restart_service(&app, service).await {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        };
+        results.insert(
+            service.key().to_string(),
+            serde_json::json!({ "ok": ok, "error": error }),
+        );
+    }
+    Json(serde_json::Value::Object(results)).into_response()
+}
 
 #[cfg(test)]
 mod tests {
@@ -449,4 +559,125 @@ mod tests {
         assert_eq!(summary.deletions, 0);
     }
 
+    async fn oneshot_json(router: axum::Router, uri: &str) -> serde_json::Value {
+        use tower::ServiceExt;
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn oneshot_post_json(router: axum::Router, uri: &str, body: &str) -> serde_json::Value {
+        use tower::ServiceExt;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "POST {uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_post_rejects_a_foreign_origin() {
+        // CORS only hides the *reply*: a page in the user's browser can still
+        // fire a simple cross-site POST and have the effect happen. The
+        // mutating routes therefore check the origin themselves.
+        let paths = crate::settings::SettingsPaths {
+            grit: None,
+            krust: None,
+            folio: None,
+        };
+        let app = AppState::new(TabRegistry::new()).with_settings(paths);
+        let response = build_router(app)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/settings")
+                    .header("content-type", "application/json")
+                    .header("origin", "http://evil.example")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn settings_get_defaults_to_loopback_everywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = crate::settings::SettingsPaths {
+            grit: Some(dir.path().join("grit.json")),
+            krust: Some(dir.path().join("krust.json")),
+            folio: Some(dir.path().join("folio.json")),
+        };
+        let app = AppState::new(TabRegistry::new()).with_settings(paths);
+
+        let body = oneshot_json(build_router(app), "/settings").await;
+        assert_eq!(body["grit"]["lan"], false);
+        assert_eq!(body["krust"]["host"], "127.0.0.1");
+        assert_eq!(body["krust"]["pending_restart"], false);
+        assert_eq!(body["ports"]["krust"], 3000);
+    }
+
+    #[tokio::test]
+    async fn settings_post_writes_the_config_and_reports_lan() {
+        let dir = tempfile::tempdir().unwrap();
+        let krust_path = dir.path().join("krust.json");
+        std::fs::write(&krust_path, br#"{"port":3000,"allowed_origins":[]}"#).unwrap();
+        let paths = crate::settings::SettingsPaths {
+            grit: None,
+            krust: Some(krust_path.clone()),
+            folio: None,
+        };
+        let app = AppState::new(TabRegistry::new()).with_settings(paths);
+
+        let body = oneshot_post_json(
+            build_router(app),
+            "/settings",
+            r#"{"krust":true}"#,
+        )
+        .await;
+        assert_eq!(body["krust"]["lan"], true);
+        assert_eq!(body["krust"]["pending_restart"], true);
+        assert_eq!(crate::settings::read_host(&krust_path), "0.0.0.0");
+        // Fields grit does not own survive the write.
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&krust_path).unwrap()).unwrap();
+        assert_eq!(value["port"], 3000);
+    }
+
+    #[tokio::test]
+    async fn settings_post_on_grit_requests_a_live_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let grit_path = dir.path().join("grit.json");
+        let paths = crate::settings::SettingsPaths {
+            grit: Some(grit_path.clone()),
+            krust: None,
+            folio: None,
+        };
+        let app = AppState::new(TabRegistry::new()).with_settings(paths);
+        let control = app.control.clone();
+
+        let body = oneshot_post_json(build_router(app), "/settings", r#"{"grit":true}"#).await;
+
+        assert_eq!(control.desired(), "0.0.0.0");
+        assert_eq!(body["grit"]["lan"], true);
+        assert_eq!(crate::settings::read_host(&grit_path), "0.0.0.0");
+    }
 }

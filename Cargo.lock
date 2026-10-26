@@ -1170,6 +1170,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "iced",
+ "libc",
  "notify",
  "rfd",
  "rust-embed",

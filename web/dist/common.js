@@ -9,12 +9,16 @@ export const LCS_DIFF_CELL_CAP = 4000000;
 export const HISTORY_SEARCH_FILLED_MS = 300;
 export const HISTORY_SEARCH_EMPTY_MS = 150;
 export const BRANCH_FILTER_DEBOUNCE_MS = 150;
-export const KRUST_BASE = "http://localhost:3000";
+// The docks are services on the *server*, not on the client. Hardcoding
+// `localhost` breaks them the moment the page is opened from another machine
+// over the LAN, where localhost is the browser's own host, so both bases follow
+// whatever host served this page.
+export const KRUST_BASE = `http://${location.hostname}:3000`;
 export const KRUST_PROBE_MS = 5000;
 export const KRUST_SESSIONS = {
   "term-1": { iframe: "krust-1", n: 1 },
 };
-export const FOLIO_BASE = "http://localhost:4000";
+export const FOLIO_BASE = `http://${location.hostname}:4000`;
 
 // ======================================
 // Shared mutable state
@@ -293,7 +297,7 @@ window.addEventListener("pageshow", (event) => {
 // blank on first load only.
 const initialUrlView = (function () {
   const v = new URL(window.location.href).searchParams.get("view");
-  return v && ["dashboard", "files", "term-1"].indexOf(v) !== -1 ? v : null;
+  return v && ["dashboard", "files", "term-1", "settings"].indexOf(v) !== -1 ? v : null;
 })();
 //#region Add-repo form ("+" is a client-local mode, never a server tab)
 
@@ -537,7 +541,12 @@ export function render(state) {
     stashesSection.style.display = "none";
     setDockVisible("files-section", false);
     setDockVisible("view-term-1", false);
-    document.body.classList.remove("view-dashboard", "view-files", "view-term-1");
+    document.body.classList.remove(
+      "view-dashboard",
+      "view-files",
+      "view-term-1",
+      "view-settings"
+    );
     setupAddRepoForm({ id: 0, repo_path: "" });
     document.title = "Grit | New Repository";
     return;
@@ -1389,6 +1398,17 @@ export function renderTabBar(state) {
   newTabBtn.textContent = "+";
   newTabBtn.title = "New tab";
   tabsEl.appendChild(newTabBtn);
+
+  // Settings is global, not tab-scoped, so it carries no `data-tab-id` and is
+  // pushed to the far right of the bar rather than sitting in a tab group.
+  const gearBtn = document.createElement("button");
+  gearBtn.className = "tab settings-btn";
+  gearBtn.textContent = "⚙";
+  gearBtn.title = "Settings";
+  gearBtn.setAttribute("aria-label", "Settings");
+  gearBtn.style.marginLeft = "auto";
+  if (store.activeView === "settings") gearBtn.classList.add("active");
+  tabsEl.appendChild(gearBtn);
 }
 
 function sortedTabs(state) {
